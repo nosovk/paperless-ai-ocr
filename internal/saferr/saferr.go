@@ -1,6 +1,11 @@
 // Package saferr provides categorized errors with safe public messages.
 package saferr
 
+import (
+	"fmt"
+	"io"
+)
+
 // Category identifies an error class for metrics and logging.
 type Category string
 
@@ -34,6 +39,19 @@ func Wrap(category Category, message string, cause error) error {
 // Error returns only categorized, operator-facing information.
 func (err *Error) Error() string {
 	return string(err.category) + ": " + err.message
+}
+
+// Format ensures all string and error formatting paths use only the safe
+// operator-facing representation.
+func (err *Error) Format(state fmt.State, verb rune) {
+	switch verb {
+	case 's', 'v':
+		io.WriteString(state, err.Error())
+	case 'q':
+		fmt.Fprintf(state, "%q", err.Error())
+	default:
+		fmt.Fprintf(state, "%%!%c(*saferr.Error=%s)", verb, err.Error())
+	}
 }
 
 // Category returns the error category.

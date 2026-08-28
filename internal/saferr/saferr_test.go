@@ -12,7 +12,7 @@ func TestErrorFormattingIsSafe(t *testing.T) {
 	cause := errors.New(providerBody)
 	err := Wrap(CategoryProvider, "model request failed", cause)
 
-	for _, format := range []string{"%s", "%v", "%+v"} {
+	for _, format := range []string{"%s", "%v", "%+v", "%#v"} {
 		t.Run(format, func(t *testing.T) {
 			formatted := fmt.Sprintf(format, err)
 			if got, want := formatted, "provider: model request failed"; got != want {
@@ -25,11 +25,23 @@ func TestErrorFormattingIsSafe(t *testing.T) {
 	}
 
 	wrapped := fmt.Errorf("transcription: %w", err)
-	if got, want := wrapped.Error(), "transcription: provider: model request failed"; got != want {
-		t.Errorf("wrapped error = %q, want %q", got, want)
+	for _, format := range []string{"%s", "%v", "%+v"} {
+		t.Run("wrapped_"+format, func(t *testing.T) {
+			formatted := fmt.Sprintf(format, wrapped)
+			if got, want := formatted, "transcription: provider: model request failed"; got != want {
+				t.Errorf("formatted wrapped error = %q, want %q", got, want)
+			}
+			if strings.Contains(formatted, providerBody) || strings.Contains(formatted, "canary-provider-secret") {
+				t.Errorf("formatted wrapped error disclosed provider body: %q", formatted)
+			}
+		})
 	}
-	if strings.Contains(wrapped.Error(), providerBody) || strings.Contains(wrapped.Error(), "canary-provider-secret") {
-		t.Errorf("wrapped error disclosed provider body: %q", wrapped)
+	formattedWrappedGoSyntax := fmt.Sprintf("%#v", wrapped)
+	if !strings.Contains(formattedWrappedGoSyntax, "transcription: provider: model request failed") {
+		t.Errorf("formatted wrapped error = %q, want safe operator-facing message", formattedWrappedGoSyntax)
+	}
+	if strings.Contains(formattedWrappedGoSyntax, providerBody) || strings.Contains(formattedWrappedGoSyntax, "canary-provider-secret") {
+		t.Errorf("formatted wrapped error disclosed provider body: %q", formattedWrappedGoSyntax)
 	}
 	if !errors.Is(err, cause) {
 		t.Error("errors.Is(error, cause) = false, want true")
@@ -68,7 +80,7 @@ func TestConfigurationErrorDoesNotDiscloseSecret(t *testing.T) {
 	cause := fmt.Errorf("invalid API key %q", secret)
 	err := Wrap(CategoryConfiguration, "AI_API_KEY is invalid", cause)
 
-	for _, format := range []string{"%s", "%v", "%+v"} {
+	for _, format := range []string{"%s", "%v", "%+v", "%#v"} {
 		formatted := fmt.Sprintf(format, err)
 		if strings.Contains(formatted, secret) {
 			t.Errorf("format %s disclosed secret: %q", format, formatted)

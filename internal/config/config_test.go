@@ -300,6 +300,9 @@ func TestLoadRejectsInvalidURLs(t *testing.T) {
 		{name: "AI_BASE_URL", value: "https://ai.example.test/v1#fragment"},
 		{name: "PAPERLESS_AI_WEBHOOK_URL", value: "https://"},
 		{name: "PAPERLESS_AI_WEBHOOK_URL", value: " paperless-ai "},
+		{name: "PAPERLESS_URL", value: "https://:8080"},
+		{name: "AI_BASE_URL", value: "https://:8080"},
+		{name: "PAPERLESS_AI_WEBHOOK_URL", value: "https://:8080"},
 	}
 
 	for _, test := range tests {

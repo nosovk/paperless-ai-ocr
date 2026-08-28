@@ -152,7 +152,7 @@ func requiredURL(name string) (*url.URL, error) {
 		return nil, err
 	}
 	parsed, parseErr := url.Parse(value)
-	if parseErr != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+	if parseErr != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" {
 		return nil, configError(name + " must be an http or https URL without userinfo or a fragment")
 	}
 	return parsed, nil
