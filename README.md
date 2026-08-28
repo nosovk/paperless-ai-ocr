@@ -271,6 +271,16 @@ observability, container hardening, CI, GHCR publishing, and end-to-end burn-in.
 Until a versioned release is published, this repository should not be deployed
 for production document processing.
 
+## Development
+
+Development requires Go 1.26. Run the test suite and inspect the development
+build metadata with:
+
+```sh
+go test ./...
+go run ./cmd/paperless-ai-ocr --version
+```
+
 ## License
 
 `paperless-ai-ocr` is available under the [MIT License](LICENSE).
