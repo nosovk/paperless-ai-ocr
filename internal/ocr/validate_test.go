@@ -227,26 +227,59 @@ func TestValidateAcceptsValidUnicodeReplacementAndSurrogatePair(t *testing.T) {
 	}
 }
 
-func TestValidateSuspiciousNonTranscriptionProse(t *testing.T) {
+func TestValidateAllowsRefusalLikeDocumentText(t *testing.T) {
 	for _, text := range []string{
 		"I'm sorry, but I can't transcribe this document.",
 		"I am sorry, but I cannot assist with that request.",
-		"As an AI language model, I cannot view the attached pages.",
+		"I cannot read this document.",
 		"I cannot comply with this request.",
 		"Sorry, but I can't transcribe the document.",
-		"SORRY! I cannot transcribe this page.",
+		"Sorry, I can't view this page.",
 		"I cannot transcribe the provided image.",
 		"I can't transcribe this attached document; it is unreadable.",
 		"Unfortunately, I cannot transcribe the image because it is unclear.",
 		"I apologize, but I am unable to read the provided page.",
-		"As an AI language model: sorry, but I cannot view this image.",
 		"I’m sorry, but I can’t transcribe this document.",
+		"No puedo leer este documento.",
+		"Lo siento, no puedo ver esta página.",
+		"Ich kann dieses Dokument nicht lesen.",
+		"Entschuldigung, ich kann diese Seite nicht sehen.",
+		"Я не можу прочитати цей документ.",
+		"Вибачте, я не можу переглянути цю сторінку.",
+	} {
+		t.Run(text, func(t *testing.T) {
+			if _, err := Validate(transcriptionJSON(1, text), 1, 1); err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsHighConfidenceProviderMetaOutput(t *testing.T) {
+	for _, text := range []string{
+		"As an AI language model, I cannot view the attached pages.",
+		"AS AN AI LANGUAGE MODEL: I CAN'T ACCESS THIS ATTACHMENT!",
+		"As an AI assistant, I am unable to transcribe the provided image.",
+		"As an AI assistant - I can't view this attachment.",
+		"I am an AI model and cannot access the attached document.",
+		"I'm an AI model; I can't transcribe this image.",
+		"I am an AI assistant, and I cannot view the provided pages.",
+		"No transcription was produced.",
+		"NO TRANSCRIPTION WAS PROVIDED!",
+		"No transcription has been produced for this attachment.",
+		"No transcription could be provided.",
 	} {
 		t.Run(text, func(t *testing.T) {
 			_, err := Validate(transcriptionJSON(1, text), 1, 1)
 			assertSafeProviderError(t, err, []byte(text))
 		})
 	}
+}
+
+func TestValidateRefusedFieldIsAuthoritative(t *testing.T) {
+	raw := []byte(`{"pages":[{"page":1,"text":"ordinary visible page text","refused":true}]}`)
+	_, err := Validate(raw, 1, 1)
+	assertSafeProviderError(t, err, raw)
 }
 
 func TestValidateAllowsSimilarDocumentText(t *testing.T) {
@@ -430,12 +463,21 @@ func disclosureCandidates(raw []byte, minBytes int) []string {
 		for end < len(raw) && isMarkerByte(raw[end]) {
 			end++
 		}
-		if end-start >= minBytes && end-start < len(raw) {
+		if end-start >= minBytes && end-start < len(raw) && distinctiveMarker(raw[start:end]) {
 			candidates = append(candidates, string(raw[start:end]))
 		}
 		start = end + 1
 	}
 	return candidates
+}
+
+func distinctiveMarker(value []byte) bool {
+	for _, character := range value {
+		if character >= '0' && character <= '9' || character == '-' || character == '_' {
+			return true
+		}
+	}
+	return false
 }
 
 func isMarkerByte(value byte) bool {

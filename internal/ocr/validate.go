@@ -407,36 +407,39 @@ func validBatch(batch Batch, expectedPage int) bool {
 }
 
 func suspiciousNonTranscription(text string) bool {
-	words := normalizedWords(text)
+	words := normalizedMetaWords(text)
 	if len(words) == 0 || len(words) > 16 {
 		return false
 	}
+	if hasMetaPrefix(words, []string{"no", "transcription"}) {
+		return noTranscriptionStatement(words[2:])
+	}
 	for _, prefix := range [][]string{
-		{"i'm", "sorry"},
-		{"i", "am", "sorry"},
-		{"sorry"},
-		{"unfortunately", "i"},
-		{"i", "apologize"},
-		{"i", "cannot"},
-		{"i", "can't"},
-		{"i", "am", "unable"},
 		{"as", "an", "ai", "language", "model"},
+		{"as", "an", "ai", "assistant"},
+		{"i", "am", "an", "ai", "model"},
+		{"i'm", "an", "ai", "model"},
+		{"i", "am", "an", "ai", "assistant"},
+		{"i'm", "an", "ai", "assistant"},
 	} {
-		if hasWordPrefix(words, prefix) && refusalTail(words[len(prefix):]) {
+		if hasMetaPrefix(words, prefix) && inaccessibleAttachmentStatement(words[len(prefix):]) {
 			return true
 		}
 	}
 	return false
 }
 
-func normalizedWords(text string) []string {
+// The refused field is authoritative. Text matching is intentionally limited to
+// whole-output model self-identification and explicit no-transcription metadata;
+// ordinary refusal-like document prose must remain valid transcription content.
+func normalizedMetaWords(text string) []string {
 	normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(text)), "’", "'")
 	return strings.FieldsFunc(normalized, func(character rune) bool {
 		return !unicode.IsLetter(character) && character != '\''
 	})
 }
 
-func hasWordPrefix(words, prefix []string) bool {
+func hasMetaPrefix(words, prefix []string) bool {
 	if len(words) < len(prefix) {
 		return false
 	}
@@ -448,18 +451,30 @@ func hasWordPrefix(words, prefix []string) bool {
 	return true
 }
 
-func refusalTail(words []string) bool {
+func inaccessibleAttachmentStatement(words []string) bool {
+	hasInability := false
 	hasAction := false
 	for _, word := range words {
 		switch word {
-		case "cannot", "can't", "unable", "assist", "comply", "read", "transcribe", "view":
+		case "cannot", "can't", "unable":
+			hasInability = true
+		case "access", "transcribe", "view":
 			hasAction = true
-		case "a", "ai", "am", "an", "and", "apologize", "as", "attached", "because", "but", "document", "image", "is", "it", "language", "model", "of", "page", "pages", "provided", "request", "sorry", "that", "the", "this", "to", "unavailable", "unclear", "unreadable", "with", "i", "i'm", "unfortunately":
+		case "am", "and", "attached", "attachment", "document", "i", "image", "pages", "provided", "the", "this", "to":
 		default:
 			return false
 		}
 	}
-	return hasAction
+	return hasInability && hasAction
+}
+
+func noTranscriptionStatement(words []string) bool {
+	switch strings.Join(words, " ") {
+	case "was produced", "was provided", "has been produced for this attachment", "could be provided":
+		return true
+	default:
+		return false
+	}
 }
 
 func pageSeparator(page Page) string {
