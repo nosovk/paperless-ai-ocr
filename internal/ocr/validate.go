@@ -78,6 +78,9 @@ func Validate(raw []byte, firstPage, lastPage int) (Batch, error) {
 	if !validJSONUnicodeEscapes(raw) {
 		return Batch{}, invalidTranscriptionError()
 	}
+	if !literalObjectKeys(raw) {
+		return Batch{}, invalidTranscriptionError()
+	}
 	if err := rejectDuplicateFields(json.NewDecoder(bytes.NewReader(raw))); err != nil {
 		return Batch{}, invalidTranscriptionError()
 	}
@@ -120,6 +123,41 @@ func Validate(raw []byte, firstPage, lastPage int) (Batch, error) {
 	}
 
 	return Batch{firstPage: firstPage, lastPage: lastPage, pages: pages}, nil
+}
+
+func literalObjectKeys(raw []byte) bool {
+	for index := 0; index < len(raw); index++ {
+		if raw[index] != '"' {
+			continue
+		}
+		hasEscape := false
+		index++
+		for index < len(raw) && raw[index] != '"' {
+			if raw[index] == '\\' {
+				hasEscape = true
+				index++
+				if index >= len(raw) {
+					return false
+				}
+			}
+			index++
+		}
+		if index >= len(raw) {
+			return false
+		}
+		next := index + 1
+		for next < len(raw) && isJSONWhitespace(raw[next]) {
+			next++
+		}
+		if next < len(raw) && raw[next] == ':' && hasEscape {
+			return false
+		}
+	}
+	return true
+}
+
+func isJSONWhitespace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\n' || value == '\r'
 }
 
 func validJSONUnicodeEscapes(raw []byte) bool {

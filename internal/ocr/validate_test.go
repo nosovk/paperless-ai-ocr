@@ -167,6 +167,27 @@ func TestValidateRejectsUnicodeFoldedSchemaAliases(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsEscapedSchemaKeys(t *testing.T) {
+	for _, key := range []string{"pages", "page", "text", "refused"} {
+		for _, escaped := range escapedKeyVariants(key) {
+			for _, test := range []struct {
+				name string
+				raw  string
+			}{
+				{name: "correct_level", raw: rawWithKeyAtCorrectLevel(key, escaped)},
+				{name: "wrong_level", raw: rawWithKeyAtWrongLevel(key, escaped)},
+				{name: "escaped_then_literal", raw: rawWithEscapedAndLiteralKeys(key, escaped, true)},
+				{name: "literal_then_escaped", raw: rawWithEscapedAndLiteralKeys(key, escaped, false)},
+			} {
+				t.Run(key+"/"+escaped+"/"+test.name, func(t *testing.T) {
+					_, err := Validate([]byte(test.raw), 1, 1)
+					assertSafeProviderError(t, err, []byte(test.raw))
+				})
+			}
+		}
+	}
+}
+
 func TestValidateRejectsMalformedUnicodeEscapes(t *testing.T) {
 	for _, raw := range []string{
 		`{"pages":[{"page":1,"text":"lone high \ud800 marker","refused":false}]}`,
@@ -506,4 +527,52 @@ func caseVariants(value string) []string {
 		}
 	}
 	return variants
+}
+
+func escapedKeyVariants(key string) []string {
+	variants := make([]string, 0, len(key)*2)
+	seen := make(map[string]struct{})
+	for index := range len(key) {
+		for _, escape := range []string{fmt.Sprintf(`\u%04x`, key[index]), fmt.Sprintf(`\u%04X`, key[index])} {
+			variant := key[:index] + escape + key[index+1:]
+			if _, exists := seen[variant]; !exists {
+				seen[variant] = struct{}{}
+				variants = append(variants, variant)
+			}
+		}
+	}
+	return variants
+}
+
+func rawWithKeyAtCorrectLevel(key, escaped string) string {
+	if key == "pages" {
+		return fmt.Sprintf(`{"%s":[{"page":1,"text":"one","refused":false}]}`, escaped)
+	}
+	switch key {
+	case "page":
+		return fmt.Sprintf(`{"pages":[{"%s":1,"text":"one","refused":false}]}`, escaped)
+	case "text":
+		return fmt.Sprintf(`{"pages":[{"page":1,"%s":"one","refused":false}]}`, escaped)
+	default:
+		return fmt.Sprintf(`{"pages":[{"page":1,"text":"one","%s":false}]}`, escaped)
+	}
+}
+
+func rawWithKeyAtWrongLevel(key, escaped string) string {
+	if key == "pages" {
+		return fmt.Sprintf(`{"pages":[{"%s":[],"page":1,"text":"one","refused":false}]}`, escaped)
+	}
+	return fmt.Sprintf(`{"pages":[{"page":1,"text":"one","refused":false}],"%s":null}`, escaped)
+}
+
+func rawWithEscapedAndLiteralKeys(key, escaped string, escapedFirst bool) string {
+	first, second := key, escaped
+	if escapedFirst {
+		first, second = escaped, key
+	}
+	if key == "pages" {
+		return fmt.Sprintf(`{"%s":[],"%s":[{"page":1,"text":"one","refused":false}]}`, first, second)
+	}
+	value := map[string]string{"page": "1", "text": `"one"`, "refused": "false"}[key]
+	return fmt.Sprintf(`{"pages":[{"%s":%s,"%s":%s}]}`, first, value, second, value)
 }
