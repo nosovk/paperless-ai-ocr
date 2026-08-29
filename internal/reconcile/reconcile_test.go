@@ -19,6 +19,7 @@ import (
 	"github.com/nosovk/paperless-ai-ocr/internal/database"
 	"github.com/nosovk/paperless-ai-ocr/internal/paperless"
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
+	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
 )
 
 func TestRunOnceResolvesWebhookCandidatesBeforeBoundedBackfill(t *testing.T) {
@@ -101,6 +102,105 @@ func TestRunOnceTemporaryCandidateFailureRetainsCandidateAndStops(t *testing.T) 
 	}
 	if got := requests(); !slices.Equal(got, []string{"/api/documents/1/"}) {
 		t.Errorf("requests = %v, want no archive request", got)
+	}
+}
+
+func TestRunOnceUsesCandidatePriorityPromotedDuringPaperlessRequest(t *testing.T) {
+	db, q := openStore(t, filepath.Join(t.TempDir(), "reconcile.db"))
+	if _, err := q.EnqueueCandidate(context.Background(), 1, queue.PriorityBackfill); err != nil {
+		t.Fatal(err)
+	}
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	client, _ := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/documents/1/" {
+			close(requestStarted)
+			<-releaseRequest
+			io.WriteString(writer, `{"id":1,"checksum":"checksum","tags":[]}`)
+			return
+		}
+		io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+	})
+	r := newReconciler(t, db, client, q, Options{})
+	type result struct {
+		report Report
+		err    error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		report, err := r.RunOnce(context.Background())
+		resultCh <- result{report: report, err: err}
+	}()
+
+	<-requestStarted
+	if _, err := q.EnqueueCandidate(context.Background(), 1, queue.PriorityWebhook); err != nil {
+		t.Fatalf("promote candidate during request: %v", err)
+	}
+	close(releaseRequest)
+	resultValue := <-resultCh
+	if resultValue.err != nil || resultValue.report.CandidatesResolved != 1 {
+		t.Fatalf("RunOnce() = (%+v, %v), want resolved candidate", resultValue.report, resultValue.err)
+	}
+	if _, ok, err := q.NextCandidate(context.Background()); err != nil || ok {
+		t.Fatalf("NextCandidate() after RunOnce = (_, %t, %v), want empty", ok, err)
+	}
+	job, ok, err := q.Claim("worker", time.Minute)
+	if err != nil || !ok || job.Priority != queue.PriorityWebhook {
+		t.Fatalf("Claim() = (%+v, %t, %v), want webhook priority", job, ok, err)
+	}
+}
+
+func TestRunOncePreservesPaperlessErrorCategoryAndCause(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		candidate bool
+	}{
+		{name: "candidate", candidate: true},
+		{name: "archive"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, q := openStore(t, filepath.Join(t.TempDir(), "reconcile.db"))
+			if test.candidate {
+				if _, err := q.EnqueueCandidate(context.Background(), 1, queue.PriorityWebhook); err != nil {
+					t.Fatal(err)
+				}
+			}
+			client, _ := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+				http.Error(writer, "sensitive response body", http.StatusInternalServerError)
+			})
+			r := newReconciler(t, db, client, q, Options{})
+
+			_, err := r.RunOnce(context.Background())
+			if errorCategory(err) != saferr.CategoryPaperless {
+				t.Fatalf("RunOnce() error = %v, category = %q, want paperless", err, errorCategory(err))
+			}
+			var statusErr *paperless.StatusError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusInternalServerError {
+				t.Errorf("RunOnce() error cause = %v, want Paperless status 500", err)
+			}
+			if strings.Contains(err.Error(), "sensitive response body") {
+				t.Errorf("RunOnce() error %q exposes response body", err)
+			}
+		})
+	}
+}
+
+func TestRunOncePreservesInternalQueueErrorCategory(t *testing.T) {
+	db, q := openStore(t, filepath.Join(t.TempDir(), "reconcile.db"))
+	if _, err := db.Exec("DROP TABLE candidates"); err != nil {
+		t.Fatalf("drop candidates: %v", err)
+	}
+	client, _ := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+		t.Fatal("Paperless request made after queue failure")
+	})
+	r := newReconciler(t, db, client, q, Options{})
+
+	_, err := r.RunOnce(context.Background())
+	if errorCategory(err) != saferr.CategoryInternal {
+		t.Fatalf("RunOnce() error = %v, category = %q, want internal", err, errorCategory(err))
+	}
+	if strings.Contains(err.Error(), "no such table") {
+		t.Errorf("RunOnce() error %q exposes database details", err)
 	}
 }
 
@@ -276,6 +376,9 @@ func TestRunOnceErrorsDoNotExposeDocumentOrCursorData(t *testing.T) {
 	if err == nil {
 		t.Fatal("RunOnce() error = nil, want unsafe cursor error")
 	}
+	if errorCategory(err) != saferr.CategoryPaperless {
+		t.Errorf("RunOnce() category = %q, want paperless", errorCategory(err))
+	}
 	for _, forbidden := range []string{"sensitive-checksum", "elsewhere.example", "token=sensitive"} {
 		if strings.Contains(err.Error(), forbidden) {
 			t.Errorf("RunOnce() error %q exposes %q", err, forbidden)
@@ -391,4 +494,12 @@ func assertClaimOrder(t *testing.T, q *queue.Queue, want []int64) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func errorCategory(err error) saferr.Category {
+	var safeError *saferr.Error
+	if errors.As(err, &safeError) {
+		return safeError.Category()
+	}
+	return ""
 }

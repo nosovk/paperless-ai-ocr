@@ -191,5 +191,9 @@ func (r *Reconciler) setCheckpoint(ctx context.Context, cursor string) error {
 }
 
 func reconcileError(message string, cause error) error {
+	var safeError *saferr.Error
+	if errors.As(cause, &safeError) {
+		return saferr.Wrap(safeError.Category(), message, cause)
+	}
 	return saferr.Wrap(saferr.CategoryInternal, message, cause)
 }

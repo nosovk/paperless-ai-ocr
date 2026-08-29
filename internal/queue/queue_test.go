@@ -186,6 +186,34 @@ func TestResolveCandidateAtomicallyEnqueuesAndDeletes(t *testing.T) {
 	}
 }
 
+func TestResolveCandidateUsesAuthoritativePromotedPriority(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityBackfill); err != nil {
+		t.Fatalf("enqueue backfill candidate: %v", err)
+	}
+	stale, ok, err := q.NextCandidate(context.Background())
+	if err != nil || !ok || stale.Priority != PriorityBackfill {
+		t.Fatalf("NextCandidate() = (%+v, %t, %v), want backfill", stale, ok, err)
+	}
+	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
+		t.Fatalf("promote candidate: %v", err)
+	}
+
+	job, created, err := q.ResolveCandidate(context.Background(), stale.DocumentID, EnqueueInput{
+		DocumentID: stale.DocumentID, SourceChecksum: "checksum", Priority: stale.Priority,
+		Model: "model", PromptVersion: "v1",
+	})
+	if err != nil || !created {
+		t.Fatalf("ResolveCandidate() = (%+v, %t, %v), want created job", job, created, err)
+	}
+	if job.Priority != PriorityWebhook {
+		t.Errorf("resolved job priority = %d, want %d", job.Priority, PriorityWebhook)
+	}
+	if _, ok, err := q.NextCandidate(context.Background()); err != nil || ok {
+		t.Fatalf("NextCandidate() after resolve = (_, %t, %v), want empty", ok, err)
+	}
+}
+
 func TestResolveCandidateRetainsCandidateOnInvalidOrMismatchedInput(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
@@ -201,6 +229,25 @@ func TestResolveCandidateRetainsCandidateOnInvalidOrMismatchedInput(t *testing.T
 	}
 	if candidate, ok, err := q.NextCandidate(context.Background()); err != nil || !ok || candidate.DocumentID != 42 {
 		t.Fatalf("retained NextCandidate() = (%+v, %t, %v), want document 42", candidate, ok, err)
+	}
+}
+
+func TestResolveCandidateMissingCandidateDoesNotEnqueue(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+
+	_, _, err := q.ResolveCandidate(context.Background(), 42, EnqueueInput{
+		DocumentID: 42, SourceChecksum: "checksum", Priority: PriorityWebhook,
+		Model: "model", PromptVersion: "v1",
+	})
+	if errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("ResolveCandidate() error = %v, want validation", err)
+	}
+	var count int
+	if err := q.db.QueryRow("SELECT count(*) FROM jobs").Scan(&count); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("job count = %d, want 0", count)
 	}
 }
 

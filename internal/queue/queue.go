@@ -107,9 +107,7 @@ func (q *Queue) ResolveCandidate(ctx context.Context, documentID int64, input En
 			}
 			return internalError("cannot inspect queued candidate", err)
 		}
-		if input.Priority != priority {
-			return validationError("candidate priority changed")
-		}
+		input.Priority = priority
 		var err error
 		job, created, err = q.enqueue(ctx, conn, input)
 		if err != nil {
