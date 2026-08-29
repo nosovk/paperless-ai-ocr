@@ -3,16 +3,19 @@ package aigate
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -241,31 +244,54 @@ func TestTranscribeRetryClassification(t *testing.T) {
 func TestTranscribeTransportFailureRetryClassification(t *testing.T) {
 	tests := []struct {
 		name      string
-		transport errorTransport
+		cause     error
 		wantRetry bool
 	}{
-		{name: "temporary network failure", transport: errorTransport{err: temporaryNetworkError("CANARY-network-secret")}, wantRetry: true},
-		{name: "connection reset", transport: errorTransport{err: &url.Error{Op: "Post", URL: "https://CANARY-url-secret", Err: temporaryNetworkError("connection reset CANARY-secret")}}, wantRetry: true},
-		{name: "deterministic TLS failure", transport: errorTransport{err: tls.RecordHeaderError{Msg: "CANARY-TLS-secret"}}},
+		{name: "direct EOF", cause: io.EOF, wantRetry: true},
+		{name: "wrapped EOF", cause: fmt.Errorf("CANARY-wrapper-secret: %w", io.EOF), wantRetry: true},
+		{name: "unexpected EOF", cause: io.ErrUnexpectedEOF, wantRetry: true},
+		{name: "connection reset", cause: socketError(syscall.ECONNRESET), wantRetry: true},
+		{name: "connection refused", cause: socketError(syscall.ECONNREFUSED), wantRetry: true},
+		{name: "broken pipe", cause: &url.Error{Op: "Post-CANARY-op", URL: "https://CANARY-url-secret", Err: socketError(syscall.EPIPE)}, wantRetry: true},
+		{name: "timeout", cause: timeoutNetworkError("CANARY-timeout-secret"), wantRetry: true},
+		{name: "temporary-only network error", cause: temporaryNetworkError("CANARY-temporary-secret")},
+		{name: "deterministic TLS failure", cause: tls.RecordHeaderError{Msg: "CANARY-TLS-secret"}},
+		{name: "certificate failure", cause: x509.CertificateInvalidError{Reason: x509.Expired}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			client := newTestClient(t, "https://example.com/v1", "key", "model", ClientOptions{HTTPClient: &http.Client{Transport: test.transport}})
+			client := newTestClient(t, "https://example.com/v1", "key", "model", ClientOptions{HTTPClient: &http.Client{Transport: errorTransport{err: test.cause}}})
 			_, err := client.Transcribe(context.Background(), Transcription{Capability: DirectPDF, FirstPage: 1, LastPage: 1, PDF: []byte{1}})
 			class, delay, retry := Retry(err)
 			if retry != test.wantRetry || (retry && (class != RetryUnavailable || delay != 0)) {
 				t.Errorf("Retry() = %q, %v, %t, want unavailable, 0, %t", class, delay, retry, test.wantRetry)
 			}
-			if errors.Is(err, test.transport.err) {
+			if errors.Is(err, test.cause) {
 				t.Error("transport error is exposed through unwrap chain")
 			}
-			formatted := fmt.Sprintf("%v|%+v|%#v", err, err, err)
-			for _, secret := range []string{"CANARY-network-secret", "CANARY-url-secret", "CANARY-secret", "connection reset"} {
-				if strings.Contains(formatted, secret) {
-					t.Errorf("error disclosed %q in %q", secret, formatted)
+			for current := err; current != nil; current = errors.Unwrap(current) {
+				formatted := fmt.Sprintf("%s|%q|%v|%+v|%#v", current, current, current, current, current)
+				for _, secret := range []string{"CANARY", "connection reset", "connection refused", "broken pipe", "unexpected EOF"} {
+					if strings.Contains(formatted, secret) {
+						t.Errorf("error disclosed %q in %q", secret, formatted)
+					}
 				}
 			}
 		})
+	}
+}
+
+func TestTranscribeRedirectPolicyFailureIsPermanent(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer target.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, target.URL+"/CANARY-target-secret", http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL+"/v1", "key", "model", ClientOptions{})
+	_, err := client.Transcribe(context.Background(), Transcription{Capability: DirectPDF, FirstPage: 1, LastPage: 1, PDF: []byte{1}})
+	if _, _, retry := Retry(err); retry {
+		t.Error("redirect policy failure classified as retryable")
 	}
 }
 
@@ -575,3 +601,19 @@ type temporaryNetworkError string
 func (err temporaryNetworkError) Error() string { return string(err) }
 func (temporaryNetworkError) Timeout() bool     { return false }
 func (temporaryNetworkError) Temporary() bool   { return true }
+
+type timeoutNetworkError string
+
+func (err timeoutNetworkError) Error() string { return string(err) }
+func (timeoutNetworkError) Timeout() bool     { return true }
+func (timeoutNetworkError) Temporary() bool   { return false }
+
+func socketError(cause error) error {
+	return &net.OpError{
+		Op:     "dial-CANARY-op",
+		Net:    "tcp-CANARY-net",
+		Source: &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 1111},
+		Addr:   &net.TCPAddr{IP: net.ParseIP("198.51.100.20"), Port: 2222},
+		Err:    cause,
+	}
+}
