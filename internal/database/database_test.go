@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-const supportedSchemaVersion = 1
+const supportedSchemaVersion = 2
 
 func TestOpenCreatesAndConfiguresDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "queue.db")
@@ -22,7 +22,7 @@ func TestOpenCreatesAndConfiguresDatabase(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	for _, table := range []string{"jobs", "batches", "settings"} {
+	for _, table := range []string{"jobs", "batches", "settings", "candidates"} {
 		var count int
 		if err := db.QueryRow(
 			"SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -42,6 +42,40 @@ func TestOpenCreatesAndConfiguresDatabase(t *testing.T) {
 
 	if got := db.Stats().MaxOpenConnections; got != 1 {
 		t.Errorf("MaxOpenConnections = %d, want 1", got)
+	}
+}
+
+func TestOpenUpgradesVersionOneDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	db, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatalf("sql.Open(): %v", err)
+	}
+	if err := applyMigrations(db, migrations[:1]); err != nil {
+		t.Fatalf("apply version 1 migration: %v", err)
+	}
+	insertJob(t, db, 1, "preserved", "pending")
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version 1 database: %v", err)
+	}
+
+	db = openTestDatabase(t, path)
+	assertPragmaValue(t, db, "user_version", fmt.Sprint(supportedSchemaVersion))
+	var jobs int
+	if err := db.QueryRow("SELECT count(*) FROM jobs").Scan(&jobs); err != nil {
+		t.Fatalf("count preserved jobs: %v", err)
+	}
+	if jobs != 1 {
+		t.Errorf("preserved job count = %d, want 1", jobs)
+	}
+	var candidates int
+	if err := db.QueryRow(
+		"SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'candidates'",
+	).Scan(&candidates); err != nil {
+		t.Fatalf("query candidates table: %v", err)
+	}
+	if candidates != 1 {
+		t.Errorf("candidates table count = %d, want 1", candidates)
 	}
 }
 

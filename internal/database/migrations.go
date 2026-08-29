@@ -11,6 +11,9 @@ import (
 //go:embed migrations/001_initial.sql
 var initialMigration string
 
+//go:embed migrations/002_candidates.sql
+var candidatesMigration string
+
 type migration struct {
 	version int
 	sql     string
@@ -18,6 +21,7 @@ type migration struct {
 
 var migrations = []migration{
 	{version: 1, sql: initialMigration},
+	{version: 2, sql: candidatesMigration},
 }
 
 func applyMigrations(db *sql.DB, available []migration) error {

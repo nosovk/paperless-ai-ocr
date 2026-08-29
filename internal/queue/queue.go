@@ -27,6 +27,46 @@ func New(db *sql.DB) *Queue {
 	return &Queue{db: db, now: time.Now}
 }
 
+// EnqueueCandidate durably records a document that still needs job inputs resolved.
+// The returned bool reports whether a new row was created.
+func (q *Queue) EnqueueCandidate(ctx context.Context, documentID int64, priority Priority) (bool, error) {
+	if documentID <= 0 || !priority.valid() {
+		return false, validationError("invalid candidate input")
+	}
+
+	created := false
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
+		var current Priority
+		err := conn.QueryRowContext(ctx,
+			"SELECT priority FROM candidates WHERE document_id = ?", documentID,
+		).Scan(&current)
+		switch {
+		case err == nil:
+			if priority <= current {
+				return nil
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE candidates
+				SET priority = ?, updated_at = ? WHERE document_id = ?`,
+				priority, formatTime(q.now()), documentID); err != nil {
+				return internalError("cannot promote queued candidate", err)
+			}
+			return nil
+		case !errors.Is(err, sql.ErrNoRows):
+			return internalError("cannot inspect queued candidate", err)
+		}
+
+		now := formatTime(q.now())
+		if _, err := conn.ExecContext(ctx, `INSERT INTO candidates (
+			document_id, priority, created_at, updated_at
+		) VALUES (?, ?, ?, ?)`, documentID, priority, now, now); err != nil {
+			return internalError("cannot enqueue candidate", err)
+		}
+		created = true
+		return nil
+	})
+	return created, err
+}
+
 // Enqueue creates current work or returns an existing current or terminal job.
 // The returned bool reports whether a new row was created.
 func (q *Queue) Enqueue(input EnqueueInput) (Job, bool, error) {
@@ -268,23 +308,27 @@ func (q *Queue) get(id int64) (Job, error) {
 }
 
 func (q *Queue) write(fn func(*sql.Conn) error) (err error) {
-	conn, err := q.db.Conn(context.Background())
+	return q.writeContext(context.Background(), fn)
+}
+
+func (q *Queue) writeContext(ctx context.Context, fn func(*sql.Conn) error) (err error) {
+	conn, err := q.db.Conn(ctx)
 	if err != nil {
 		return internalError("cannot acquire database connection", err)
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return internalError("cannot begin queue transaction", err)
 	}
 	defer func() {
 		if err != nil {
-			conn.ExecContext(context.Background(), "ROLLBACK")
+			conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 		}
 	}()
 	if err = fn(conn); err != nil {
 		return err
 	}
-	if _, err = conn.ExecContext(context.Background(), "COMMIT"); err != nil {
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return internalError("cannot commit queue transaction", err)
 	}
 	return nil

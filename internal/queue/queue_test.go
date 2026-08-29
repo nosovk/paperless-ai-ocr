@@ -17,6 +17,122 @@ import (
 
 var testNow = time.Date(2026, time.August, 29, 12, 0, 0, 123456789, time.FixedZone("test", 2*60*60))
 
+func TestEnqueueCandidateIsDurableIdempotentAndPromotes(t *testing.T) {
+	now := testNow
+	path := filepath.Join(t.TempDir(), "queue.db")
+	q := openTestQueue(t, path, now)
+
+	created, err := q.EnqueueCandidate(context.Background(), 42, PriorityBackfill)
+	if err != nil || !created {
+		t.Fatalf("first EnqueueCandidate() = (%t, %v), want (true, nil)", created, err)
+	}
+	now = now.Add(time.Second)
+	q.now = func() time.Time { return now }
+	created, err = q.EnqueueCandidate(context.Background(), 42, PriorityWebhook)
+	if err != nil || created {
+		t.Fatalf("promoting EnqueueCandidate() = (%t, %v), want (false, nil)", created, err)
+	}
+	created, err = q.EnqueueCandidate(context.Background(), 42, PriorityBackfill)
+	if err != nil || created {
+		t.Fatalf("duplicate EnqueueCandidate() = (%t, %v), want (false, nil)", created, err)
+	}
+	if err := q.db.Close(); err != nil {
+		t.Fatalf("close candidate database: %v", err)
+	}
+	db, err := database.Open(path)
+	if err != nil {
+		t.Fatalf("reopen candidate database: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	var count int
+	var priority Priority
+	var createdAt, updatedAt string
+	if err := db.QueryRow(`SELECT count(*), priority, created_at, updated_at
+		FROM candidates WHERE document_id = 42`).Scan(&count, &priority, &createdAt, &updatedAt); err != nil {
+		t.Fatalf("load candidate: %v", err)
+	}
+	if count != 1 || priority != PriorityWebhook {
+		t.Errorf("candidate = (count %d, priority %d), want (1, %d)", count, priority, PriorityWebhook)
+	}
+	if createdAt == updatedAt {
+		t.Errorf("candidate timestamps = (%q, %q), want promotion to advance updated_at", createdAt, updatedAt)
+	}
+}
+
+func TestEnqueueCandidateValidatesInputAndContext(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	for _, test := range []struct {
+		documentID int64
+		priority   Priority
+	}{
+		{documentID: 0, priority: PriorityWebhook},
+		{documentID: -1, priority: PriorityWebhook},
+		{documentID: 1, priority: 1},
+	} {
+		if _, err := q.EnqueueCandidate(context.Background(), test.documentID, test.priority); errorCategory(err) != saferr.CategoryValidation {
+			t.Errorf("EnqueueCandidate(%d, %d) error = %v, want validation error", test.documentID, test.priority, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := q.EnqueueCandidate(ctx, 1, PriorityWebhook); err == nil {
+		t.Fatal("EnqueueCandidate(canceled context) error = nil, want error")
+	}
+}
+
+func TestEnqueueCandidateIsAtomicAcrossDatabaseHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	q1 := openTestQueue(t, path, testNow)
+	q2 := openTestQueue(t, path, testNow)
+	const deliveries = 20
+	start := make(chan struct{})
+	results := make(chan bool, deliveries)
+	errs := make(chan error, deliveries)
+	var wg sync.WaitGroup
+	for i := range deliveries {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			q := q1
+			if i%2 == 1 {
+				q = q2
+			}
+			created, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook)
+			results <- created
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	created := 0
+	for result := range results {
+		if result {
+			created++
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent EnqueueCandidate() error = %v", err)
+		}
+	}
+	if created != 1 {
+		t.Errorf("created candidates = %d, want 1", created)
+	}
+	var count int
+	if err := q1.db.QueryRow("SELECT count(*) FROM candidates WHERE document_id = 42").Scan(&count); err != nil {
+		t.Fatalf("count candidates: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("candidate count = %d, want 1", count)
+	}
+}
+
 func TestEnqueueIsIdempotentAndPromotesCurrentWork(t *testing.T) {
 	now := testNow
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)
