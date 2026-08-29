@@ -1,5 +1,5 @@
 CREATE TABLE jobs (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY CHECK (id > 0),
     document_id INTEGER NOT NULL CHECK (document_id > 0),
     source_checksum TEXT NOT NULL CHECK (length(source_checksum) > 0),
     priority INTEGER NOT NULL DEFAULT 0 CHECK (typeof(priority) = 'integer'),
@@ -35,7 +35,7 @@ CREATE INDEX jobs_claim_order
 ON jobs (state, available_at, priority DESC, created_at, id);
 
 CREATE TABLE batches (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY CHECK (id > 0),
     job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     page_start INTEGER NOT NULL CHECK (page_start > 0),
     page_end INTEGER NOT NULL CHECK (page_end >= page_start),
@@ -45,7 +45,7 @@ CREATE TABLE batches (
         state IN ('pending', 'processing', 'retry', 'completed', 'failed')
     ),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-    available_at TEXT,
+    available_at TEXT NOT NULL CHECK (length(available_at) > 0),
     lease_owner TEXT,
     lease_expires_at TEXT,
     result_text TEXT,
@@ -63,7 +63,10 @@ CREATE TABLE batches (
         (error_category IS NULL AND error_message IS NULL)
         OR (error_category IS NOT NULL AND error_message IS NOT NULL)
     ),
-    CHECK (state != 'completed' OR length(result_text) > 0)
+    CHECK (
+        state != 'completed'
+        OR (result_text IS NOT NULL AND length(result_text) > 0)
+    )
 );
 
 CREATE INDEX batches_job_state_pages

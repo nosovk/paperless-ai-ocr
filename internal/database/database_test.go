@@ -68,6 +68,24 @@ func TestOpenMigratesOnlyOnce(t *testing.T) {
 func TestDatabaseConstraints(t *testing.T) {
 	db := openTestDatabase(t, filepath.Join(t.TempDir(), "queue.db"))
 
+	t.Run("job positive ID", func(t *testing.T) {
+		for _, id := range []int64{0, -1} {
+			_, err := db.Exec(`INSERT INTO jobs (
+				id, document_id, source_checksum, priority, state, attempts, model,
+				prompt_version, available_at, created_at, updated_at
+			) VALUES (?, 10, ?, 0, 'pending', 0, 'model', 'v1',
+				CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, id, fmt.Sprintf("invalid-id-%d", id))
+			assertConstraintError(t, err)
+		}
+	})
+
+	t.Run("omitted job ID auto-allocates positive ID", func(t *testing.T) {
+		id := insertJob(t, db, 11, "auto-job-id", "pending")
+		if id <= 0 {
+			t.Errorf("auto-allocated job ID = %d, want positive", id)
+		}
+	})
+
 	t.Run("job state", func(t *testing.T) {
 		_, err := db.Exec(`INSERT INTO jobs (
 			document_id, source_checksum, priority, state, attempts, model,
@@ -146,9 +164,58 @@ func TestDatabaseConstraints(t *testing.T) {
 		} {
 			t.Run(name, func(t *testing.T) {
 				_, err := db.Exec(fmt.Sprintf(`INSERT INTO batches (
+						job_id, page_start, page_end, render_dpi, render_format,
+						state, attempts, available_at, created_at, updated_at
+					) VALUES (?, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+						CURRENT_TIMESTAMP)`, values), jobID)
+				assertConstraintError(t, err)
+			})
+		}
+	})
+
+	t.Run("batch positive ID", func(t *testing.T) {
+		jobID := insertJob(t, db, 12, "batch-id", "pending")
+		for page, id := range []int64{0, -1} {
+			_, err := db.Exec(`INSERT INTO batches (
+				id, job_id, page_start, page_end, render_dpi, render_format,
+				state, attempts, available_at, created_at, updated_at
+			) VALUES (?, ?, ?, ?, 200, 'png', 'pending', 0,
+				CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, id, jobID, page+1, page+1)
+			assertConstraintError(t, err)
+		}
+	})
+
+	t.Run("omitted batch ID auto-allocates positive ID", func(t *testing.T) {
+		jobID := insertJob(t, db, 13, "auto-batch-id", "pending")
+		result, err := db.Exec(`INSERT INTO batches (
+			job_id, page_start, page_end, render_dpi, render_format, state,
+			attempts, available_at, created_at, updated_at
+		) VALUES (?, 1, 1, 200, 'png', 'pending', 0,
+			CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, jobID)
+		if err != nil {
+			t.Fatalf("insert batch without ID: %v", err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatalf("batch LastInsertId(): %v", err)
+		}
+		if id <= 0 {
+			t.Errorf("auto-allocated batch ID = %d, want positive", id)
+		}
+	})
+
+	t.Run("batch requires available timestamp", func(t *testing.T) {
+		jobID := insertJob(t, db, 14, "batch-available-at", "pending")
+		for name, availableAt := range map[string]any{
+			"NULL":  nil,
+			"empty": "",
+		} {
+			t.Run(name, func(t *testing.T) {
+				_, err := db.Exec(`INSERT INTO batches (
 					job_id, page_start, page_end, render_dpi, render_format,
-					state, attempts, created_at, updated_at
-				) VALUES (?, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, values), jobID)
+					state, attempts, available_at, created_at, updated_at
+				) VALUES (?, 1, 1, 200, 'png', 'pending', 0, ?,
+					CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, jobID, availableAt)
 				assertConstraintError(t, err)
 			})
 		}
@@ -170,12 +237,19 @@ func TestDatabaseConstraints(t *testing.T) {
 
 	t.Run("completed batch requires nonempty result", func(t *testing.T) {
 		jobID := insertJob(t, db, 8, "empty-result", "pending")
-		_, err := db.Exec(`INSERT INTO batches (
-			job_id, page_start, page_end, render_dpi, render_format, state,
-			attempts, result_text, created_at, updated_at
-		) VALUES (?, 1, 1, 200, 'png', 'completed', 0, '',
-			CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, jobID)
-		assertConstraintError(t, err)
+		for name, resultText := range map[string]any{
+			"NULL":  nil,
+			"empty": "",
+		} {
+			t.Run(name, func(t *testing.T) {
+				_, err := db.Exec(`INSERT INTO batches (
+					job_id, page_start, page_end, render_dpi, render_format,
+					state, attempts, available_at, result_text, created_at, updated_at
+				) VALUES (?, 1, 1, 200, 'png', 'completed', 0,
+					CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, jobID, resultText)
+				assertConstraintError(t, err)
+			})
+		}
 	})
 }
 
@@ -184,17 +258,18 @@ func TestForeignKeysAndBatchDeleteBehavior(t *testing.T) {
 
 	_, err := db.Exec(`INSERT INTO batches (
 		job_id, page_start, page_end, render_dpi, render_format, state,
-		attempts, created_at, updated_at
+		attempts, available_at, created_at, updated_at
 	) VALUES (999, 1, 1, 200, 'png', 'pending', 0,
-		CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+		CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	assertConstraintError(t, err)
 
 	jobID := insertJob(t, db, 5, "cascade", "pending")
 	if _, err := db.Exec(`INSERT INTO batches (
 		job_id, page_start, page_end, render_dpi, render_format, state,
-		attempts, result_text, created_at, updated_at
+		attempts, available_at, result_text, created_at, updated_at
 	) VALUES (?, 1, 5, 200, 'png', 'completed', 0,
-		'validated text', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, jobID); err != nil {
+		CURRENT_TIMESTAMP, 'validated text', CURRENT_TIMESTAMP,
+		CURRENT_TIMESTAMP)`, jobID); err != nil {
 		t.Fatalf("insert batch: %v", err)
 	}
 	if _, err := db.Exec("DELETE FROM jobs WHERE id = ?", jobID); err != nil {
