@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
@@ -74,6 +75,9 @@ func Validate(raw []byte, firstPage, lastPage int) (Batch, error) {
 	if !validRange(firstPage, lastPage) || len(raw) == 0 || len(raw) > maxRawBatchBytes || !utf8.Valid(raw) {
 		return Batch{}, invalidTranscriptionError()
 	}
+	if !validJSONUnicodeEscapes(raw) {
+		return Batch{}, invalidTranscriptionError()
+	}
 	if err := rejectDuplicateFields(json.NewDecoder(bytes.NewReader(raw))); err != nil {
 		return Batch{}, invalidTranscriptionError()
 	}
@@ -116,6 +120,71 @@ func Validate(raw []byte, firstPage, lastPage int) (Batch, error) {
 	}
 
 	return Batch{firstPage: firstPage, lastPage: lastPage, pages: pages}, nil
+}
+
+func validJSONUnicodeEscapes(raw []byte) bool {
+	for index := 0; index < len(raw); index++ {
+		if raw[index] != '"' {
+			continue
+		}
+		index++
+		for index < len(raw) && raw[index] != '"' {
+			if raw[index] != '\\' {
+				index++
+				continue
+			}
+			if index+1 >= len(raw) {
+				return false
+			}
+			if raw[index+1] != 'u' {
+				index += 2
+				continue
+			}
+			codeUnit, ok := parseHexCodeUnit(raw, index+2)
+			if !ok {
+				return false
+			}
+			index += 6
+			switch {
+			case codeUnit >= 0xd800 && codeUnit <= 0xdbff:
+				if index+1 >= len(raw) || raw[index] != '\\' || raw[index+1] != 'u' {
+					return false
+				}
+				low, ok := parseHexCodeUnit(raw, index+2)
+				if !ok || low < 0xdc00 || low > 0xdfff {
+					return false
+				}
+				index += 6
+			case codeUnit >= 0xdc00 && codeUnit <= 0xdfff:
+				return false
+			}
+		}
+		if index >= len(raw) {
+			return false
+		}
+	}
+	return true
+}
+
+func parseHexCodeUnit(raw []byte, start int) (uint16, bool) {
+	if start > len(raw)-4 {
+		return 0, false
+	}
+	var value uint16
+	for _, digit := range raw[start : start+4] {
+		value <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			value |= uint16(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			value |= uint16(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			value |= uint16(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
 }
 
 // Join assembles validated batches into deterministic Paperless full-text content.
@@ -200,6 +269,9 @@ func scanJSONValue(decoder *json.Decoder) error {
 			if !ok {
 				return fmt.Errorf("invalid object key")
 			}
+			if folded := strings.ToLower(key); isSchemaKey(folded) && key != folded {
+				return fmt.Errorf("schema key is not lowercase")
+			}
 			if _, exists := seen[key]; exists {
 				return fmt.Errorf("duplicate object key")
 			}
@@ -219,6 +291,15 @@ func scanJSONValue(decoder *json.Decoder) error {
 	}
 	_, err = decoder.Token()
 	return err
+}
+
+func isSchemaKey(key string) bool {
+	switch key {
+	case "pages", "page", "text", "refused":
+		return true
+	default:
+		return false
+	}
 }
 
 func validRange(firstPage, lastPage int) bool {
@@ -243,16 +324,59 @@ func validBatch(batch Batch, expectedPage int) bool {
 }
 
 func suspiciousNonTranscription(text string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(text))
-	switch normalized {
-	case "i'm sorry, but i can't transcribe this document.",
-		"i am sorry, but i cannot assist with that request.",
-		"as an ai language model, i cannot view the attached pages.",
-		"i cannot comply with this request.":
-		return true
-	default:
+	words := normalizedWords(text)
+	if len(words) == 0 || len(words) > 16 {
 		return false
 	}
+	for _, prefix := range [][]string{
+		{"i'm", "sorry"},
+		{"i", "am", "sorry"},
+		{"sorry"},
+		{"unfortunately", "i"},
+		{"i", "apologize"},
+		{"i", "cannot"},
+		{"i", "can't"},
+		{"i", "am", "unable"},
+		{"as", "an", "ai", "language", "model"},
+	} {
+		if hasWordPrefix(words, prefix) && refusalTail(words[len(prefix):]) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedWords(text string) []string {
+	normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(text)), "’", "'")
+	return strings.FieldsFunc(normalized, func(character rune) bool {
+		return !unicode.IsLetter(character) && character != '\''
+	})
+}
+
+func hasWordPrefix(words, prefix []string) bool {
+	if len(words) < len(prefix) {
+		return false
+	}
+	for index := range prefix {
+		if words[index] != prefix[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func refusalTail(words []string) bool {
+	hasAction := false
+	for _, word := range words {
+		switch word {
+		case "cannot", "can't", "unable", "assist", "comply", "read", "transcribe", "view":
+			hasAction = true
+		case "a", "ai", "am", "an", "and", "apologize", "as", "attached", "because", "but", "document", "image", "is", "it", "language", "model", "of", "page", "pages", "provided", "request", "sorry", "that", "the", "this", "to", "unavailable", "unclear", "unreadable", "with", "i", "i'm", "unfortunately":
+		default:
+			return false
+		}
+	}
+	return hasAction
 }
 
 func pageSeparator(page Page) string {

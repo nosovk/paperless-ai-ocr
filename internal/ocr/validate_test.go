@@ -113,12 +113,95 @@ func TestValidateRejectsInvalidOutput(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsCaseVariantSchemaKeys(t *testing.T) {
+	templates := map[string]string{
+		"pages":   `{"%s":[{"page":1,"text":"one","refused":false}]}`,
+		"page":    `{"pages":[{"%s":1,"text":"one","refused":false}]}`,
+		"text":    `{"pages":[{"page":1,"%s":"one","refused":false}]}`,
+		"refused": `{"pages":[{"page":1,"text":"one","%s":false}]}`,
+	}
+	for key, template := range templates {
+		for _, variant := range caseVariants(key) {
+			t.Run(key+"_as_"+variant, func(t *testing.T) {
+				raw := []byte(fmt.Sprintf(template, variant))
+				_, err := Validate(raw, 1, 1)
+				assertSafeProviderError(t, err, raw)
+			})
+		}
+	}
+}
+
+func TestValidateRejectsMixedCaseSemanticDuplicateKeys(t *testing.T) {
+	for _, raw := range []string{
+		`{"pages":[{"page":1,"text":"one","refused":false}],"Pages":[{"page":1,"text":"again","refused":false}]}`,
+		`{"Pages":[{"page":1,"text":"one","refused":false}],"pAgEs":[{"page":1,"text":"again","refused":false}]}`,
+		`{"pages":[{"page":1,"Page":1,"text":"one","refused":false}]}`,
+		`{"pages":[{"Page":1,"pAgE":1,"text":"one","refused":false}]}`,
+		`{"pages":[{"page":1,"text":"one","Text":"again","refused":false}]}`,
+		`{"pages":[{"page":1,"Text":"one","tExT":"again","refused":false}]}`,
+		`{"pages":[{"page":1,"text":"one","refused":false,"Refused":false}]}`,
+		`{"pages":[{"page":1,"text":"one","Refused":false,"rEfUsEd":false}]}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			_, err := Validate([]byte(raw), 1, 1)
+			assertSafeProviderError(t, err, []byte(raw))
+		})
+	}
+}
+
+func TestValidateRejectsMalformedUnicodeEscapes(t *testing.T) {
+	for _, raw := range []string{
+		`{"pages":[{"page":1,"text":"lone high \ud800 marker","refused":false}]}`,
+		`{"pages":[{"page":1,"text":"lone low \udc00 marker","refused":false}]}`,
+		`{"pages":[{"page":1,"text":"high then text \ud800x","refused":false}]}`,
+		`{"pages":[{"page":1,"text":"high then escape \ud800\n","refused":false}]}`,
+		`{"pages":[{"page":1,"text":"reversed pair \udc00\ud800","refused":false}]}`,
+		`{"pages":[{"page":1,"text":"wrong pair \ud800\ud800","refused":false}]}`,
+		`{"pag\ud800es":[{"page":1,"text":"one","refused":false}]}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			_, err := Validate([]byte(raw), 1, 1)
+			assertSafeProviderError(t, err, []byte(raw))
+		})
+	}
+}
+
+func TestValidateAcceptsValidUnicodeReplacementAndSurrogatePair(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "valid surrogate pair", raw: `{"pages":[{"page":1,"text":"music \ud834\udd1e","refused":false}]}`, want: "music 𝄞"},
+		{name: "literal replacement rune", raw: `{"pages":[{"page":1,"text":"literal � marker","refused":false}]}`, want: "literal � marker"},
+		{name: "escaped replacement rune", raw: `{"pages":[{"page":1,"text":"escaped \ufffd marker","refused":false}]}`, want: "escaped � marker"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			batch, err := Validate([]byte(test.raw), 1, 1)
+			if err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+			if got := batch.Pages()[0].Text(); got != test.want {
+				t.Errorf("Text() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestValidateSuspiciousNonTranscriptionProse(t *testing.T) {
 	for _, text := range []string{
 		"I'm sorry, but I can't transcribe this document.",
 		"I am sorry, but I cannot assist with that request.",
 		"As an AI language model, I cannot view the attached pages.",
 		"I cannot comply with this request.",
+		"Sorry, but I can't transcribe the document.",
+		"SORRY! I cannot transcribe this page.",
+		"I cannot transcribe the provided image.",
+		"I can't transcribe this attached document; it is unreadable.",
+		"Unfortunately, I cannot transcribe the image because it is unclear.",
+		"I apologize, but I am unable to read the provided page.",
+		"As an AI language model: sorry, but I cannot view this image.",
+		"I’m sorry, but I can’t transcribe this document.",
 	} {
 		t.Run(text, func(t *testing.T) {
 			_, err := Validate(transcriptionJSON(1, text), 1, 1)
@@ -133,6 +216,9 @@ func TestValidateAllowsSimilarDocumentText(t *testing.T) {
 		"The witness stated: I cannot comply with this request. The hearing then adjourned.",
 		"I'm sorry, but I can't transcribe this document was the exact message displayed by the machine, according to the report.",
 		"As an AI language model, I cannot view the attached pages is an example sentence in this textbook chapter.",
+		"I cannot transcribe the provided image unless the archive grants access, the curator wrote in the incident log.",
+		"Sorry, but I can't transcribe the document was printed in red beneath the scanner's error code.",
+		"Unfortunately, I cannot transcribe the image because it is unclear was her summary of the software's response.",
 	} {
 		t.Run(text, func(t *testing.T) {
 			if _, err := Validate(transcriptionJSON(1, text), 1, 1); err != nil {
@@ -218,8 +304,8 @@ func TestJoinRejectsInvalidBatches(t *testing.T) {
 
 func FuzzValidate(f *testing.F) {
 	f.Add([]byte(`{"pages":[{"page":1,"text":"CANARY-one","refused":false}]}`), 1, 1)
-	f.Add([]byte(`{"pages":[]} trailing-CANARY`), 1, 1)
-	f.Add([]byte{0xff, 'C', 'A', 'N', 'A', 'R', 'Y'}, 1, 1)
+	f.Add([]byte(`{"pages":[]} trailing-validate-disclosure-marker-7c91`), 1, 1)
+	f.Add([]byte{0xff, 'v', 'a', 'l', 'i', 'd', 'a', 't', 'e', '-', 'm', 'a', 'r', 'k', 'e', 'r', '-', '9', 'f', '2'}, 1, 1)
 	f.Fuzz(func(t *testing.T, raw []byte, firstPage, lastPage int) {
 		batch1, err1 := Validate(raw, firstPage, lastPage)
 		batch2, err2 := Validate(raw, firstPage, lastPage)
@@ -233,10 +319,11 @@ func FuzzValidate(f *testing.F) {
 }
 
 func FuzzJoin(f *testing.F) {
+	f.Add(0, "join-disclosure-marker-CANARY-4e82")
 	f.Add(1, "CANARY-one")
 	f.Add(2, "two\nlines")
 	f.Fuzz(func(t *testing.T, page int, text string) {
-		if page <= 0 || len(text) > maxPageTextBytes || !utf8.ValidString(text) || strings.TrimSpace(text) == "" {
+		if len(text) > maxPageTextBytes || !utf8.ValidString(text) || strings.TrimSpace(text) == "" {
 			return
 		}
 		batch := Batch{firstPage: page, lastPage: page, pages: []Page{{number: page, text: text}}}
@@ -251,7 +338,7 @@ func FuzzJoin(f *testing.F) {
 	})
 }
 
-func assertSafeProviderError(t *testing.T, err error, _ []byte) {
+func assertSafeProviderError(t *testing.T, err error, raw []byte) {
 	t.Helper()
 	if err == nil {
 		t.Fatal("error = nil, want provider validation error")
@@ -263,16 +350,51 @@ func assertSafeProviderError(t *testing.T, err error, _ []byte) {
 	if got := err.Error(); got != "provider: "+invalidTranscriptionMessage && got != "provider: "+invalidJoinMessage {
 		t.Errorf("error = %q, want stable generic message", got)
 	}
-	for _, formatted := range []string{fmt.Sprintf("%s", err), fmt.Sprintf("%v", err), fmt.Sprintf("%+v", err), fmt.Sprintf("%#v", err)} {
-		if strings.Contains(formatted, "CANARY") {
-			t.Errorf("error disclosed input marker: %q", formatted)
+	if errorDisclosesInput(err, raw) {
+		t.Error("error formatting or unwrap chain disclosed input")
+	}
+}
+
+func errorDisclosesInput(err error, raw []byte) bool {
+	const minDisclosureBytes = 8
+	if len(raw) < minDisclosureBytes {
+		return false
+	}
+	input := string(raw)
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		for _, formatted := range []string{
+			fmt.Sprintf("%s", current),
+			fmt.Sprintf("%v", current),
+			fmt.Sprintf("%+v", current),
+			fmt.Sprintf("%#v", current),
+		} {
+			if strings.Contains(formatted, input) {
+				return true
+			}
 		}
 	}
-	for cause := errors.Unwrap(err); cause != nil; cause = errors.Unwrap(cause) {
-		formatted := fmt.Sprintf("%+v", cause)
-		if strings.Contains(formatted, "CANARY") {
-			t.Errorf("unwrap chain disclosed input: %q", formatted)
-		}
+	return false
+}
+
+func TestErrorDisclosesInputChecksFormattingAndUnwrapChain(t *testing.T) {
+	const raw = "unique-raw-disclosure-marker-83f5"
+	tests := []struct {
+		name string
+		err  error
+		raw  string
+		want bool
+	}{
+		{name: "safe", err: saferr.New(saferr.CategoryProvider, invalidTranscriptionMessage), raw: raw, want: false},
+		{name: "public formatting", err: errors.New("failed: " + raw), raw: raw, want: true},
+		{name: "private unwrap cause", err: saferr.Wrap(saferr.CategoryProvider, invalidTranscriptionMessage, errors.New(raw)), raw: raw, want: true},
+		{name: "too short to be meaningful", err: errors.New("x"), raw: "x", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := errorDisclosesInput(test.err, []byte(test.raw)); got != test.want {
+				t.Errorf("errorDisclosesInput() = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -319,4 +441,20 @@ func repeatedBatches(batch Batch, count int) []Batch {
 		batches[index] = Batch{firstPage: page, lastPage: page, pages: []Page{{number: page, text: batch.pages[0].text}}}
 	}
 	return batches
+}
+
+func caseVariants(value string) []string {
+	variants := make([]string, 0, 1<<len(value)-1)
+	for mask := 0; mask < 1<<len(value); mask++ {
+		variant := []byte(value)
+		for index := range variant {
+			if mask&(1<<index) != 0 {
+				variant[index] -= 'a' - 'A'
+			}
+		}
+		if string(variant) != value {
+			variants = append(variants, string(variant))
+		}
+	}
+	return variants
 }
