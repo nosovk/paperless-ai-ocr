@@ -11,7 +11,10 @@ import (
 	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
 )
 
-const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
+const (
+	timestampLayout           = "2006-01-02T15:04:05.000000000Z07:00"
+	maxDiagnosticMessageBytes = 256
+)
 
 // Queue stores durable jobs in SQLite.
 type Queue struct {
@@ -27,7 +30,7 @@ func New(db *sql.DB) *Queue {
 // Enqueue creates current work or returns an existing current or terminal job.
 // The returned bool reports whether a new row was created.
 func (q *Queue) Enqueue(input EnqueueInput) (Job, bool, error) {
-	if input.DocumentID <= 0 || blank(input.SourceChecksum) || blank(input.Model) || blank(input.PromptVersion) {
+	if input.DocumentID <= 0 || !input.Priority.valid() || blank(input.SourceChecksum) || blank(input.Model) || blank(input.PromptVersion) {
 		return Job{}, false, validationError("invalid enqueue input")
 	}
 
@@ -133,14 +136,14 @@ func (q *Queue) Claim(owner string, leaseDuration time.Duration) (Job, bool, err
 }
 
 // ScheduleRetry releases a processing job until a future time.
-func (q *Queue) ScheduleRetry(id int64, owner string, availableAt time.Time, category, message string) error {
-	if id <= 0 || blank(owner) || blank(category) || blank(message) || !availableAt.After(q.now()) {
+func (q *Queue) ScheduleRetry(id int64, owner string, availableAt time.Time, diagnostic SafeDiagnostic) error {
+	if id <= 0 || blank(owner) || !diagnostic.valid() || !availableAt.After(q.now()) {
 		return validationError("invalid retry input")
 	}
 	return q.updateOne(`UPDATE jobs SET state = 'retry', available_at = ?,
 		lease_owner = NULL, lease_expires_at = NULL, error_category = ?, error_message = ?,
 		updated_at = ? WHERE id = ? AND state = 'processing' AND lease_owner = ?`,
-		formatTime(availableAt), category, message, formatTime(q.now()), id, owner)
+		formatTime(availableAt), diagnostic.Category, diagnostic.Message, formatTime(q.now()), id, owner)
 }
 
 // Complete marks an owned processing job completed.
@@ -156,15 +159,15 @@ func (q *Queue) Complete(id int64, owner string) error {
 }
 
 // Fail marks an owned processing job terminally failed using safe diagnostics.
-func (q *Queue) Fail(id int64, owner, category, message string) error {
-	if id <= 0 || blank(owner) || blank(category) || blank(message) {
+func (q *Queue) Fail(id int64, owner string, diagnostic SafeDiagnostic) error {
+	if id <= 0 || blank(owner) || !diagnostic.valid() {
 		return validationError("invalid failure input")
 	}
 	now := formatTime(q.now())
 	return q.updateOne(`UPDATE jobs SET state = 'failed',
 		lease_owner = NULL, lease_expires_at = NULL, error_category = ?, error_message = ?,
 		completed_at = ?, updated_at = ?
-		WHERE id = ? AND state = 'processing' AND lease_owner = ?`, category, message, now, now, id, owner)
+		WHERE id = ? AND state = 'processing' AND lease_owner = ?`, diagnostic.Category, diagnostic.Message, now, now, id, owner)
 }
 
 // RetryFailed explicitly returns a terminally failed job to the queue.
@@ -301,7 +304,7 @@ func queryJob(row rowScanner) (Job, error) {
 		return Job{}, err
 	}
 	job.LeaseOwner = leaseOwner.String
-	job.ErrorCategory = errorCategory.String
+	job.ErrorCategory = saferr.Category(errorCategory.String)
 	job.ErrorMessage = errorMessage.String
 	if leaseExpiresAt.Valid {
 		if job.LeaseExpiresAt, err = parseTime(leaseExpiresAt.String); err != nil {
@@ -326,6 +329,36 @@ func parseTime(value string) (time.Time, error) {
 
 func blank(value string) bool {
 	return strings.TrimSpace(value) == ""
+}
+
+func (priority Priority) valid() bool {
+	return priority == PriorityBackfill || priority == PriorityWebhook
+}
+
+func (diagnostic SafeDiagnostic) valid() bool {
+	if !validDiagnosticCategory(diagnostic.Category) || blank(diagnostic.Message) || len(diagnostic.Message) > maxDiagnosticMessageBytes {
+		return false
+	}
+	for _, character := range []byte(diagnostic.Message) {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validDiagnosticCategory(category saferr.Category) bool {
+	switch category {
+	case saferr.CategoryConfiguration,
+		saferr.CategoryPaperless,
+		saferr.CategoryProvider,
+		saferr.CategoryValidation,
+		saferr.CategoryRendering,
+		saferr.CategoryInternal:
+		return true
+	default:
+		return false
+	}
 }
 
 func validationError(message string) error {

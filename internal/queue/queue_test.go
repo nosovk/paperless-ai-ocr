@@ -91,7 +91,9 @@ func TestEnqueueSuppressesCompletedAndFailedHistory(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Claim() = (%+v, %t, %v), want job", claimed, ok, err)
 	}
-	if err := q.Fail(claimed.ID, "owner", "provider", "retry limit reached"); err != nil {
+	if err := q.Fail(claimed.ID, "owner", SafeDiagnostic{
+		Category: saferr.CategoryProvider, Message: "retry limit reached",
+	}); err != nil {
 		t.Fatalf("Fail() error = %v", err)
 	}
 	failed, created, err := q.Enqueue(EnqueueInput{
@@ -118,6 +120,27 @@ func TestEnqueueValidatesInput(t *testing.T) {
 	}
 }
 
+func TestEnqueueRejectsUndeclaredPriorities(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	for _, priority := range []Priority{-1, 1, 50, PriorityWebhook + 1} {
+		input := EnqueueInput{
+			DocumentID: 1, SourceChecksum: fmt.Sprintf("checksum-%d", priority),
+			Priority: priority, Model: "model", PromptVersion: "v1",
+		}
+		if _, _, err := q.Enqueue(input); errorCategory(err) != saferr.CategoryValidation {
+			t.Errorf("Enqueue(priority %d) error = %v, want validation error", priority, err)
+		}
+	}
+
+	var count int
+	if err := q.db.QueryRow("SELECT count(*) FROM jobs").Scan(&count); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("job count = %d, want 0", count)
+	}
+}
+
 func TestClaimOrdersByPriorityThenFIFOAndSkipsFutureRetry(t *testing.T) {
 	now := testNow
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)
@@ -141,7 +164,9 @@ func TestClaimOrdersByPriorityThenFIFOAndSkipsFutureRetry(t *testing.T) {
 		t.Fatalf("second Claim() = (%+v, %t, %v), want oldest backfill %d", claimed, ok, err, backfill1.ID)
 	}
 	future := now.Add(time.Hour)
-	if err := q.ScheduleRetry(claimed.ID, "worker", future, "provider", "temporarily unavailable"); err != nil {
+	if err := q.ScheduleRetry(claimed.ID, "worker", future, SafeDiagnostic{
+		Category: saferr.CategoryProvider, Message: "temporarily unavailable",
+	}); err != nil {
 		t.Fatalf("ScheduleRetry() error = %v", err)
 	}
 
@@ -253,7 +278,9 @@ func TestProcessingTransitionsRequireStateAndOwner(t *testing.T) {
 	if completed.State != StateCompleted || completed.CompletedAt.IsZero() || completed.LeaseOwner != "" || completed.ErrorCategory != "" {
 		t.Errorf("completed job = %+v", completed)
 	}
-	if err := q.Fail(job.ID, "owner", "internal", "late failure"); errorCategory(err) != saferr.CategoryValidation {
+	if err := q.Fail(job.ID, "owner", SafeDiagnostic{
+		Category: saferr.CategoryInternal, Message: "late failure",
+	}); errorCategory(err) != saferr.CategoryValidation {
 		t.Errorf("illegal Fail() error = %v, want validation error", err)
 	}
 }
@@ -261,11 +288,13 @@ func TestProcessingTransitionsRequireStateAndOwner(t *testing.T) {
 func TestFailureAndExplicitRetry(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
-	if err := q.Fail(job.ID, "owner", "provider", "retry limit reached"); err != nil {
+	if err := q.Fail(job.ID, "owner", SafeDiagnostic{
+		Category: saferr.CategoryProvider, Message: "retry limit reached",
+	}); err != nil {
 		t.Fatalf("Fail() error = %v", err)
 	}
 	failed := loadJob(t, q, job.ID)
-	if failed.State != StateFailed || failed.ErrorCategory != "provider" || failed.ErrorMessage != "retry limit reached" || failed.CompletedAt.IsZero() {
+	if failed.State != StateFailed || failed.ErrorCategory != saferr.CategoryProvider || failed.ErrorMessage != "retry limit reached" || failed.CompletedAt.IsZero() {
 		t.Errorf("failed job = %+v", failed)
 	}
 
@@ -285,7 +314,9 @@ func TestFailureAndExplicitRetry(t *testing.T) {
 func TestRetryFailedRejectsConflictingCurrentJob(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	failed := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
-	if err := q.Fail(failed.ID, "owner", "provider", "retry limit reached"); err != nil {
+	if err := q.Fail(failed.ID, "owner", SafeDiagnostic{
+		Category: saferr.CategoryProvider, Message: "retry limit reached",
+	}); err != nil {
 		t.Fatalf("Fail() error = %v", err)
 	}
 	now := formatTime(testNow)
@@ -317,17 +348,77 @@ func TestRetryFailedRejectsConflictingCurrentJob(t *testing.T) {
 func TestRetryValidation(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
-	if err := q.ScheduleRetry(job.ID, "owner", testNow, "provider", "retry"); errorCategory(err) != saferr.CategoryValidation {
+	valid := SafeDiagnostic{Category: saferr.CategoryProvider, Message: "retry"}
+	if err := q.ScheduleRetry(job.ID, "owner", testNow, valid); errorCategory(err) != saferr.CategoryValidation {
 		t.Errorf("ScheduleRetry(now) error = %v, want validation error", err)
-	}
-	if err := q.ScheduleRetry(job.ID, "owner", testNow.Add(time.Minute), "", "retry"); errorCategory(err) != saferr.CategoryValidation {
-		t.Errorf("ScheduleRetry(blank category) error = %v, want validation error", err)
 	}
 	if _, _, err := q.Claim("", time.Minute); errorCategory(err) != saferr.CategoryValidation {
 		t.Errorf("Claim(blank owner) error = %v, want validation error", err)
 	}
 	if err := q.Complete(job.ID, ""); errorCategory(err) != saferr.CategoryValidation {
 		t.Errorf("Complete(blank owner) error = %v, want validation error", err)
+	}
+}
+
+func TestTransitionDiagnosticsValidateAndPersistSafeValues(t *testing.T) {
+	validCategories := []saferr.Category{
+		saferr.CategoryConfiguration,
+		saferr.CategoryPaperless,
+		saferr.CategoryProvider,
+		saferr.CategoryValidation,
+		saferr.CategoryRendering,
+		saferr.CategoryInternal,
+	}
+	for i, category := range validCategories {
+		q := openTestQueue(t, filepath.Join(t.TempDir(), fmt.Sprintf("valid-%d.db", i)), testNow)
+		job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+		diagnostic := SafeDiagnostic{Category: category, Message: "Caller-vetted safe value 123"}
+		if err := q.Fail(job.ID, "owner", diagnostic); err != nil {
+			t.Fatalf("Fail(%q) error = %v", category, err)
+		}
+		failed := loadJob(t, q, job.ID)
+		if failed.ErrorCategory != category || failed.ErrorMessage != diagnostic.Message {
+			t.Errorf("persisted diagnostic = (%q, %q), want (%q, %q)",
+				failed.ErrorCategory, failed.ErrorMessage, category, diagnostic.Message)
+		}
+	}
+
+	invalid := []SafeDiagnostic{
+		{Category: saferr.Category("unknown"), Message: "safe message"},
+		{Category: saferr.CategoryProvider, Message: ""},
+		{Category: saferr.CategoryProvider, Message: "   "},
+		{Category: saferr.CategoryProvider, Message: strings.Repeat("x", maxDiagnosticMessageBytes+1)},
+		{Category: saferr.CategoryProvider, Message: "two\nlines"},
+		{Category: saferr.CategoryProvider, Message: "tab\tseparated"},
+		{Category: saferr.CategoryProvider, Message: "escape\x1bcode"},
+		{Category: saferr.CategoryProvider, Message: "delete\x7fcode"},
+	}
+	for i, diagnostic := range invalid {
+		q := openTestQueue(t, filepath.Join(t.TempDir(), fmt.Sprintf("invalid-%d.db", i)), testNow)
+		job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+		if err := q.Fail(job.ID, "owner", diagnostic); errorCategory(err) != saferr.CategoryValidation {
+			t.Errorf("Fail(%+v) error = %v, want validation error", diagnostic, err)
+		}
+		if got := loadJob(t, q, job.ID); got.State != StateProcessing || got.ErrorCategory != "" {
+			t.Errorf("job after invalid diagnostic = %+v, want unchanged processing job", got)
+		}
+	}
+}
+
+func TestScheduleRetryPersistsSafeDiagnosticUnchanged(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+	diagnostic := SafeDiagnostic{
+		Category: saferr.CategoryRendering,
+		Message:  strings.Repeat("x", maxDiagnosticMessageBytes),
+	}
+	if err := q.ScheduleRetry(job.ID, "owner", testNow.Add(time.Minute), diagnostic); err != nil {
+		t.Fatalf("ScheduleRetry() error = %v", err)
+	}
+	retry := loadJob(t, q, job.ID)
+	if retry.ErrorCategory != diagnostic.Category || retry.ErrorMessage != diagnostic.Message {
+		t.Errorf("persisted diagnostic = (%q, %q), want (%q, %q)",
+			retry.ErrorCategory, retry.ErrorMessage, diagnostic.Category, diagnostic.Message)
 	}
 }
 
@@ -346,7 +437,7 @@ func TestRecoverExpiredLeases(t *testing.T) {
 		t.Errorf("RecoverExpiredLeases() = %d, want 1", recovered)
 	}
 	retry := loadJob(t, q, expired.ID)
-	if retry.State != StateRetry || retry.LeaseOwner != "" || retry.ErrorCategory != "internal" || retry.ErrorMessage != "lease expired" || !retry.AvailableAt.Equal(now.UTC()) {
+	if retry.State != StateRetry || retry.LeaseOwner != "" || retry.ErrorCategory != saferr.CategoryInternal || retry.ErrorMessage != "lease expired" || !retry.AvailableAt.Equal(now.UTC()) {
 		t.Errorf("recovered job = %+v", retry)
 	}
 	if err := q.Complete(expired.ID, "old-owner"); errorCategory(err) != saferr.CategoryValidation {
@@ -359,6 +450,38 @@ func TestRecoverExpiredLeases(t *testing.T) {
 	}
 	if recovered, err := q.RecoverExpiredLeases(); err != nil || recovered != 0 {
 		t.Errorf("RecoverExpiredLeases(unexpired) = (%d, %v), want (0, nil)", recovered, err)
+	}
+}
+
+func TestRecoverExpiredLeasesIncludesExactBoundaryOnly(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	exact := enqueue(t, q, 1, "exact", PriorityBackfill)
+	future := enqueue(t, q, 2, "future", PriorityBackfill)
+	now := formatTime(testNow)
+	if _, err := q.db.Exec(`UPDATE jobs SET
+		state = 'processing', attempts = 1, lease_owner = 'exact-owner',
+		lease_expires_at = ?, updated_at = ? WHERE id = ?`, now, now, exact.ID); err != nil {
+		t.Fatalf("set exact lease: %v", err)
+	}
+	if _, err := q.db.Exec(`UPDATE jobs SET
+		state = 'processing', attempts = 1, lease_owner = 'future-owner',
+		lease_expires_at = ?, updated_at = ? WHERE id = ?`,
+		formatTime(testNow.Add(time.Nanosecond)), now, future.ID); err != nil {
+		t.Fatalf("set future lease: %v", err)
+	}
+
+	recovered, err := q.RecoverExpiredLeases()
+	if err != nil {
+		t.Fatalf("RecoverExpiredLeases() error = %v", err)
+	}
+	if recovered != 1 {
+		t.Errorf("RecoverExpiredLeases() = %d, want 1", recovered)
+	}
+	if got := loadJob(t, q, exact.ID); got.State != StateRetry {
+		t.Errorf("exact-boundary job state = %q, want retry", got.State)
+	}
+	if got := loadJob(t, q, future.ID); got.State != StateProcessing || got.LeaseOwner != "future-owner" {
+		t.Errorf("future job = %+v, want unchanged processing lease", got)
 	}
 }
 

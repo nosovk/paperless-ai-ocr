@@ -1,6 +1,10 @@
 package queue
 
-import "time"
+import (
+	"time"
+
+	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
+)
 
 // State is a durable job lifecycle state.
 type State string
@@ -30,6 +34,15 @@ type EnqueueInput struct {
 	PromptVersion  string
 }
 
+// SafeDiagnostic is a caller-vetted, operator-facing one-line diagnostic.
+// Message is limited to 256 bytes and cannot contain ASCII control characters.
+// Queue validation does not detect secrets or document content; callers remain
+// responsible for ensuring Message is safe to persist and display.
+type SafeDiagnostic struct {
+	Category saferr.Category
+	Message  string
+}
+
 // Job is the durable queue record returned to workers.
 type Job struct {
 	ID             int64
@@ -43,7 +56,7 @@ type Job struct {
 	LeaseExpiresAt time.Time
 	Model          string
 	PromptVersion  string
-	ErrorCategory  string
+	ErrorCategory  saferr.Category
 	ErrorMessage   string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
