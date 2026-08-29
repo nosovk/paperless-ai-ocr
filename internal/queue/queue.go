@@ -46,13 +46,10 @@ func (q *Queue) EnqueueCandidate(ctx context.Context, documentID int64, priority
 		).Scan(&current)
 		switch {
 		case err == nil:
-			if priority <= current {
-				return nil
-			}
 			if _, err := conn.ExecContext(ctx, `UPDATE candidates
-				SET priority = ?, updated_at = ? WHERE document_id = ?`,
-				priority, formatTime(q.now()), documentID); err != nil {
-				return internalError("cannot promote queued candidate", err)
+				SET priority = ?, generation = generation + 1, updated_at = ?
+				WHERE document_id = ?`, max(priority, current), formatTime(q.now()), documentID); err != nil {
+				return internalError("cannot refresh queued candidate", err)
 			}
 			return nil
 		case !errors.Is(err, sql.ErrNoRows):
@@ -61,8 +58,8 @@ func (q *Queue) EnqueueCandidate(ctx context.Context, documentID int64, priority
 
 		now := formatTime(q.now())
 		if _, err := conn.ExecContext(ctx, `INSERT INTO candidates (
-			document_id, priority, created_at, updated_at
-		) VALUES (?, ?, ?, ?)`, documentID, priority, now, now); err != nil {
+			document_id, priority, generation, created_at, updated_at
+		) VALUES (?, ?, 1, ?, ?)`, documentID, priority, now, now); err != nil {
 			return internalError("cannot enqueue candidate", err)
 		}
 		created = true
@@ -75,9 +72,9 @@ func (q *Queue) EnqueueCandidate(ctx context.Context, documentID int64, priority
 func (q *Queue) NextCandidate(ctx context.Context) (Candidate, bool, error) {
 	var candidate Candidate
 	var createdAt, updatedAt string
-	err := q.db.QueryRowContext(ctx, `SELECT document_id, priority, created_at, updated_at
+	err := q.db.QueryRowContext(ctx, `SELECT document_id, priority, generation, created_at, updated_at
 		FROM candidates ORDER BY priority DESC, created_at, document_id LIMIT 1`).Scan(
-		&candidate.DocumentID, &candidate.Priority, &createdAt, &updatedAt)
+		&candidate.DocumentID, &candidate.Priority, &candidate.Generation, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Candidate{}, false, nil
 	}
@@ -93,37 +90,45 @@ func (q *Queue) NextCandidate(ctx context.Context) (Candidate, bool, error) {
 	return candidate, true, nil
 }
 
-// DiscardCandidate permanently removes an unresolvable candidate.
-// Discarding an already absent candidate is idempotent.
-func (q *Queue) DiscardCandidate(ctx context.Context, documentID int64) error {
-	if documentID <= 0 {
-		return validationError("invalid candidate discard input")
+// DiscardCandidate removes an unresolvable candidate if it was not refreshed.
+func (q *Queue) DiscardCandidate(ctx context.Context, documentID, generation int64) (bool, error) {
+	if documentID <= 0 || generation <= 0 {
+		return false, validationError("invalid candidate discard input")
 	}
-	return q.writeContext(ctx, func(conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx,
-			"DELETE FROM candidates WHERE document_id = ?", documentID,
-		); err != nil {
+	discarded := false
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
+		result, err := conn.ExecContext(ctx,
+			"DELETE FROM candidates WHERE document_id = ? AND generation = ?", documentID, generation,
+		)
+		if err != nil {
 			return internalError("cannot discard queued candidate", err)
 		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return internalError("cannot confirm discarded candidate", err)
+		}
+		discarded = changed == 1
 		return nil
 	})
+	return discarded, err
 }
 
-// ResolveCandidate atomically enqueues resolved work and removes its candidate.
-func (q *Queue) ResolveCandidate(ctx context.Context, documentID int64, input EnqueueInput) (Job, bool, error) {
-	if documentID <= 0 || input.DocumentID != documentID || !validEnqueueInput(input) {
-		return Job{}, false, validationError("invalid candidate resolution input")
+// ResolveCandidate atomically enqueues resolved work if the candidate was not refreshed.
+func (q *Queue) ResolveCandidate(ctx context.Context, documentID, generation int64, input EnqueueInput) (Job, bool, bool, error) {
+	if documentID <= 0 || generation <= 0 || input.DocumentID != documentID || !validEnqueueInput(input) {
+		return Job{}, false, false, validationError("invalid candidate resolution input")
 	}
 
 	var job Job
 	created := false
+	resolved := false
 	err := q.writeContext(ctx, func(conn *sql.Conn) error {
 		var priority Priority
 		if err := conn.QueryRowContext(ctx,
-			"SELECT priority FROM candidates WHERE document_id = ?", documentID,
+			"SELECT priority FROM candidates WHERE document_id = ? AND generation = ?", documentID, generation,
 		).Scan(&priority); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return validationError("candidate no longer exists")
+				return nil
 			}
 			return internalError("cannot inspect queued candidate", err)
 		}
@@ -133,7 +138,8 @@ func (q *Queue) ResolveCandidate(ctx context.Context, documentID int64, input En
 		if err != nil {
 			return err
 		}
-		result, err := conn.ExecContext(ctx, "DELETE FROM candidates WHERE document_id = ?", documentID)
+		result, err := conn.ExecContext(ctx,
+			"DELETE FROM candidates WHERE document_id = ? AND generation = ?", documentID, generation)
 		if err != nil {
 			return internalError("cannot delete resolved candidate", err)
 		}
@@ -144,9 +150,10 @@ func (q *Queue) ResolveCandidate(ctx context.Context, documentID int64, input En
 		if changed != 1 {
 			return validationError("candidate changed during resolution")
 		}
+		resolved = true
 		return nil
 	})
-	return job, created, err
+	return job, created, resolved, err
 }
 
 // Enqueue creates current work or returns an existing current or terminal job.

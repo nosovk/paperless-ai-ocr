@@ -38,6 +38,7 @@ type EnqueueInput struct {
 type Candidate struct {
 	DocumentID int64
 	Priority   Priority
+	Generation int64
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 }

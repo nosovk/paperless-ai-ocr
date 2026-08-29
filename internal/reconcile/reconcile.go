@@ -113,27 +113,36 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 		if err != nil {
 			var statusErr *paperless.StatusError
 			if errors.As(err, &statusErr) && statusErr.StatusCode == 404 {
-				if err := r.queue.DiscardCandidate(ctx, candidate.DocumentID); err != nil {
+				discarded, err := r.queue.DiscardCandidate(ctx, candidate.DocumentID, candidate.Generation)
+				if err != nil {
 					return report, reconcileError("cannot discard missing candidate", err)
 				}
-				report.CandidatesDiscarded++
+				if discarded {
+					report.CandidatesDiscarded++
+				}
 				continue
 			}
 			return report, reconcileError("cannot resolve candidate", err)
 		}
 		if strings.TrimSpace(document.Checksum) == "" {
-			if err := r.queue.DiscardCandidate(ctx, candidate.DocumentID); err != nil {
+			discarded, err := r.queue.DiscardCandidate(ctx, candidate.DocumentID, candidate.Generation)
+			if err != nil {
 				return report, reconcileError("cannot discard invalid candidate", err)
 			}
-			report.CandidatesDiscarded++
+			if discarded {
+				report.CandidatesDiscarded++
+			}
 			continue
 		}
-		_, created, err := r.queue.ResolveCandidate(ctx, candidate.DocumentID, queue.EnqueueInput{
+		_, created, resolved, err := r.queue.ResolveCandidate(ctx, candidate.DocumentID, candidate.Generation, queue.EnqueueInput{
 			DocumentID: candidate.DocumentID, SourceChecksum: document.Checksum,
 			Priority: candidate.Priority, Model: r.model, PromptVersion: r.promptVersion,
 		})
 		if err != nil {
 			return report, reconcileError("cannot persist resolved candidate", err)
+		}
+		if !resolved {
+			continue
 		}
 		report.CandidatesResolved++
 		if created {

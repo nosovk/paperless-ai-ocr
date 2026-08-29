@@ -150,6 +150,71 @@ func TestRunOnceDiscardsMissingCandidateThenContinuesToBackfill(t *testing.T) {
 	assertClaimOrder(t, q, []int64{2, 3})
 }
 
+func TestRunOnceRetainsCandidateRefreshedDuringMissingDocumentRequest(t *testing.T) {
+	db, q := openStore(t, filepath.Join(t.TempDir(), "reconcile.db"))
+	if _, err := q.EnqueueCandidate(context.Background(), 1, queue.PriorityWebhook); err != nil {
+		t.Fatal(err)
+	}
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	client, _ := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/documents/" {
+			io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+			return
+		}
+		if request.URL.Path != "/api/documents/1/" {
+			http.NotFound(writer, request)
+			return
+		}
+		close(requestStarted)
+		<-releaseRequest
+		http.NotFound(writer, request)
+	})
+	r := newReconciler(t, db, client, q, Options{MaxCandidatesPerPass: 1})
+	type result struct {
+		report Report
+		err    error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		report, err := r.RunOnce(context.Background())
+		resultCh <- result{report: report, err: err}
+	}()
+
+	<-requestStarted
+	if _, err := q.EnqueueCandidate(context.Background(), 1, queue.PriorityWebhook); err != nil {
+		t.Fatalf("refresh candidate during request: %v", err)
+	}
+	close(releaseRequest)
+	resultValue := <-resultCh
+	if resultValue.err != nil || resultValue.report.CandidatesDiscarded != 0 {
+		t.Fatalf("RunOnce() = (%+v, %v), want refreshed candidate retained", resultValue.report, resultValue.err)
+	}
+	if candidate, ok, err := q.NextCandidate(context.Background()); err != nil || !ok || candidate.DocumentID != 1 {
+		t.Fatalf("candidate after stale 404 = (%+v, %t, %v), want document 1", candidate, ok, err)
+	}
+
+	client, _ = testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/documents/1/":
+			io.WriteString(writer, `{"id":1,"checksum":"refreshed","tags":[]}`)
+		case "/api/documents/":
+			io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+		default:
+			http.NotFound(writer, request)
+		}
+	})
+	r = newReconciler(t, db, client, q, Options{MaxCandidatesPerPass: 1})
+	report, err := r.RunOnce(context.Background())
+	if err != nil || report.CandidatesResolved != 1 || report.JobsCreated != 1 {
+		t.Fatalf("next RunOnce() = (%+v, %v), want refreshed candidate resolved", report, err)
+	}
+	job, ok, err := q.Claim("worker", time.Minute)
+	if err != nil || !ok || job.SourceChecksum != "refreshed" {
+		t.Fatalf("Claim() = (%+v, %t, %v), want refreshed job", job, ok, err)
+	}
+}
+
 func TestRunOnceDiscardsBlankChecksumCandidateThenContinues(t *testing.T) {
 	db, q := openStore(t, filepath.Join(t.TempDir(), "reconcile.db"))
 	for _, id := range []int64{1, 2} {
@@ -184,12 +249,15 @@ func TestRunOnceUsesCandidatePriorityPromotedDuringPaperlessRequest(t *testing.T
 	if _, err := q.EnqueueCandidate(context.Background(), 1, queue.PriorityBackfill); err != nil {
 		t.Fatal(err)
 	}
-	requestStarted := make(chan struct{})
+	requestStarted := make(chan struct{}, 1)
 	releaseRequest := make(chan struct{})
 	client, _ := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/api/documents/1/" {
-			close(requestStarted)
-			<-releaseRequest
+			select {
+			case requestStarted <- struct{}{}:
+				<-releaseRequest
+			default:
+			}
 			io.WriteString(writer, `{"id":1,"checksum":"checksum","tags":[]}`)
 			return
 		}

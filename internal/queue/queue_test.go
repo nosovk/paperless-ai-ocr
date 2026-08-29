@@ -160,12 +160,16 @@ func TestResolveCandidateAtomicallyEnqueuesAndDeletes(t *testing.T) {
 		t.Fatalf("EnqueueCandidate() error = %v", err)
 	}
 
-	job, created, err := q.ResolveCandidate(context.Background(), 42, EnqueueInput{
+	candidate, ok, err := q.NextCandidate(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("NextCandidate() = (%+v, %t, %v), want candidate", candidate, ok, err)
+	}
+	job, created, resolved, err := q.ResolveCandidate(context.Background(), 42, candidate.Generation, EnqueueInput{
 		DocumentID: 42, SourceChecksum: "checksum", Priority: PriorityWebhook,
 		Model: "model", PromptVersion: "v1",
 	})
-	if err != nil || !created {
-		t.Fatalf("ResolveCandidate() = (%+v, %t, %v), want created job", job, created, err)
+	if err != nil || !created || !resolved {
+		t.Fatalf("ResolveCandidate() = (%+v, %t, %t, %v), want created job", job, created, resolved, err)
 	}
 	if _, ok, err := q.NextCandidate(context.Background()); err != nil || ok {
 		t.Fatalf("NextCandidate() after resolve = (_, %t, %v), want empty", ok, err)
@@ -174,12 +178,16 @@ func TestResolveCandidateAtomicallyEnqueuesAndDeletes(t *testing.T) {
 	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
 		t.Fatalf("reenqueue candidate: %v", err)
 	}
-	duplicate, created, err := q.ResolveCandidate(context.Background(), 42, EnqueueInput{
+	candidate, ok, err = q.NextCandidate(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("NextCandidate() = (%+v, %t, %v), want candidate", candidate, ok, err)
+	}
+	duplicate, created, resolved, err := q.ResolveCandidate(context.Background(), 42, candidate.Generation, EnqueueInput{
 		DocumentID: 42, SourceChecksum: "checksum", Priority: PriorityWebhook,
 		Model: "other", PromptVersion: "v2",
 	})
-	if err != nil || created || duplicate.ID != job.ID {
-		t.Fatalf("duplicate ResolveCandidate() = (%+v, %t, %v), want suppression", duplicate, created, err)
+	if err != nil || created || !resolved || duplicate.ID != job.ID {
+		t.Fatalf("duplicate ResolveCandidate() = (%+v, %t, %t, %v), want suppression", duplicate, created, resolved, err)
 	}
 	if _, ok, err := q.NextCandidate(context.Background()); err != nil || ok {
 		t.Fatalf("NextCandidate() after suppressed resolve = (_, %t, %v), want empty", ok, err)
@@ -199,18 +207,54 @@ func TestResolveCandidateUsesAuthoritativePromotedPriority(t *testing.T) {
 		t.Fatalf("promote candidate: %v", err)
 	}
 
-	job, created, err := q.ResolveCandidate(context.Background(), stale.DocumentID, EnqueueInput{
+	current, ok, err := q.NextCandidate(context.Background())
+	if err != nil || !ok || current.Priority != PriorityWebhook {
+		t.Fatalf("NextCandidate() after promotion = (%+v, %t, %v), want webhook", current, ok, err)
+	}
+	job, created, resolved, err := q.ResolveCandidate(context.Background(), current.DocumentID, current.Generation, EnqueueInput{
 		DocumentID: stale.DocumentID, SourceChecksum: "checksum", Priority: stale.Priority,
 		Model: "model", PromptVersion: "v1",
 	})
-	if err != nil || !created {
-		t.Fatalf("ResolveCandidate() = (%+v, %t, %v), want created job", job, created, err)
+	if err != nil || !created || !resolved {
+		t.Fatalf("ResolveCandidate() = (%+v, %t, %t, %v), want created job", job, created, resolved, err)
 	}
 	if job.Priority != PriorityWebhook {
 		t.Errorf("resolved job priority = %d, want %d", job.Priority, PriorityWebhook)
 	}
 	if _, ok, err := q.NextCandidate(context.Background()); err != nil || ok {
 		t.Fatalf("NextCandidate() after resolve = (_, %t, %v), want empty", ok, err)
+	}
+}
+
+func TestResolveCandidateDoesNotDeleteRefreshedGeneration(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
+		t.Fatal(err)
+	}
+	stale, ok, err := q.NextCandidate(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("NextCandidate() = (%+v, %t, %v), want candidate", stale, ok, err)
+	}
+	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
+		t.Fatalf("refresh candidate: %v", err)
+	}
+
+	_, created, resolved, err := q.ResolveCandidate(context.Background(), stale.DocumentID, stale.Generation, EnqueueInput{
+		DocumentID: stale.DocumentID, SourceChecksum: "stale", Priority: stale.Priority,
+		Model: "model", PromptVersion: "v1",
+	})
+	if err != nil || created || resolved {
+		t.Fatalf("ResolveCandidate(stale generation) = (_, %t, %t, %v), want (_, false, false, nil)", created, resolved, err)
+	}
+	if candidate, ok, err := q.NextCandidate(context.Background()); err != nil || !ok || candidate.Generation <= stale.Generation {
+		t.Fatalf("candidate after stale resolve = (%+v, %t, %v), want refreshed candidate", candidate, ok, err)
+	}
+	var jobs int
+	if err := q.db.QueryRow("SELECT count(*) FROM jobs").Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 0 {
+		t.Fatalf("jobs after stale resolve = %d, want 0", jobs)
 	}
 }
 
@@ -223,7 +267,7 @@ func TestResolveCandidateRetainsCandidateOnInvalidOrMismatchedInput(t *testing.T
 		{DocumentID: 43, SourceChecksum: "checksum", Priority: PriorityWebhook, Model: "model", PromptVersion: "v1"},
 		{DocumentID: 42, SourceChecksum: " ", Priority: PriorityWebhook, Model: "model", PromptVersion: "v1"},
 	} {
-		if _, _, err := q.ResolveCandidate(context.Background(), 42, input); errorCategory(err) != saferr.CategoryValidation {
+		if _, _, _, err := q.ResolveCandidate(context.Background(), 42, 1, input); errorCategory(err) != saferr.CategoryValidation {
 			t.Errorf("ResolveCandidate(%+v) error = %v, want validation", input, err)
 		}
 	}
@@ -235,12 +279,12 @@ func TestResolveCandidateRetainsCandidateOnInvalidOrMismatchedInput(t *testing.T
 func TestResolveCandidateMissingCandidateDoesNotEnqueue(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 
-	_, _, err := q.ResolveCandidate(context.Background(), 42, EnqueueInput{
+	_, _, resolved, err := q.ResolveCandidate(context.Background(), 42, 1, EnqueueInput{
 		DocumentID: 42, SourceChecksum: "checksum", Priority: PriorityWebhook,
 		Model: "model", PromptVersion: "v1",
 	})
-	if errorCategory(err) != saferr.CategoryValidation {
-		t.Fatalf("ResolveCandidate() error = %v, want validation", err)
+	if err != nil || resolved {
+		t.Fatalf("ResolveCandidate() = (_, _, %t, %v), want missing candidate ignored", resolved, err)
 	}
 	var count int
 	if err := q.db.QueryRow("SELECT count(*) FROM jobs").Scan(&count); err != nil {
@@ -257,11 +301,15 @@ func TestDiscardCandidateIsDurableAndIdempotent(t *testing.T) {
 	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
 		t.Fatal(err)
 	}
-	if err := q.DiscardCandidate(context.Background(), 42); err != nil {
-		t.Fatalf("DiscardCandidate() error = %v", err)
+	candidate, ok, err := q.NextCandidate(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("NextCandidate() = (%+v, %t, %v), want candidate", candidate, ok, err)
 	}
-	if err := q.DiscardCandidate(context.Background(), 42); err != nil {
-		t.Fatalf("idempotent DiscardCandidate() error = %v", err)
+	if discarded, err := q.DiscardCandidate(context.Background(), 42, candidate.Generation); err != nil || !discarded {
+		t.Fatalf("DiscardCandidate() = (%t, %v), want (true, nil)", discarded, err)
+	}
+	if discarded, err := q.DiscardCandidate(context.Background(), 42, candidate.Generation); err != nil || discarded {
+		t.Fatalf("idempotent DiscardCandidate() = (%t, %v), want (false, nil)", discarded, err)
 	}
 	if err := q.db.Close(); err != nil {
 		t.Fatal(err)
@@ -277,9 +325,32 @@ func TestDiscardCandidateIsDurableAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestDiscardCandidateDoesNotDeleteRefreshedGeneration(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
+		t.Fatal(err)
+	}
+	stale, ok, err := q.NextCandidate(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("NextCandidate() = (%+v, %t, %v), want candidate", stale, ok, err)
+	}
+	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
+		t.Fatalf("refresh candidate: %v", err)
+	}
+
+	discarded, err := q.DiscardCandidate(context.Background(), stale.DocumentID, stale.Generation)
+	if err != nil || discarded {
+		t.Fatalf("DiscardCandidate(stale generation) = (%t, %v), want (false, nil)", discarded, err)
+	}
+	refreshed, ok, err := q.NextCandidate(context.Background())
+	if err != nil || !ok || refreshed.Generation <= stale.Generation {
+		t.Fatalf("refreshed candidate = (%+v, %t, %v), want newer generation", refreshed, ok, err)
+	}
+}
+
 func TestDiscardCandidateValidatesDocumentID(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
-	if err := q.DiscardCandidate(context.Background(), 0); errorCategory(err) != saferr.CategoryValidation {
+	if _, err := q.DiscardCandidate(context.Background(), 0, 1); errorCategory(err) != saferr.CategoryValidation {
 		t.Fatalf("DiscardCandidate(0) error = %v, want validation", err)
 	}
 }
@@ -337,6 +408,61 @@ func TestEnqueueContextCancellationWhileWaitingForWriterCreatesNoJob(t *testing.
 	if count != 0 {
 		t.Errorf("job count = %d, want 0", count)
 	}
+}
+
+func TestWriteContextRestoresBusyTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*testing.T, *Queue)
+	}{
+		{
+			name: "success",
+			run: func(t *testing.T, q *Queue) {
+				if _, err := q.EnqueueCandidate(context.Background(), 1, PriorityWebhook); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "callback error rollback",
+			run: func(t *testing.T, q *Queue) {
+				err := q.writeContext(context.Background(), func(*sql.Conn) error {
+					return errors.New("callback failed")
+				})
+				if err == nil {
+					t.Fatal("writeContext() error = nil")
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+			q.db.SetMaxOpenConns(1)
+			test.run(t, q)
+			assertBusyTimeout(t, q.db, 5000)
+		})
+	}
+}
+
+func TestWriteContextRestoresBusyTimeoutAfterWriterCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	q1 := openTestQueue(t, path, testNow)
+	q2 := openTestQueue(t, path, testNow)
+	q2.db.SetMaxOpenConns(1)
+	lock := holdWriterLock(t, q1.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := q2.EnqueueCandidate(ctx, 1, PriorityWebhook)
+		result <- err
+	}()
+	waitForConnectionInUse(t, q2.db)
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("EnqueueCandidate() error = %v, want context canceled", err)
+	}
+	lock.Release(t)
+	assertBusyTimeout(t, q2.db, 5000)
 }
 
 func TestEnqueueIsIdempotentAndPromotesCurrentWork(t *testing.T) {
@@ -1017,6 +1143,17 @@ func loadJob(t *testing.T, q *Queue, id int64) Job {
 		t.Fatalf("get(%d) error = %v", id, err)
 	}
 	return job
+}
+
+func assertBusyTimeout(t *testing.T, db *sql.DB, want int) {
+	t.Helper()
+	var got int
+	if err := db.QueryRow("PRAGMA busy_timeout").Scan(&got); err != nil {
+		t.Fatalf("load busy_timeout: %v", err)
+	}
+	if got != want {
+		t.Fatalf("busy_timeout = %d, want %d", got, want)
+	}
 }
 
 func assertProcessingClaim(t *testing.T, q *Queue, id int64, attempt int, owner string) {
