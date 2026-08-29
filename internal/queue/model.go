@@ -34,6 +34,14 @@ type EnqueueInput struct {
 	PromptVersion  string
 }
 
+// Candidate is unresolved durable work ordered ahead of archive backfill.
+type Candidate struct {
+	DocumentID int64
+	Priority   Priority
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
 // SafeDiagnostic is a caller-vetted, operator-facing one-line diagnostic.
 // Message is limited to 256 bytes and cannot contain ASCII control characters.
 // Queue validation does not detect secrets or document content; callers remain

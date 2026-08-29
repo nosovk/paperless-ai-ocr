@@ -133,6 +133,77 @@ func TestEnqueueCandidateIsAtomicAcrossDatabaseHandles(t *testing.T) {
 	}
 }
 
+func TestNextCandidateOrdersByPriorityCreationAndDocumentID(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	if _, err := q.EnqueueCandidate(context.Background(), 30, PriorityBackfill); err != nil {
+		t.Fatalf("enqueue backfill candidate: %v", err)
+	}
+	q.now = func() time.Time { return testNow.Add(time.Second) }
+	for _, id := range []int64{20, 10} {
+		if _, err := q.EnqueueCandidate(context.Background(), id, PriorityWebhook); err != nil {
+			t.Fatalf("enqueue webhook candidate %d: %v", id, err)
+		}
+	}
+
+	candidate, ok, err := q.NextCandidate(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("NextCandidate() = (%+v, %t, %v), want candidate", candidate, ok, err)
+	}
+	if candidate.DocumentID != 10 || candidate.Priority != PriorityWebhook {
+		t.Errorf("NextCandidate() = %+v, want webhook document 10", candidate)
+	}
+}
+
+func TestResolveCandidateAtomicallyEnqueuesAndDeletes(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
+		t.Fatalf("EnqueueCandidate() error = %v", err)
+	}
+
+	job, created, err := q.ResolveCandidate(context.Background(), 42, EnqueueInput{
+		DocumentID: 42, SourceChecksum: "checksum", Priority: PriorityWebhook,
+		Model: "model", PromptVersion: "v1",
+	})
+	if err != nil || !created {
+		t.Fatalf("ResolveCandidate() = (%+v, %t, %v), want created job", job, created, err)
+	}
+	if _, ok, err := q.NextCandidate(context.Background()); err != nil || ok {
+		t.Fatalf("NextCandidate() after resolve = (_, %t, %v), want empty", ok, err)
+	}
+
+	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
+		t.Fatalf("reenqueue candidate: %v", err)
+	}
+	duplicate, created, err := q.ResolveCandidate(context.Background(), 42, EnqueueInput{
+		DocumentID: 42, SourceChecksum: "checksum", Priority: PriorityWebhook,
+		Model: "other", PromptVersion: "v2",
+	})
+	if err != nil || created || duplicate.ID != job.ID {
+		t.Fatalf("duplicate ResolveCandidate() = (%+v, %t, %v), want suppression", duplicate, created, err)
+	}
+	if _, ok, err := q.NextCandidate(context.Background()); err != nil || ok {
+		t.Fatalf("NextCandidate() after suppressed resolve = (_, %t, %v), want empty", ok, err)
+	}
+}
+
+func TestResolveCandidateRetainsCandidateOnInvalidOrMismatchedInput(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
+		t.Fatalf("EnqueueCandidate() error = %v", err)
+	}
+	for _, input := range []EnqueueInput{
+		{DocumentID: 43, SourceChecksum: "checksum", Priority: PriorityWebhook, Model: "model", PromptVersion: "v1"},
+		{DocumentID: 42, SourceChecksum: " ", Priority: PriorityWebhook, Model: "model", PromptVersion: "v1"},
+	} {
+		if _, _, err := q.ResolveCandidate(context.Background(), 42, input); errorCategory(err) != saferr.CategoryValidation {
+			t.Errorf("ResolveCandidate(%+v) error = %v, want validation", input, err)
+		}
+	}
+	if candidate, ok, err := q.NextCandidate(context.Background()); err != nil || !ok || candidate.DocumentID != 42 {
+		t.Fatalf("retained NextCandidate() = (%+v, %t, %v), want document 42", candidate, ok, err)
+	}
+}
+
 func TestEnqueueIsIdempotentAndPromotesCurrentWork(t *testing.T) {
 	now := testNow
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)

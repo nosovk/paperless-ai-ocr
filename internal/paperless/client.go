@@ -142,6 +142,37 @@ func (client *Client) WalkDocuments(ctx context.Context, visit func([]Document) 
 	return nil
 }
 
+// ListDocumentsPage retrieves one archive page from a validated opaque cursor.
+func (client *Client) ListDocumentsPage(ctx context.Context, cursor string) (DocumentPage, error) {
+	current := client.endpoint("api/documents/")
+	if cursor != "" {
+		parsed, err := url.Parse(cursor)
+		if err != nil || !parsed.IsAbs() || !allowedURL(client.baseURL, parsed) {
+			return DocumentPage{}, paperlessError("list documents page", errors.New("invalid pagination cursor"))
+		}
+		current = parsed
+	}
+
+	var page documentPage
+	if err := client.doJSON(ctx, "list documents page", http.MethodGet, current, nil, &page); err != nil {
+		return DocumentPage{}, err
+	}
+	for _, document := range page.Results {
+		if err := validateDocument(document); err != nil {
+			return DocumentPage{}, paperlessError("list documents page", err)
+		}
+	}
+	next, err := client.nextURL(current, page.Next)
+	if err != nil {
+		return DocumentPage{}, paperlessError("list documents page", err)
+	}
+	result := DocumentPage{Documents: page.Results}
+	if next != nil {
+		result.Next = next.String()
+	}
+	return result, nil
+}
+
 // GetDocument retrieves the Paperless detail fields used by the worker.
 func (client *Client) GetDocument(ctx context.Context, documentID int) (Document, error) {
 	if documentID <= 0 {

@@ -9,6 +9,12 @@ type Document struct {
 	Tags     []int  `json:"tags"`
 }
 
+// DocumentPage is one validated archive page and its opaque continuation cursor.
+type DocumentPage struct {
+	Documents []Document
+	Next      string
+}
+
 // Tag is a Paperless document tag.
 type Tag struct {
 	ID   int    `json:"id"`

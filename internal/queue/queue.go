@@ -67,10 +67,74 @@ func (q *Queue) EnqueueCandidate(ctx context.Context, documentID int64, priority
 	return created, err
 }
 
+// NextCandidate returns the highest-priority unresolved candidate without deleting it.
+func (q *Queue) NextCandidate(ctx context.Context) (Candidate, bool, error) {
+	var candidate Candidate
+	var createdAt, updatedAt string
+	err := q.db.QueryRowContext(ctx, `SELECT document_id, priority, created_at, updated_at
+		FROM candidates ORDER BY priority DESC, created_at, document_id LIMIT 1`).Scan(
+		&candidate.DocumentID, &candidate.Priority, &createdAt, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Candidate{}, false, nil
+	}
+	if err != nil {
+		return Candidate{}, false, internalError("cannot inspect queued candidates", err)
+	}
+	if candidate.CreatedAt, err = parseTime(createdAt); err != nil {
+		return Candidate{}, false, internalError("cannot load queued candidate", err)
+	}
+	if candidate.UpdatedAt, err = parseTime(updatedAt); err != nil {
+		return Candidate{}, false, internalError("cannot load queued candidate", err)
+	}
+	return candidate, true, nil
+}
+
+// ResolveCandidate atomically enqueues resolved work and removes its candidate.
+func (q *Queue) ResolveCandidate(ctx context.Context, documentID int64, input EnqueueInput) (Job, bool, error) {
+	if documentID <= 0 || input.DocumentID != documentID || !validEnqueueInput(input) {
+		return Job{}, false, validationError("invalid candidate resolution input")
+	}
+
+	var job Job
+	created := false
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
+		var priority Priority
+		if err := conn.QueryRowContext(ctx,
+			"SELECT priority FROM candidates WHERE document_id = ?", documentID,
+		).Scan(&priority); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return validationError("candidate no longer exists")
+			}
+			return internalError("cannot inspect queued candidate", err)
+		}
+		if input.Priority != priority {
+			return validationError("candidate priority changed")
+		}
+		var err error
+		job, created, err = q.enqueue(ctx, conn, input)
+		if err != nil {
+			return err
+		}
+		result, err := conn.ExecContext(ctx, "DELETE FROM candidates WHERE document_id = ?", documentID)
+		if err != nil {
+			return internalError("cannot delete resolved candidate", err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return internalError("cannot confirm resolved candidate", err)
+		}
+		if changed != 1 {
+			return validationError("candidate changed during resolution")
+		}
+		return nil
+	})
+	return job, created, err
+}
+
 // Enqueue creates current work or returns an existing current or terminal job.
 // The returned bool reports whether a new row was created.
 func (q *Queue) Enqueue(input EnqueueInput) (Job, bool, error) {
-	if input.DocumentID <= 0 || !input.Priority.valid() || blank(input.SourceChecksum) || blank(input.Model) || blank(input.PromptVersion) {
+	if !validEnqueueInput(input) {
 		return Job{}, false, validationError("invalid enqueue input")
 	}
 
@@ -78,49 +142,53 @@ func (q *Queue) Enqueue(input EnqueueInput) (Job, bool, error) {
 	created := false
 	err := q.write(func(conn *sql.Conn) error {
 		var err error
-		job, err = queryJob(conn.QueryRowContext(context.Background(), `SELECT `+jobColumns+`
+		job, created, err = q.enqueue(context.Background(), conn, input)
+		return err
+	})
+	return job, created, err
+}
+
+func (q *Queue) enqueue(ctx context.Context, conn *sql.Conn, input EnqueueInput) (Job, bool, error) {
+	job, err := queryJob(conn.QueryRowContext(ctx, `SELECT `+jobColumns+`
 			FROM jobs WHERE document_id = ? AND source_checksum = ?
 			ORDER BY CASE
 				WHEN state IN ('pending', 'processing', 'retry') THEN 0
 				WHEN state = 'completed' THEN 1 ELSE 2 END, id DESC LIMIT 1`,
-			input.DocumentID, input.SourceChecksum))
-		if err == nil {
-			if (job.State == StatePending || job.State == StateRetry) && input.Priority > job.Priority {
-				now := q.now().UTC()
-				if _, err := conn.ExecContext(context.Background(), `UPDATE jobs
+		input.DocumentID, input.SourceChecksum))
+	if err == nil {
+		if (job.State == StatePending || job.State == StateRetry) && input.Priority > job.Priority {
+			now := q.now().UTC()
+			if _, err := conn.ExecContext(ctx, `UPDATE jobs
 					SET priority = ?, updated_at = ? WHERE id = ?`, input.Priority, formatTime(now), job.ID); err != nil {
-					return internalError("cannot promote queued job", err)
-				}
-				job.Priority = input.Priority
-				job.UpdatedAt = now
+				return Job{}, false, internalError("cannot promote queued job", err)
 			}
-			return nil
+			job.Priority = input.Priority
+			job.UpdatedAt = now
 		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return internalError("cannot inspect queued jobs", err)
-		}
+		return job, false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Job{}, false, internalError("cannot inspect queued jobs", err)
+	}
 
-		now := formatTime(q.now())
-		result, err := conn.ExecContext(context.Background(), `INSERT INTO jobs (
+	now := formatTime(q.now())
+	result, err := conn.ExecContext(ctx, `INSERT INTO jobs (
 			document_id, source_checksum, priority, state, attempts, available_at,
 			model, prompt_version, created_at, updated_at
 		) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)`, input.DocumentID,
-			input.SourceChecksum, input.Priority, now, input.Model, input.PromptVersion, now, now)
-		if err != nil {
-			return internalError("cannot enqueue job", err)
-		}
-		id, err := result.LastInsertId()
-		if err != nil {
-			return internalError("cannot identify enqueued job", err)
-		}
-		job, err = getJob(conn, id)
-		if err != nil {
-			return internalError("cannot load enqueued job", err)
-		}
-		created = true
-		return nil
-	})
-	return job, created, err
+		input.SourceChecksum, input.Priority, now, input.Model, input.PromptVersion, now, now)
+	if err != nil {
+		return Job{}, false, internalError("cannot enqueue job", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return Job{}, false, internalError("cannot identify enqueued job", err)
+	}
+	job, err = queryJob(conn.QueryRowContext(ctx, "SELECT "+jobColumns+" FROM jobs WHERE id = ?", id))
+	if err != nil {
+		return Job{}, false, internalError("cannot load enqueued job", err)
+	}
+	return job, true, nil
 }
 
 // Claim atomically leases the highest-priority due job when no job is active.
@@ -395,6 +463,10 @@ func parseTime(value string) (time.Time, error) {
 
 func blank(value string) bool {
 	return strings.TrimSpace(value) == ""
+}
+
+func validEnqueueInput(input EnqueueInput) bool {
+	return input.DocumentID > 0 && input.Priority.valid() && !blank(input.SourceChecksum) && !blank(input.Model) && !blank(input.PromptVersion)
 }
 
 func (priority Priority) valid() bool {

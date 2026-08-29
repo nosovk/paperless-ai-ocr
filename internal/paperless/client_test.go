@@ -89,6 +89,51 @@ func TestWalkDocumentsFollowsRelativeAndAbsolutePagination(t *testing.T) {
 	}
 }
 
+func TestListDocumentsPageReturnsValidatedOpaqueCursor(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Query().Get("page") == "2" {
+			io.WriteString(writer, `{"count":2,"next":null,"results":[{"id":2,"checksum":"two","tags":[]}]}`)
+			return
+		}
+		fmt.Fprintf(writer, `{"count":2,"next":%q,"results":[{"id":1,"checksum":"one","tags":[]}]}`, "?page=2")
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL+"/", Options{})
+
+	first, err := client.ListDocumentsPage(context.Background(), "")
+	if err != nil {
+		t.Fatalf("first ListDocumentsPage() error = %v", err)
+	}
+	if len(first.Documents) != 1 || first.Documents[0].ID != 1 || first.Next == "" {
+		t.Fatalf("first page = %+v", first)
+	}
+	second, err := client.ListDocumentsPage(context.Background(), first.Next)
+	if err != nil {
+		t.Fatalf("second ListDocumentsPage() error = %v", err)
+	}
+	if len(second.Documents) != 1 || second.Documents[0].ID != 2 || second.Next != "" {
+		t.Fatalf("second page = %+v", second)
+	}
+}
+
+func TestListDocumentsPageRejectsTamperedCursorAndUnsafeNext(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		io.WriteString(writer, `{"count":1,"next":"https://elsewhere.example/api/documents/","results":[]}`)
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL+"/paperless/", Options{})
+
+	assertPaperlessError(t, func() error {
+		_, err := client.ListDocumentsPage(context.Background(), server.URL+"/api/documents/?page=2")
+		return err
+	}())
+	assertPaperlessError(t, func() error {
+		_, err := client.ListDocumentsPage(context.Background(), "")
+		return err
+	}())
+}
+
 func TestWalkDocumentsRejectsUnsafePagination(t *testing.T) {
 	t.Parallel()
 
