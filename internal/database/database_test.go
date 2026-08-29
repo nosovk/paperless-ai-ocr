@@ -253,6 +253,148 @@ func TestDatabaseConstraints(t *testing.T) {
 	})
 }
 
+func TestIntegerColumnsRejectWrongStorageClasses(t *testing.T) {
+	t.Run("jobs", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			documentID any
+			priority   any
+			attempts   any
+		}{
+			{name: "document ID text", documentID: "not-an-integer", priority: 0, attempts: 0},
+			{name: "priority fractional", documentID: 101, priority: 1.5, attempts: 0},
+			{name: "attempts fractional", documentID: 102, priority: 0, attempts: 0.5},
+		}
+
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				db := openTestDatabase(t, filepath.Join(t.TempDir(), "queue.db"))
+				_, err := db.Exec(`INSERT INTO jobs (
+					document_id, source_checksum, priority, state, attempts, model,
+					prompt_version, available_at, created_at, updated_at
+				) VALUES (?, ?, ?, 'pending', ?, 'model', 'v1',
+					CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+					test.documentID, "wrong-type-"+test.name, test.priority, test.attempts)
+				assertConstraintError(t, err)
+			})
+		}
+	})
+
+	t.Run("batches", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			pageStart any
+			pageEnd   any
+			renderDPI any
+			attempts  any
+		}{
+			{name: "page start fractional", pageStart: 1.5, pageEnd: 2, renderDPI: 200, attempts: 0},
+			{name: "page end fractional", pageStart: 1, pageEnd: 1.5, renderDPI: 200, attempts: 0},
+			{name: "render DPI text", pageStart: 1, pageEnd: 1, renderDPI: "not-an-integer", attempts: 0},
+			{name: "attempts fractional", pageStart: 1, pageEnd: 1, renderDPI: 200, attempts: 0.5},
+		}
+
+		for index, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				db := openTestDatabase(t, filepath.Join(t.TempDir(), "queue.db"))
+				jobID := insertJob(t, db, int64(201+index), "wrong-type-"+test.name, "pending")
+				_, err := db.Exec(`INSERT INTO batches (
+					job_id, page_start, page_end, render_dpi, render_format,
+					state, attempts, available_at, created_at, updated_at
+				) VALUES (?, ?, ?, ?, 'png', 'pending', ?,
+					CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+					jobID, test.pageStart, test.pageEnd, test.renderDPI, test.attempts)
+				assertConstraintError(t, err)
+			})
+		}
+	})
+
+	t.Run("batch job ID text without foreign key masking", func(t *testing.T) {
+		db := openTestDatabase(t, filepath.Join(t.TempDir(), "queue.db"))
+		if _, err := db.Exec("PRAGMA foreign_keys = OFF"); err != nil {
+			t.Fatalf("disable foreign keys: %v", err)
+		}
+		t.Cleanup(func() {
+			if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+				t.Errorf("restore foreign keys: %v", err)
+			}
+		})
+
+		_, err := db.Exec(`INSERT INTO batches (
+			job_id, page_start, page_end, render_dpi, render_format, state,
+			attempts, available_at, created_at, updated_at
+		) VALUES ('not-an-integer', 1, 1, 200, 'png', 'pending', 0,
+			CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+		assertConstraintError(t, err)
+	})
+}
+
+func TestValidIntegerValuesUseIntegerStorage(t *testing.T) {
+	db := openTestDatabase(t, filepath.Join(t.TempDir(), "queue.db"))
+	jobID := insertJob(t, db, 301, "integer-storage", "pending")
+	result, err := db.Exec(`INSERT INTO batches (
+		job_id, page_start, page_end, render_dpi, render_format, state,
+		attempts, available_at, created_at, updated_at
+	) VALUES (?, 1, 2, 200, 'png', 'pending', 0,
+		CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, jobID)
+	if err != nil {
+		t.Fatalf("insert valid batch: %v", err)
+	}
+	batchID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("batch LastInsertId(): %v", err)
+	}
+
+	for table, query := range map[string]string{
+		"jobs": `SELECT typeof(id), typeof(document_id), typeof(priority),
+			typeof(attempts) FROM jobs WHERE id = ?`,
+		"batches": `SELECT typeof(id), typeof(job_id), typeof(page_start),
+			typeof(page_end), typeof(render_dpi), typeof(attempts)
+			FROM batches WHERE id = ?`,
+	} {
+		id := jobID
+		wantColumns := 4
+		if table == "batches" {
+			id = batchID
+			wantColumns = 6
+		}
+		rows, err := db.Query(query, id)
+		if err != nil {
+			t.Fatalf("query %s storage types: %v", table, err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			t.Fatalf("query %s columns: %v", table, err)
+		}
+		if len(columns) != wantColumns {
+			rows.Close()
+			t.Fatalf("%s storage column count = %d, want %d", table, len(columns), wantColumns)
+		}
+		if !rows.Next() {
+			rows.Close()
+			t.Fatalf("query %s storage types returned no row", table)
+		}
+		values := make([]string, wantColumns)
+		destinations := make([]any, wantColumns)
+		for index := range values {
+			destinations[index] = &values[index]
+		}
+		if err := rows.Scan(destinations...); err != nil {
+			rows.Close()
+			t.Fatalf("scan %s storage types: %v", table, err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close %s storage query: %v", table, err)
+		}
+		for index, value := range values {
+			if value != "integer" {
+				t.Errorf("%s integer column %d storage type = %q, want integer", table, index, value)
+			}
+		}
+	}
+}
+
 func TestForeignKeysAndBatchDeleteBehavior(t *testing.T) {
 	db := openTestDatabase(t, filepath.Join(t.TempDir(), "queue.db"))
 

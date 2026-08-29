@@ -25,7 +25,7 @@ CREATE TABLE jobs (
         (error_category IS NULL AND error_message IS NULL)
         OR (error_category IS NOT NULL AND error_message IS NOT NULL)
     )
-);
+) STRICT;
 
 CREATE UNIQUE INDEX jobs_one_current_document_source
 ON jobs (document_id, source_checksum)
@@ -67,7 +67,7 @@ CREATE TABLE batches (
         state != 'completed'
         OR (result_text IS NOT NULL AND length(result_text) > 0)
     )
-);
+) STRICT;
 
 CREATE INDEX batches_job_state_pages
 ON batches (job_id, state, page_start, page_end);
@@ -76,4 +76,4 @@ CREATE TABLE settings (
     key TEXT PRIMARY KEY CHECK (length(key) > 0),
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL CHECK (length(updated_at) > 0)
-);
+) STRICT;
