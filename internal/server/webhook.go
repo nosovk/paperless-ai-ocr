@@ -34,7 +34,12 @@ func (h webhookHandler) serveHTTP(response http.ResponseWriter, request *http.Re
 		return
 	}
 
-	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	contentTypes := request.Header.Values("Content-Type")
+	if len(contentTypes) != 1 {
+		http.Error(response, "unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(contentTypes[0])
 	if err != nil || mediaType != "application/json" {
 		http.Error(response, "unsupported media type", http.StatusUnsupportedMediaType)
 		return

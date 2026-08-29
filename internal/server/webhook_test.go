@@ -29,6 +29,19 @@ type spyEnqueuer struct {
 	err   error
 }
 
+type readTrackingBody struct {
+	reads int
+}
+
+func (body *readTrackingBody) Read([]byte) (int, error) {
+	body.reads++
+	return 0, errors.New("body-read-canary")
+}
+
+func (*readTrackingBody) Close() error {
+	return nil
+}
+
 func (e *spyEnqueuer) EnqueueCandidate(_ context.Context, documentID int64, priority queue.Priority) (bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -216,6 +229,40 @@ func TestWebhookRejectsInvalidContentTypeAndJSON(t *testing.T) {
 			}
 			if strings.Contains(response.Body.String(), "body-canary") || strings.Contains(response.Body.String(), testToken) {
 				t.Errorf("response exposes request data: %q", response.Body.String())
+			}
+			if calls := enqueuer.snapshot(); len(calls) != 0 {
+				t.Errorf("enqueue calls = %v, want none", calls)
+			}
+		})
+	}
+}
+
+func TestWebhookRejectsAmbiguousContentTypeWithoutReadingBody(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+	}{
+		{name: "separate duplicate values", values: []string{"application/json", "text/plain"}},
+		{name: "comma-combined values", values: []string{"application/json, text/plain"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			enqueuer := &spyEnqueuer{}
+			body := &readTrackingBody{}
+			request := httptest.NewRequest(http.MethodPost, "/webhooks/paperless", nil)
+			request.Body = body
+			request.Header.Set("Authorization", "Bearer "+testToken)
+			for _, value := range test.values {
+				request.Header.Add("Content-Type", value)
+			}
+			response := httptest.NewRecorder()
+			newTestMux(t, testToken, enqueuer).ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnsupportedMediaType {
+				t.Errorf("status = %d, want %d", response.Code, http.StatusUnsupportedMediaType)
+			}
+			if body.reads != 0 {
+				t.Errorf("body reads = %d, want 0", body.reads)
 			}
 			if calls := enqueuer.snapshot(); len(calls) != 0 {
 				t.Errorf("enqueue calls = %v, want none", calls)
