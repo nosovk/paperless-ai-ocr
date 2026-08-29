@@ -38,6 +38,12 @@ type Workspace struct {
 	closed         bool
 }
 
+type reservation struct {
+	workspace *Workspace
+	bytes     int64
+	released  bool
+}
+
 // NewWorkspace creates a protected workspace below the system temporary root.
 func NewWorkspace(ctx context.Context, jobID int64, options WorkspaceOptions) (*Workspace, error) {
 	return newWorkspace(ctx, jobID, options, workspaceHooks{})
@@ -111,38 +117,51 @@ func (workspace *Workspace) Path(name string) (string, error) {
 	return path, nil
 }
 
-// Reserve accounts for temporary bytes before external work starts.
-func (workspace *Workspace) Reserve(ctx context.Context, bytes int64) error {
+func (workspace *Workspace) reserve(ctx context.Context, bytes int64) (*reservation, error) {
 	if workspace == nil || ctx == nil {
-		return saferr.New(saferr.CategoryRendering, "temporary storage reservation failed")
+		return nil, saferr.New(saferr.CategoryRendering, "temporary storage reservation failed")
 	}
 	if err := ctx.Err(); err != nil {
-		return renderingError("temporary storage reservation canceled", err)
+		return nil, renderingError("temporary storage reservation canceled", err)
 	}
 	if bytes < 0 {
-		return saferr.New(saferr.CategoryRendering, "invalid temporary storage reservation")
+		return nil, saferr.New(saferr.CategoryRendering, "invalid temporary storage reservation")
 	}
 
 	workspace.mu.Lock()
 	defer workspace.mu.Unlock()
 	if workspace.closed {
-		return saferr.New(saferr.CategoryRendering, "workspace is closed")
+		return nil, saferr.New(saferr.CategoryRendering, "workspace is closed")
 	}
 	if bytes > math.MaxInt64-workspace.reserved || workspace.reserved+bytes > workspace.budget {
-		return saferr.New(saferr.CategoryRendering, "temporary byte budget exceeded")
+		return nil, saferr.New(saferr.CategoryRendering, "temporary byte budget exceeded")
 	}
 	available, err := workspace.availableBytes(workspace.dir)
 	if err != nil {
-		return renderingError("workspace storage check failed", err)
+		return nil, renderingError("workspace storage check failed", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return renderingError("temporary storage reservation canceled", err)
+		return nil, renderingError("temporary storage reservation canceled", err)
 	}
 	if available < 0 || bytes > math.MaxInt64-workspace.minimumFree || available < bytes+workspace.minimumFree {
-		return saferr.New(saferr.CategoryRendering, "insufficient temporary storage")
+		return nil, saferr.New(saferr.CategoryRendering, "insufficient temporary storage")
 	}
 	workspace.reserved += bytes
-	return nil
+	return &reservation{workspace: workspace, bytes: bytes}, nil
+}
+
+func (reservation *reservation) release() {
+	if reservation == nil || reservation.workspace == nil {
+		return
+	}
+	workspace := reservation.workspace
+	workspace.mu.Lock()
+	defer workspace.mu.Unlock()
+	if reservation.released {
+		return
+	}
+	reservation.released = true
+	workspace.reserved = max(0, workspace.reserved-reservation.bytes)
 }
 
 // Close recursively removes the workspace. Repeated calls are safe.
@@ -154,6 +173,9 @@ func (workspace *Workspace) Close() error {
 	defer workspace.mu.Unlock()
 	if workspace.closed {
 		return nil
+	}
+	if workspace.reserved != 0 {
+		return saferr.New(saferr.CategoryRendering, "workspace is in use")
 	}
 	if err := os.RemoveAll(workspace.dir); err != nil {
 		return renderingError("workspace cleanup failed", err)

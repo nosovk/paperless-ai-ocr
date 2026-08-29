@@ -120,7 +120,7 @@ func TestWorkspaceOptionsValidation(t *testing.T) {
 	}
 }
 
-func TestWorkspaceReserveBudgetAndOverflow(t *testing.T) {
+func TestWorkspaceReservationBudgetReleaseAndSequentialReuse(t *testing.T) {
 	workspace, err := newWorkspace(context.Background(), 5, WorkspaceOptions{
 		TemporaryByteBudget: 10,
 		MinimumFreeBytes:    5,
@@ -130,30 +130,43 @@ func TestWorkspaceReserveBudgetAndOverflow(t *testing.T) {
 	}
 	t.Cleanup(func() { workspace.Close() })
 
-	if err := workspace.Reserve(context.Background(), 4); err != nil {
-		t.Fatalf("Reserve(4) error = %v", err)
+	reservation, err := workspace.reserve(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("reserve(10) error = %v", err)
 	}
-	if err := workspace.Reserve(context.Background(), 6); err != nil {
-		t.Fatalf("Reserve(6) error = %v", err)
+	if workspace.reserved != 10 {
+		t.Errorf("reserved = %d, want 10", workspace.reserved)
 	}
-	if err := workspace.Reserve(context.Background(), 1); err == nil {
-		t.Fatal("Reserve over budget error = nil")
+	if _, err := workspace.reserve(context.Background(), 1); err == nil {
+		t.Fatal("overlapping reserve error = nil")
 	} else {
 		assertRenderingError(t, err)
 	}
-	if err := workspace.Reserve(context.Background(), math.MaxInt64); err == nil {
-		t.Fatal("Reserve overflow error = nil")
+
+	reservation.release()
+	reservation.release()
+	if workspace.reserved != 0 {
+		t.Errorf("reserved after repeated release = %d, want 0", workspace.reserved)
+	}
+	sequential, err := workspace.reserve(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("sequential reserve(10) error = %v", err)
+	}
+	sequential.release()
+
+	if _, err := workspace.reserve(context.Background(), math.MaxInt64); err == nil {
+		t.Fatal("reserve overflow error = nil")
 	} else {
 		assertRenderingError(t, err)
 	}
-	if err := workspace.Reserve(context.Background(), -1); err == nil {
-		t.Fatal("Reserve negative error = nil")
+	if _, err := workspace.reserve(context.Background(), -1); err == nil {
+		t.Fatal("reserve negative error = nil")
 	} else {
 		assertRenderingError(t, err)
 	}
 }
 
-func TestWorkspaceReserveChecksFreeSpaceBeforeUpdating(t *testing.T) {
+func TestWorkspaceReservationChecksFreeSpaceBeforeUpdating(t *testing.T) {
 	var calls int
 	workspace, err := newWorkspace(context.Background(), 6, WorkspaceOptions{
 		TemporaryByteBudget: 100,
@@ -173,15 +186,15 @@ func TestWorkspaceReserveChecksFreeSpaceBeforeUpdating(t *testing.T) {
 	}
 	t.Cleanup(func() { workspace.Close() })
 
-	if err := workspace.Reserve(context.Background(), 5); err == nil {
-		t.Fatal("Reserve() error = nil")
+	if _, err := workspace.reserve(context.Background(), 5); err == nil {
+		t.Fatal("reserve() error = nil")
 	}
 	if workspace.reserved != 0 {
 		t.Errorf("reserved = %d, want 0", workspace.reserved)
 	}
 }
 
-func TestWorkspaceReserveChecksCurrentFreeSpaceForNewBytes(t *testing.T) {
+func TestWorkspaceReservationChecksCurrentFreeSpaceForNewBytes(t *testing.T) {
 	available := []int64{100, 100, 60}
 	workspace, err := newWorkspace(context.Background(), 61, WorkspaceOptions{
 		TemporaryByteBudget: 100,
@@ -199,18 +212,22 @@ func TestWorkspaceReserveChecksCurrentFreeSpaceForNewBytes(t *testing.T) {
 	}
 	t.Cleanup(func() { workspace.Close() })
 
-	if err := workspace.Reserve(context.Background(), 40); err != nil {
-		t.Fatalf("first Reserve() error = %v", err)
+	first, err := workspace.reserve(context.Background(), 40)
+	if err != nil {
+		t.Fatalf("first reserve() error = %v", err)
 	}
-	if err := workspace.Reserve(context.Background(), 20); err != nil {
-		t.Fatalf("second Reserve() error = %v", err)
+	second, err := workspace.reserve(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("second reserve() error = %v", err)
 	}
 	if workspace.reserved != 60 {
 		t.Errorf("reserved = %d, want 60", workspace.reserved)
 	}
+	first.release()
+	second.release()
 }
 
-func TestWorkspaceReserveRejectsNewBytesBelowCurrentFreeSpace(t *testing.T) {
+func TestWorkspaceReservationRejectsNewBytesBelowCurrentFreeSpace(t *testing.T) {
 	workspace, err := newWorkspace(context.Background(), 62, WorkspaceOptions{
 		TemporaryByteBudget: 100,
 		MinimumFreeBytes:    10,
@@ -220,8 +237,8 @@ func TestWorkspaceReserveRejectsNewBytesBelowCurrentFreeSpace(t *testing.T) {
 	}
 	t.Cleanup(func() { workspace.Close() })
 
-	if err := workspace.Reserve(context.Background(), 20); err == nil {
-		t.Fatal("Reserve() error = nil")
+	if _, err := workspace.reserve(context.Background(), 20); err == nil {
+		t.Fatal("reserve() error = nil")
 	} else {
 		assertRenderingError(t, err)
 	}
@@ -294,13 +311,13 @@ func TestWorkspaceCanceledSetupCleansUp(t *testing.T) {
 	assertDirectoryEmpty(t, root)
 }
 
-func TestWorkspaceReserveCancellation(t *testing.T) {
+func TestWorkspaceReservationCancellation(t *testing.T) {
 	workspace := newTestWorkspace(t, context.Background(), 11, WorkspaceOptions{TemporaryByteBudget: testByteBudget})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := workspace.Reserve(ctx, 1)
+	_, err := workspace.reserve(ctx, 1)
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Reserve() error = %v, want context.Canceled", err)
+		t.Fatalf("reserve() error = %v, want context.Canceled", err)
 	}
 	assertRenderingError(t, err)
 }
