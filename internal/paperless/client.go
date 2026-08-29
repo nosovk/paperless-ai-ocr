@@ -46,6 +46,7 @@ type Client struct {
 	maxJSONResponseBytes int64
 	maxDownloadBytes     int64
 	maxPages             int
+	ensureTagGate        chan struct{}
 }
 
 // StatusError reports an HTTP response status without retaining response data.
@@ -87,13 +88,15 @@ func New(baseURL *url.URL, token string, options Options) (*Client, error) {
 	clonedURL.RawPath = ""
 
 	httpClient := options.HTTPClient
+	var callerRedirectPolicy func(*http.Request, []*http.Request) error
 	if httpClient == nil {
 		httpClient = &http.Client{Transport: boundedTransport()}
 	} else {
+		callerRedirectPolicy = httpClient.CheckRedirect
 		clone := *httpClient
 		httpClient = &clone
 	}
-	httpClient.CheckRedirect = redirectPolicy(&clonedURL)
+	httpClient.CheckRedirect = redirectPolicy(&clonedURL, callerRedirectPolicy)
 
 	return &Client{
 		baseURL:              &clonedURL,
@@ -103,6 +106,7 @@ func New(baseURL *url.URL, token string, options Options) (*Client, error) {
 		maxJSONResponseBytes: defaultValue(options.MaxJSONResponseBytes, defaultMaxJSONResponseBytes),
 		maxDownloadBytes:     defaultValue(options.MaxDownloadBytes, defaultMaxDownloadBytes),
 		maxPages:             defaultValue(options.MaxPages, defaultMaxPages),
+		ensureTagGate:        make(chan struct{}, 1),
 	}, nil
 }
 
@@ -183,7 +187,7 @@ func (client *Client) DownloadOriginal(ctx context.Context, documentID int, dest
 		return paperlessError("download original", err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+	if response.StatusCode != http.StatusOK {
 		drain(response.Body)
 		return paperlessError("download original", &StatusError{Operation: "download original", StatusCode: response.StatusCode})
 	}
@@ -253,6 +257,48 @@ func (client *Client) EnsureTag(ctx context.Context, name string) (Tag, error) {
 	if strings.TrimSpace(name) == "" {
 		return Tag{}, paperlessError("ensure tag", errors.New("blank tag name"))
 	}
+	select {
+	case client.ensureTagGate <- struct{}{}:
+		defer func() { <-client.ensureTagGate }()
+	case <-ctx.Done():
+		return Tag{}, paperlessError("ensure tag", ctx.Err())
+	}
+	matches, err := client.lookupTags(ctx, name)
+	if err != nil {
+		return Tag{}, err
+	}
+	if len(matches) > 1 {
+		return Tag{}, paperlessError("ensure tag", errors.New("ambiguous exact tag name"))
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+
+	var created Tag
+	err = client.doJSON(ctx, "ensure tag", http.MethodPost, client.endpoint("api/tags/"), struct {
+		Name string `json:"name"`
+	}{Name: name}, &created)
+	if err != nil {
+		var statusErr *StatusError
+		if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusConflict {
+			return Tag{}, err
+		}
+		matches, err = client.lookupTags(ctx, name)
+		if err != nil {
+			return Tag{}, err
+		}
+		if len(matches) != 1 {
+			return Tag{}, paperlessError("ensure tag", errors.New("tag conflict did not resolve uniquely"))
+		}
+		return matches[0], nil
+	}
+	if err := validateTag(created); err != nil {
+		return Tag{}, paperlessError("ensure tag", err)
+	}
+	return created, nil
+}
+
+func (client *Client) lookupTags(ctx context.Context, name string) ([]Tag, error) {
 	endpoint := client.endpoint("api/tags/")
 	query := endpoint.Query()
 	query.Set("name__iexact", name)
@@ -274,26 +320,9 @@ func (client *Client) EnsureTag(ctx context.Context, name string) (Tag, error) {
 		}
 		return page.Next, nil
 	}); err != nil {
-		return Tag{}, err
+		return nil, err
 	}
-	if len(matches) > 1 {
-		return Tag{}, paperlessError("ensure tag", errors.New("ambiguous exact tag name"))
-	}
-	if len(matches) == 1 {
-		return matches[0], nil
-	}
-
-	var created Tag
-	err := client.doJSON(ctx, "ensure tag", http.MethodPost, client.endpoint("api/tags/"), struct {
-		Name string `json:"name"`
-	}{Name: name}, &created)
-	if err != nil {
-		return Tag{}, err
-	}
-	if err := validateTag(created); err != nil {
-		return Tag{}, paperlessError("ensure tag", err)
-	}
-	return created, nil
+	return matches, nil
 }
 
 func (client *Client) walkPages(ctx context.Context, operation string, first *url.URL, visit func(*url.URL) (*string, error)) error {
@@ -458,13 +487,19 @@ func boundedTransport() *http.Transport {
 	}
 }
 
-func redirectPolicy(baseURL *url.URL) func(*http.Request, []*http.Request) error {
+func redirectPolicy(baseURL *url.URL, callerPolicy func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
 	return func(request *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return errors.New("too many redirects")
 		}
+		if len(via) == 0 || (via[0].Method != http.MethodGet && via[0].Method != http.MethodHead) {
+			return errors.New("redirect rejected for mutating request")
+		}
 		if !allowedURL(baseURL, request.URL) {
 			return errors.New("cross-origin redirect rejected")
+		}
+		if callerPolicy != nil {
+			return callerPolicy(request, via)
 		}
 		return nil
 	}

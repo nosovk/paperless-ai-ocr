@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -349,6 +350,31 @@ func TestDownloadOriginalStreamsAndLimitsResponse(t *testing.T) {
 	assertPaperlessError(t, limited.DownloadOriginal(context.Background(), 9, io.Discard))
 }
 
+func TestDownloadOriginalRejectsPartialContentWithoutWriting(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusPartialContent)
+		io.WriteString(writer, "partial PDF bytes")
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	var destination bytes.Buffer
+	err := client.DownloadOriginal(context.Background(), 1, &destination)
+	assertPaperlessError(t, err)
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("errors.As(*StatusError) = false: %v", err)
+	}
+	if got, want := statusErr.StatusCode, http.StatusPartialContent; got != want {
+		t.Errorf("StatusCode = %d, want %d", got, want)
+	}
+	if destination.Len() != 0 {
+		t.Errorf("destination length = %d, want 0", destination.Len())
+	}
+}
+
 func TestUpdateContentAndTagsUseSeparatePatches(t *testing.T) {
 	t.Parallel()
 
@@ -617,6 +643,197 @@ func TestEnsureTagRejectsInvalidCreatedTag(t *testing.T) {
 	assertRedacted(t, err, "canary created tag")
 }
 
+func TestEnsureTagSerializesConcurrentCreation(t *testing.T) {
+	t.Parallel()
+
+	const callers = 20
+	var stateMu sync.Mutex
+	var exists bool
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			stateMu.Lock()
+			found := exists
+			stateMu.Unlock()
+			time.Sleep(30 * time.Millisecond)
+			if found {
+				io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":77,"name":"concurrent"}]}`)
+				return
+			}
+			io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+		case http.MethodPost:
+			posts.Add(1)
+			stateMu.Lock()
+			exists = true
+			stateMu.Unlock()
+			writer.WriteHeader(http.StatusCreated)
+			io.WriteString(writer, `{"id":77,"name":"concurrent"}`)
+		default:
+			http.Error(writer, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	start := make(chan struct{})
+	results := make(chan Tag, callers)
+	errorsChannel := make(chan error, callers)
+	var waitGroup sync.WaitGroup
+	for range callers {
+		waitGroup.Go(func() {
+			<-start
+			tag, err := client.EnsureTag(context.Background(), "concurrent")
+			results <- tag
+			errorsChannel <- err
+		})
+	}
+	close(start)
+	waitGroup.Wait()
+	close(results)
+	close(errorsChannel)
+
+	for err := range errorsChannel {
+		if err != nil {
+			t.Errorf("EnsureTag() error = %v", err)
+		}
+	}
+	for tag := range results {
+		if got, want := tag.ID, 77; got != want {
+			t.Errorf("EnsureTag() ID = %d, want %d", got, want)
+		}
+	}
+	if got, want := posts.Load(), int32(1); got != want {
+		t.Errorf("POST count = %d, want %d", got, want)
+	}
+}
+
+func TestEnsureTagWaiterHonorsContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	firstLookupStarted := make(chan struct{})
+	releaseFirstLookup := make(chan struct{})
+	var lookups atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet {
+			if lookups.Add(1) == 1 {
+				close(firstLookupStarted)
+				<-releaseFirstLookup
+			}
+			io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":3,"name":"serialized"}]}`)
+			return
+		}
+		http.Error(writer, "unexpected POST", http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := client.EnsureTag(context.Background(), "serialized")
+		firstResult <- err
+	}()
+	<-firstLookupStarted
+
+	ctx, cancel := context.WithCancel(context.Background())
+	secondResult := make(chan error, 1)
+	go func() {
+		_, err := client.EnsureTag(ctx, "serialized")
+		secondResult <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	secondErr := <-secondResult
+	close(releaseFirstLookup)
+	firstErr := <-firstResult
+
+	assertPaperlessError(t, secondErr)
+	if !errors.Is(secondErr, context.Canceled) {
+		t.Errorf("errors.Is(error, context.Canceled) = false")
+	}
+	if got, want := lookups.Load(), int32(1); got != want {
+		t.Errorf("lookup count before release = %d, want %d", got, want)
+	}
+	if firstErr != nil {
+		t.Errorf("first EnsureTag() error = %v", firstErr)
+	}
+}
+
+func TestEnsureTagRecoversFromCreateConflictByRelookingUp(t *testing.T) {
+	t.Parallel()
+
+	var lookups atomic.Int32
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			if lookups.Add(1) == 1 {
+				io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+				return
+			}
+			io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":88,"name":"external race"}]}`)
+		case http.MethodPost:
+			posts.Add(1)
+			writer.WriteHeader(http.StatusConflict)
+			io.WriteString(writer, `{"detail":"canary external conflict body"}`)
+		default:
+			http.Error(writer, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	tag, err := client.EnsureTag(context.Background(), "external race")
+	if err != nil {
+		t.Fatalf("EnsureTag() error = %v", err)
+	}
+	if got, want := tag.ID, 88; got != want {
+		t.Errorf("EnsureTag() ID = %d, want %d", got, want)
+	}
+	if got, want := lookups.Load(), int32(2); got != want {
+		t.Errorf("lookup count = %d, want %d", got, want)
+	}
+	if got, want := posts.Load(), int32(1); got != want {
+		t.Errorf("POST count = %d, want %d", got, want)
+	}
+}
+
+func TestEnsureTagConflictRelookupMustFindExactlyOneTag(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		result string
+	}{
+		{name: "absent", result: `{"count":0,"next":null,"results":[]}`},
+		{name: "ambiguous", result: `{"count":2,"next":null,"results":[{"id":1,"name":"race"},{"id":2,"name":"race"}]}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var lookups atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.Method == http.MethodGet {
+					if lookups.Add(1) == 1 {
+						io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+						return
+					}
+					io.WriteString(writer, test.result)
+					return
+				}
+				writer.WriteHeader(http.StatusConflict)
+			}))
+			t.Cleanup(server.Close)
+			client := newTestClient(t, server.URL, Options{})
+
+			_, err := client.EnsureTag(context.Background(), "race")
+			assertPaperlessError(t, err)
+		})
+	}
+}
+
 func TestRequestDeadlineAndJSONLimit(t *testing.T) {
 	t.Parallel()
 
@@ -710,6 +927,109 @@ func TestSameOriginRedirectRetainsAuthorization(t *testing.T) {
 	}
 	if got, want := redirectedAuth, "Token "+testToken; got != want {
 		t.Errorf("redirected Authorization = %q, want %q", got, want)
+	}
+}
+
+func TestMutatingRedirectsAreRejectedBeforeMethodRewrite(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther} {
+		for _, operation := range []string{"update content", "ensure tag"} {
+			t.Run(fmt.Sprintf("%s_%d", operation, status), func(t *testing.T) {
+				t.Parallel()
+
+				var redirectedRequests atomic.Int32
+				server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+					if request.URL.Path == "/redirected" {
+						redirectedRequests.Add(1)
+						if request.Method == http.MethodGet {
+							t.Error("mutating request was rewritten to GET")
+						}
+						io.WriteString(writer, `{}`)
+						return
+					}
+					if operation == "ensure tag" && request.Method == http.MethodGet {
+						io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+						return
+					}
+					writer.Header().Set("Location", "/redirected")
+					writer.WriteHeader(status)
+				}))
+				t.Cleanup(server.Close)
+				client := newTestClient(t, server.URL, Options{})
+
+				var err error
+				if operation == "update content" {
+					err = client.UpdateContent(context.Background(), 1, "canary redirected OCR content")
+				} else {
+					_, err = client.EnsureTag(context.Background(), "redirected tag")
+				}
+				assertPaperlessError(t, err)
+				assertRedacted(t, err, testToken, "canary redirected OCR content")
+				if got := redirectedRequests.Load(); got != 0 {
+					t.Errorf("redirected request count = %d, want 0", got)
+				}
+			})
+		}
+	}
+}
+
+func TestCallerRedirectPolicyIsPreserved(t *testing.T) {
+	t.Parallel()
+
+	callerErr := errors.New("caller redirect rejection")
+	var policyCalls atomic.Int32
+	var policyMethod string
+	httpClient := &http.Client{CheckRedirect: func(request *http.Request, via []*http.Request) error {
+		policyCalls.Add(1)
+		policyMethod = via[0].Method
+		if request.URL.Path != "/paperless/redirected" || len(via) != 1 {
+			t.Errorf("caller policy request = %s, via = %d", request.URL.Path, len(via))
+		}
+		return callerErr
+	}}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/paperless/api/documents/1/" {
+			http.Redirect(writer, request, "/paperless/redirected", http.StatusFound)
+			return
+		}
+		t.Error("caller-rejected redirect was followed")
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL+"/paperless/", Options{HTTPClient: httpClient})
+
+	_, err := client.GetDocument(context.Background(), 1)
+	assertPaperlessError(t, err)
+	if !errors.Is(err, callerErr) {
+		t.Errorf("errors.Is(error, caller error) = false")
+	}
+	if got, want := policyCalls.Load(), int32(1); got != want {
+		t.Errorf("caller policy calls = %d, want %d", got, want)
+	}
+	if got, want := policyMethod, http.MethodGet; got != want {
+		t.Errorf("original method = %q, want %q", got, want)
+	}
+}
+
+func TestMandatoryRedirectPolicyRunsBeforeCallerPolicy(t *testing.T) {
+	t.Parallel()
+
+	var policyCalls atomic.Int32
+	httpClient := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		policyCalls.Add(1)
+		return nil
+	}}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Location", "/outside")
+		writer.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL+"/paperless/", Options{HTTPClient: httpClient})
+
+	_, err := client.GetDocument(context.Background(), 1)
+	assertPaperlessError(t, err)
+	if got := policyCalls.Load(); got != 0 {
+		t.Errorf("caller policy calls = %d, want 0", got)
 	}
 }
 
