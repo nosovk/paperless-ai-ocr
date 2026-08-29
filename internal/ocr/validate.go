@@ -239,13 +239,86 @@ func Join(batches []Batch) (string, error) {
 }
 
 func rejectDuplicateFields(decoder *json.Decoder) error {
-	if err := scanJSONValue(decoder); err != nil {
+	if err := scanTranscriptionObject(decoder); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); err != io.EOF {
 		return fmt.Errorf("unexpected trailing JSON")
 	}
 	return nil
+}
+
+func scanTranscriptionObject(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return fmt.Errorf("invalid transcription object")
+	}
+	seenPages := false
+	for decoder.More() {
+		key, err := nextObjectKey(decoder)
+		if err != nil || key != "pages" || seenPages {
+			return fmt.Errorf("invalid transcription field")
+		}
+		seenPages = true
+		if err := scanPagesArray(decoder); err != nil {
+			return err
+		}
+	}
+	_, err = decoder.Token()
+	return err
+}
+
+func scanPagesArray(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('[') {
+		return fmt.Errorf("invalid pages array")
+	}
+	for decoder.More() {
+		if err := scanPageObject(decoder); err != nil {
+			return err
+		}
+	}
+	_, err = decoder.Token()
+	return err
+}
+
+func scanPageObject(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return fmt.Errorf("invalid page object")
+	}
+	seen := make(map[string]struct{}, 3)
+	for decoder.More() {
+		key, err := nextObjectKey(decoder)
+		if err != nil || !isPageField(key) {
+			return fmt.Errorf("invalid page field")
+		}
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("duplicate page field")
+		}
+		seen[key] = struct{}{}
+		if err := scanJSONValue(decoder); err != nil {
+			return err
+		}
+	}
+	_, err = decoder.Token()
+	return err
+}
+
+func nextObjectKey(decoder *json.Decoder) (string, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return "", err
+	}
+	key, ok := token.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid object key")
+	}
+	return key, nil
+}
+
+func isPageField(key string) bool {
+	return key == "page" || key == "text" || key == "refused"
 }
 
 func scanJSONValue(decoder *json.Decoder) error {
@@ -257,49 +330,21 @@ func scanJSONValue(decoder *json.Decoder) error {
 	if !ok {
 		return nil
 	}
-	switch delimiter {
-	case '{':
-		seen := make(map[string]struct{})
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return fmt.Errorf("invalid object key")
-			}
-			if folded := strings.ToLower(key); isSchemaKey(folded) && key != folded {
-				return fmt.Errorf("schema key is not lowercase")
-			}
-			if _, exists := seen[key]; exists {
-				return fmt.Errorf("duplicate object key")
-			}
-			seen[key] = struct{}{}
-			if err := scanJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-	case '[':
-		for decoder.More() {
-			if err := scanJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-	default:
+	if delimiter != '{' && delimiter != '[' {
 		return fmt.Errorf("unexpected JSON delimiter")
+	}
+	for decoder.More() {
+		if delimiter == '{' {
+			if _, err := nextObjectKey(decoder); err != nil {
+				return err
+			}
+		}
+		if err := scanJSONValue(decoder); err != nil {
+			return err
+		}
 	}
 	_, err = decoder.Token()
 	return err
-}
-
-func isSchemaKey(key string) bool {
-	switch key {
-	case "pages", "page", "text", "refused":
-		return true
-	default:
-		return false
-	}
 }
 
 func validRange(firstPage, lastPage int) bool {

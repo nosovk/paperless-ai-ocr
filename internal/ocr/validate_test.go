@@ -149,6 +149,24 @@ func TestValidateRejectsMixedCaseSemanticDuplicateKeys(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsUnicodeFoldedSchemaAliases(t *testing.T) {
+	for _, raw := range []string{
+		`{"pageſ":[{"page":1,"text":"one","refused":false}]}`,
+		`{"page\u017f":[{"page":1,"text":"one","refused":false}]}`,
+		`{"pages":[{"page":1,"text":"one","refuſed":false}]}`,
+		`{"pages":[{"page":1,"text":"one","refu\u017fed":false}]}`,
+		`{"pages":[{"page":1,"text":"one","refused":false}],"pageſ":[{"page":1,"text":"again","refused":false}]}`,
+		`{"pageſ":[{"page":1,"text":"one","refused":false}],"pages":[{"page":1,"text":"again","refused":false}]}`,
+		`{"pages":[{"page":1,"text":"one","refused":false,"refuſed":true}]}`,
+		`{"pages":[{"page":1,"text":"one","refuſed":true,"refused":false}]}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			_, err := Validate([]byte(raw), 1, 1)
+			assertSafeProviderError(t, err, []byte(raw))
+		})
+	}
+}
+
 func TestValidateRejectsMalformedUnicodeEscapes(t *testing.T) {
 	for _, raw := range []string{
 		`{"pages":[{"page":1,"text":"lone high \ud800 marker","refused":false}]}`,
@@ -304,8 +322,8 @@ func TestJoinRejectsInvalidBatches(t *testing.T) {
 
 func FuzzValidate(f *testing.F) {
 	f.Add([]byte(`{"pages":[{"page":1,"text":"CANARY-one","refused":false}]}`), 1, 1)
-	f.Add([]byte(`{"pages":[]} trailing-validate-disclosure-marker-7c91`), 1, 1)
-	f.Add([]byte{0xff, 'v', 'a', 'l', 'i', 'd', 'a', 't', 'e', '-', 'm', 'a', 'r', 'k', 'e', 'r', '-', '9', 'f', '2'}, 1, 1)
+	f.Add([]byte(`{"pages":[]} validate-segment-alpha-7c91 validate-segment-beta-3d42`), 1, 1)
+	f.Add([]byte{0xff, 'v', 'a', 'l', 'i', 'd', 'a', 't', 'e', '-', 's', 'e', 'g', 'm', 'e', 'n', 't', '-', 'g', 'a', 'm', 'm', 'a', '-', '9', 'f', '2', ' ', 'v', 'a', 'l', 'i', 'd', 'a', 't', 'e', '-', 's', 'e', 'g', 'm', 'e', 'n', 't', '-', 'd', 'e', 'l', 't', 'a', '-', '6', 'b', '1'}, 1, 1)
 	f.Fuzz(func(t *testing.T, raw []byte, firstPage, lastPage int) {
 		batch1, err1 := Validate(raw, firstPage, lastPage)
 		batch2, err2 := Validate(raw, firstPage, lastPage)
@@ -319,7 +337,7 @@ func FuzzValidate(f *testing.F) {
 }
 
 func FuzzJoin(f *testing.F) {
-	f.Add(0, "join-disclosure-marker-CANARY-4e82")
+	f.Add(0, "join-segment-alpha-CANARY-4e82 join-segment-beta-19d7")
 	f.Add(1, "CANARY-one")
 	f.Add(2, "two\nlines")
 	f.Fuzz(func(t *testing.T, page int, text string) {
@@ -357,10 +375,10 @@ func assertSafeProviderError(t *testing.T, err error, raw []byte) {
 
 func errorDisclosesInput(err error, raw []byte) bool {
 	const minDisclosureBytes = 8
-	if len(raw) < minDisclosureBytes {
+	candidates := disclosureCandidates(raw, minDisclosureBytes)
+	if len(candidates) == 0 {
 		return false
 	}
-	input := string(raw)
 	for current := err; current != nil; current = errors.Unwrap(current) {
 		for _, formatted := range []string{
 			fmt.Sprintf("%s", current),
@@ -368,16 +386,46 @@ func errorDisclosesInput(err error, raw []byte) bool {
 			fmt.Sprintf("%+v", current),
 			fmt.Sprintf("%#v", current),
 		} {
-			if strings.Contains(formatted, input) {
-				return true
+			for _, candidate := range candidates {
+				if strings.Contains(formatted, candidate) {
+					return true
+				}
 			}
 		}
 	}
 	return false
 }
 
+func disclosureCandidates(raw []byte, minBytes int) []string {
+	if len(raw) < minBytes {
+		return nil
+	}
+	candidates := []string{string(raw)}
+	for start := 0; start < len(raw); {
+		for start < len(raw) && !isMarkerByte(raw[start]) {
+			start++
+		}
+		end := start
+		for end < len(raw) && isMarkerByte(raw[end]) {
+			end++
+		}
+		if end-start >= minBytes && end-start < len(raw) {
+			candidates = append(candidates, string(raw[start:end]))
+		}
+		start = end + 1
+	}
+	return candidates
+}
+
+func isMarkerByte(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '-' || value == '_'
+}
+
 func TestErrorDisclosesInputChecksFormattingAndUnwrapChain(t *testing.T) {
-	const raw = "unique-raw-disclosure-marker-83f5"
+	const (
+		raw     = "prefix unique-segment-alpha-83f5 middle unique-segment-beta-27c1 suffix"
+		segment = "unique-segment-beta-27c1"
+	)
 	tests := []struct {
 		name string
 		err  error
@@ -387,6 +435,7 @@ func TestErrorDisclosesInputChecksFormattingAndUnwrapChain(t *testing.T) {
 		{name: "safe", err: saferr.New(saferr.CategoryProvider, invalidTranscriptionMessage), raw: raw, want: false},
 		{name: "public formatting", err: errors.New("failed: " + raw), raw: raw, want: true},
 		{name: "private unwrap cause", err: saferr.Wrap(saferr.CategoryProvider, invalidTranscriptionMessage, errors.New(raw)), raw: raw, want: true},
+		{name: "raw substring only", err: errors.New("failed: " + segment), raw: raw, want: true},
 		{name: "too short to be meaningful", err: errors.New("x"), raw: "x", want: false},
 	}
 	for _, test := range tests {
