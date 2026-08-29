@@ -251,6 +251,94 @@ func TestResolveCandidateMissingCandidateDoesNotEnqueue(t *testing.T) {
 	}
 }
 
+func TestDiscardCandidateIsDurableAndIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	q := openTestQueue(t, path, testNow)
+	if _, err := q.EnqueueCandidate(context.Background(), 42, PriorityWebhook); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.DiscardCandidate(context.Background(), 42); err != nil {
+		t.Fatalf("DiscardCandidate() error = %v", err)
+	}
+	if err := q.DiscardCandidate(context.Background(), 42); err != nil {
+		t.Fatalf("idempotent DiscardCandidate() error = %v", err)
+	}
+	if err := q.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	q = New(db)
+	if _, ok, err := q.NextCandidate(context.Background()); err != nil || ok {
+		t.Fatalf("NextCandidate() after reopen = (_, %t, %v), want empty", ok, err)
+	}
+}
+
+func TestDiscardCandidateValidatesDocumentID(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	if err := q.DiscardCandidate(context.Background(), 0); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("DiscardCandidate(0) error = %v, want validation", err)
+	}
+}
+
+func TestEnqueueContextCanceledBeforeTransactionCreatesNoJob(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := q.EnqueueContext(ctx, EnqueueInput{
+		DocumentID: 1, SourceChecksum: "checksum", Priority: PriorityBackfill,
+		Model: "model", PromptVersion: "v1",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("EnqueueContext() error = %v, want context canceled", err)
+	}
+	var count int
+	if err := q.db.QueryRow("SELECT count(*) FROM jobs").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("job count = %d, want 0", count)
+	}
+}
+
+func TestEnqueueContextCancellationWhileWaitingForWriterCreatesNoJob(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	q1 := openTestQueue(t, path, testNow)
+	q2 := openTestQueue(t, path, testNow)
+	lock := holdWriterLock(t, q1.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := q2.EnqueueContext(ctx, EnqueueInput{
+			DocumentID: 1, SourceChecksum: "checksum", Priority: PriorityBackfill,
+			Model: "model", PromptVersion: "v1",
+		})
+		result <- err
+	}()
+	waitForConnectionInUse(t, q2.db)
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("EnqueueContext() error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("EnqueueContext() did not return after cancellation")
+	}
+	lock.Release(t)
+	var count int
+	if err := q1.db.QueryRow("SELECT count(*) FROM jobs").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("job count = %d, want 0", count)
+	}
+}
+
 func TestEnqueueIsIdempotentAndPromotesCurrentWork(t *testing.T) {
 	now := testNow
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)

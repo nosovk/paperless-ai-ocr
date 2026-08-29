@@ -2,7 +2,10 @@ package reconcile
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -102,6 +105,77 @@ func TestRunOnceTemporaryCandidateFailureRetainsCandidateAndStops(t *testing.T) 
 	}
 	if got := requests(); !slices.Equal(got, []string{"/api/documents/1/"}) {
 		t.Errorf("requests = %v, want no archive request", got)
+	}
+}
+
+func TestRunOnceDiscardsMissingCandidateThenContinuesToBackfill(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reconcile.db")
+	db, q := openStore(t, path)
+	for _, id := range []int64{1, 2} {
+		if _, err := q.EnqueueCandidate(context.Background(), id, queue.PriorityWebhook); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client, requests := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/documents/1/":
+			http.NotFound(writer, request)
+		case "/api/documents/2/":
+			io.WriteString(writer, `{"id":2,"checksum":"candidate","tags":[]}`)
+		case "/api/documents/":
+			io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":3,"checksum":"backfill","tags":[]}]}`)
+		}
+	})
+	r := newReconciler(t, db, client, q, Options{})
+
+	report, err := r.RunOnce(context.Background())
+	if err != nil || report.CandidatesDiscarded != 1 || report.CandidatesResolved != 1 || report.JobsCreated != 2 || !report.ScanComplete {
+		t.Fatalf("RunOnce() = (%+v, %v)", report, err)
+	}
+	if got := requests(); !slices.Equal(got, []string{"/api/documents/1/", "/api/documents/2/", "/api/documents/"}) {
+		t.Errorf("requests = %v", got)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = database.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	q = queue.New(db)
+	if _, ok, err := q.NextCandidate(context.Background()); err != nil || ok {
+		t.Fatalf("candidate after reopen = (_, %t, %v), want empty", ok, err)
+	}
+	assertClaimOrder(t, q, []int64{2, 3})
+}
+
+func TestRunOnceDiscardsBlankChecksumCandidateThenContinues(t *testing.T) {
+	db, q := openStore(t, filepath.Join(t.TempDir(), "reconcile.db"))
+	for _, id := range []int64{1, 2} {
+		if _, err := q.EnqueueCandidate(context.Background(), id, queue.PriorityWebhook); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client, _ := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/documents/1/":
+			io.WriteString(writer, `{"id":1,"checksum":" ","content":"sensitive","tags":[]}`)
+		case "/api/documents/2/":
+			io.WriteString(writer, `{"id":2,"checksum":"valid","tags":[]}`)
+		case "/api/documents/":
+			io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+		}
+	})
+	r := newReconciler(t, db, client, q, Options{})
+
+	report, err := r.RunOnce(context.Background())
+	if err != nil || report.CandidatesDiscarded != 1 || report.CandidatesResolved != 1 || !report.ScanComplete {
+		t.Fatalf("RunOnce() = (%+v, %v)", report, err)
+	}
+	job, ok, err := q.Claim("worker", time.Minute)
+	if err != nil || !ok || job.DocumentID != 2 {
+		t.Fatalf("Claim() = (%+v, %t, %v), want valid candidate", job, ok, err)
 	}
 }
 
@@ -213,6 +287,17 @@ func TestRunOncePersistsBoundedArchiveCheckpointAcrossReopen(t *testing.T) {
 	first, err := r.RunOnce(context.Background())
 	if err != nil || first.PagesProcessed != 1 || first.ScanComplete {
 		t.Fatalf("first RunOnce() = (%+v, %v)", first, err)
+	}
+	checkpoint := loadCheckpointValue(t, db)
+	if checkpoint["version"] != float64(checkpointVersion) || checkpoint["pages"] != float64(1) {
+		t.Errorf("checkpoint metadata = %#v", checkpoint)
+	}
+	visited, ok := checkpoint["visited"].([]any)
+	if !ok || len(visited) != 1 || visited[0] != checkpointFingerprint(initialCursorIdentifier) {
+		t.Errorf("checkpoint visited = %#v, want initial cursor fingerprint", checkpoint["visited"])
+	}
+	if strings.Contains(fmt.Sprint(checkpoint["visited"]), "api/documents") {
+		t.Errorf("checkpoint visited contains raw cursor: %#v", checkpoint["visited"])
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("close database: %v", err)
@@ -365,6 +450,177 @@ func TestRunOnceContextCancellationPreservesCompletedPageCheckpoint(t *testing.T
 	}
 }
 
+func TestRunOnceCancellationDuringArchiveEnqueueDoesNotAdvanceCheckpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reconcile.db")
+	db, q := openStore(t, path)
+	lockDB, err := database.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { lockDB.Close() })
+	lockConn, err := lockDB.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockConn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		lockConn.ExecContext(context.Background(), "ROLLBACK")
+		lockConn.Close()
+	})
+	client, _ := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+		io.WriteString(writer, `{"count":1,"next":"?page=2","results":[{"id":1,"checksum":"checksum","tags":[]}]}`)
+	})
+	r := newReconciler(t, db, client, q, Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		report Report
+		err    error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		report, err := r.RunOnce(ctx)
+		resultCh <- result{report: report, err: err}
+	}()
+	waitForDBConnectionInUse(t, db)
+	cancel()
+	var got result
+	select {
+	case got = <-resultCh:
+	case <-time.After(time.Second):
+		t.Fatal("RunOnce() did not return after cancellation")
+	}
+	if !errors.Is(got.err, context.Canceled) || got.report.PagesProcessed != 0 {
+		t.Fatalf("RunOnce() = (%+v, %v), want canceled before checkpoint", got.report, got.err)
+	}
+	if _, err := lockConn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lockConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertNoCheckpoint(t, db)
+	var jobs int
+	if err := db.QueryRow("SELECT count(*) FROM jobs").Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 0 {
+		t.Errorf("jobs = %d, want 0", jobs)
+	}
+}
+
+func TestRunOnceRejectsImmediatePaginationLoopWithoutRefetch(t *testing.T) {
+	db, q := openStore(t, filepath.Join(t.TempDir(), "reconcile.db"))
+	requests := 0
+	client, _ := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		io.WriteString(writer, `{"count":1,"next":"/api/documents/","results":[{"id":1,"checksum":"checksum","tags":[]}]}`)
+	})
+	r := newReconciler(t, db, client, q, Options{})
+
+	report, err := r.RunOnce(context.Background())
+	if errorCategory(err) != saferr.CategoryPaperless || report.PagesProcessed != 1 {
+		t.Fatalf("RunOnce() = (%+v, %v), want pagination loop", report, err)
+	}
+	if _, err := r.RunOnce(context.Background()); errorCategory(err) != saferr.CategoryPaperless {
+		t.Fatalf("second RunOnce() error = %v, want persisted pagination loop", err)
+	}
+	if requests != 1 {
+		t.Errorf("requests = %d, want 1", requests)
+	}
+}
+
+func TestRunOnceDetectsPaginationCycleAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reconcile.db")
+	db, q := openStore(t, path)
+	requests := make([]string, 0, 2)
+	client, _ := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+		page := request.URL.Query().Get("page")
+		if page == "" {
+			page = "A"
+		}
+		requests = append(requests, page)
+		if page == "A" {
+			io.WriteString(writer, `{"count":2,"next":"?page=B","results":[{"id":1,"checksum":"a","tags":[]}]}`)
+			return
+		}
+		io.WriteString(writer, `{"count":2,"next":"/api/documents/","results":[{"id":2,"checksum":"b","tags":[]}]}`)
+	})
+	r := newReconciler(t, db, client, q, Options{MaxArchivePagesPerPass: 1})
+	if _, err := r.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	q = queue.New(db)
+	r = newReconciler(t, db, client, q, Options{MaxArchivePagesPerPass: 1})
+	if report, err := r.RunOnce(context.Background()); errorCategory(err) != saferr.CategoryPaperless || report.PagesProcessed != 1 {
+		t.Fatalf("cycle RunOnce() = (%+v, %v)", report, err)
+	}
+	if _, err := r.RunOnce(context.Background()); errorCategory(err) != saferr.CategoryPaperless {
+		t.Fatalf("blocked RunOnce() error = %v", err)
+	}
+	if !slices.Equal(requests, []string{"A", "B"}) {
+		t.Errorf("requests = %v", requests)
+	}
+}
+
+func TestRunOnceEnforcesCumulativePageLimitAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reconcile.db")
+	db, q := openStore(t, path)
+	client, requests := paginatedPaperless(t, 4, 0)
+	r := newReconciler(t, db, client, q, Options{MaxArchivePagesPerPass: 1, MaxArchivePagesPerScan: 2})
+	if _, err := r.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	q = queue.New(db)
+	r = newReconciler(t, db, client, q, Options{MaxArchivePagesPerPass: 1, MaxArchivePagesPerScan: 2})
+	if report, err := r.RunOnce(context.Background()); errorCategory(err) != saferr.CategoryPaperless || report.PagesProcessed != 1 {
+		t.Fatalf("limit RunOnce() = (%+v, %v)", report, err)
+	}
+	if _, err := r.RunOnce(context.Background()); errorCategory(err) != saferr.CategoryPaperless {
+		t.Fatalf("blocked RunOnce() error = %v", err)
+	}
+	if got := requests(); !slices.Equal(got, []string{"1", "2"}) {
+		t.Errorf("requests = %v", got)
+	}
+}
+
+func TestRunOnceRejectsMalformedCheckpointWithoutLeakingValue(t *testing.T) {
+	db, q := openStore(t, filepath.Join(t.TempDir(), "reconcile.db"))
+	sensitive := `{"version":99,"next":"https://example.test/?token=sensitive"}`
+	if _, err := db.Exec(`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)`, checkpointKey, sensitive, time.Now().UTC().Format(checkpointTimestampLayout)); err != nil {
+		t.Fatal(err)
+	}
+	client, requests := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
+		t.Fatal("request made with malformed checkpoint")
+	})
+	r := newReconciler(t, db, client, q, Options{})
+
+	_, err := r.RunOnce(context.Background())
+	if errorCategory(err) != saferr.CategoryInternal {
+		t.Fatalf("RunOnce() error = %v, want internal", err)
+	}
+	if strings.Contains(err.Error(), "sensitive") || len(requests()) != 0 {
+		t.Errorf("malformed checkpoint error/request leaked: %q, %v", err, requests())
+	}
+}
+
 func TestRunOnceErrorsDoNotExposeDocumentOrCursorData(t *testing.T) {
 	db, q := openStore(t, filepath.Join(t.TempDir(), "reconcile.db"))
 	client, _ := testPaperless(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -394,6 +650,7 @@ func TestNewValidatesDependenciesAndOptions(t *testing.T) {
 		{Model: "model", PromptVersion: " "},
 		{Model: "model", PromptVersion: "v1", MaxCandidatesPerPass: -1},
 		{Model: "model", PromptVersion: "v1", MaxArchivePagesPerPass: -1},
+		{Model: "model", PromptVersion: "v1", MaxArchivePagesPerScan: -1},
 	} {
 		if _, err := New(db, client, q, options); err == nil {
 			t.Errorf("New(%+v) error = nil", options)
@@ -502,4 +759,50 @@ func errorCategory(err error) saferr.Category {
 		return safeError.Category()
 	}
 	return ""
+}
+
+func waitForDBConnectionInUse(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if db.Stats().InUse == 1 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("database operation did not start")
+		case <-ticker.C:
+		}
+	}
+}
+
+func assertNoCheckpoint(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM settings WHERE key = ?", checkpointKey).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("checkpoint count = %d, want 0", count)
+	}
+}
+
+func checkpointFingerprint(cursor string) string {
+	sum := sha256.Sum256([]byte(cursor))
+	return hex.EncodeToString(sum[:])
+}
+
+func loadCheckpointValue(t *testing.T, db *sql.DB) map[string]any {
+	t.Helper()
+	var value string
+	if err := db.QueryRow("SELECT value FROM settings WHERE key = ?", checkpointKey).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	var checkpoint map[string]any
+	if err := json.Unmarshal([]byte(value), &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	return checkpoint
 }

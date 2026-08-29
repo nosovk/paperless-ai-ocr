@@ -14,6 +14,10 @@ import (
 const (
 	timestampLayout           = "2006-01-02T15:04:05.000000000Z07:00"
 	maxDiagnosticMessageBytes = 256
+	rollbackTimeout           = 5 * time.Second
+	defaultBusyTimeout        = 5 * time.Second
+	busyRetryInterval         = time.Millisecond
+	sqliteBusy                = 5
 )
 
 // Queue stores durable jobs in SQLite.
@@ -89,6 +93,22 @@ func (q *Queue) NextCandidate(ctx context.Context) (Candidate, bool, error) {
 	return candidate, true, nil
 }
 
+// DiscardCandidate permanently removes an unresolvable candidate.
+// Discarding an already absent candidate is idempotent.
+func (q *Queue) DiscardCandidate(ctx context.Context, documentID int64) error {
+	if documentID <= 0 {
+		return validationError("invalid candidate discard input")
+	}
+	return q.writeContext(ctx, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx,
+			"DELETE FROM candidates WHERE document_id = ?", documentID,
+		); err != nil {
+			return internalError("cannot discard queued candidate", err)
+		}
+		return nil
+	})
+}
+
 // ResolveCandidate atomically enqueues resolved work and removes its candidate.
 func (q *Queue) ResolveCandidate(ctx context.Context, documentID int64, input EnqueueInput) (Job, bool, error) {
 	if documentID <= 0 || input.DocumentID != documentID || !validEnqueueInput(input) {
@@ -132,15 +152,20 @@ func (q *Queue) ResolveCandidate(ctx context.Context, documentID int64, input En
 // Enqueue creates current work or returns an existing current or terminal job.
 // The returned bool reports whether a new row was created.
 func (q *Queue) Enqueue(input EnqueueInput) (Job, bool, error) {
+	return q.EnqueueContext(context.Background(), input)
+}
+
+// EnqueueContext creates current work using the caller's cancellation context.
+func (q *Queue) EnqueueContext(ctx context.Context, input EnqueueInput) (Job, bool, error) {
 	if !validEnqueueInput(input) {
 		return Job{}, false, validationError("invalid enqueue input")
 	}
 
 	var job Job
 	created := false
-	err := q.write(func(conn *sql.Conn) error {
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
 		var err error
-		job, created, err = q.enqueue(context.Background(), conn, input)
+		job, created, err = q.enqueue(ctx, conn, input)
 		return err
 	})
 	return job, created, err
@@ -383,12 +408,14 @@ func (q *Queue) writeContext(ctx context.Context, fn func(*sql.Conn) error) (err
 		return internalError("cannot acquire database connection", err)
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+	if err := beginImmediate(ctx, conn); err != nil {
 		return internalError("cannot begin queue transaction", err)
 	}
 	defer func() {
 		if err != nil {
-			conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+			defer cancel()
+			conn.ExecContext(rollbackCtx, "ROLLBACK")
 		}
 	}()
 	if err = fn(conn); err != nil {
@@ -398,6 +425,44 @@ func (q *Queue) writeContext(ctx context.Context, fn func(*sql.Conn) error) (err
 		return internalError("cannot commit queue transaction", err)
 	}
 	return nil
+}
+
+func beginImmediate(ctx context.Context, conn *sql.Conn) error {
+	waitCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, defaultBusyTimeout)
+		defer cancel()
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = 0"); err != nil {
+		return err
+	}
+	defer func() {
+		restoreCtx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+		defer cancel()
+		conn.ExecContext(restoreCtx, "PRAGMA busy_timeout = 5000")
+	}()
+	for {
+		if _, err := conn.ExecContext(waitCtx, "BEGIN IMMEDIATE"); err == nil {
+			return nil
+		} else if !isSQLiteBusy(err) {
+			return err
+		}
+		timer := time.NewTimer(busyRetryInterval)
+		select {
+		case <-waitCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return waitCtx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func isSQLiteBusy(err error) bool {
+	var sqliteError interface{ Code() int }
+	return errors.As(err, &sqliteError) && sqliteError.Code()&0xff == sqliteBusy
 }
 
 const jobColumns = `id, document_id, source_checksum, priority, state, attempts,
