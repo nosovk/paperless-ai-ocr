@@ -49,6 +49,11 @@ func TestNewValidatesConfiguration(t *testing.T) {
 		enqueuer CandidateEnqueuer
 	}{
 		{name: "blank token", token: " ", enqueuer: &spyEnqueuer{}},
+		{name: "token with space", token: "two words", enqueuer: &spyEnqueuer{}},
+		{name: "token with tab", token: "two\twords", enqueuer: &spyEnqueuer{}},
+		{name: "token with comma", token: "two,words", enqueuer: &spyEnqueuer{}},
+		{name: "token with control", token: "control\x1f", enqueuer: &spyEnqueuer{}},
+		{name: "token with non ASCII", token: "caf\u00e9", enqueuer: &spyEnqueuer{}},
 		{name: "nil enqueuer", token: testToken},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -69,6 +74,17 @@ func TestWebhookRejectsUnauthorizedRequestsUniformly(t *testing.T) {
 		{name: "scheme only", headers: []string{"Bearer"}},
 		{name: "wrong scheme", headers: []string{"Basic abc"}},
 		{name: "blank credential", headers: []string{"Bearer  "}},
+		{name: "leading space", headers: []string{" Bearer correct-secret"}},
+		{name: "trailing space", headers: []string{"Bearer correct-secret "}},
+		{name: "multiple spaces", headers: []string{"Bearer  correct-secret"}},
+		{name: "tab separator", headers: []string{"Bearer\tcorrect-secret"}},
+		{name: "tab in credential", headers: []string{"Bearer correct\tsecret"}},
+		{name: "carriage return in credential", headers: []string{"Bearer correct\rsecret"}},
+		{name: "line feed in credential", headers: []string{"Bearer correct\nsecret"}},
+		{name: "comma in credential", headers: []string{"Bearer correct,secret"}},
+		{name: "combined values", headers: []string{"Bearer correct-secret,Bearer correct-secret"}},
+		{name: "control in credential", headers: []string{"Bearer correct\x1fsecret"}},
+		{name: "non ASCII credential", headers: []string{"Bearer caf\u00e9"}},
 		{name: "extra field", headers: []string{"Bearer correct-secret extra"}},
 		{name: "multiple headers", headers: []string{"Bearer correct-secret", "Bearer correct-secret"}},
 	}
@@ -138,6 +154,26 @@ func TestVerifyBearerUsesFixedSizeComparison(t *testing.T) {
 	}
 }
 
+func TestVerifyBearerRejectsMalformedSyntaxBeforeComparison(t *testing.T) {
+	expected := hashToken(testToken)
+	for _, authorization := range []string{
+		"", "Bearer", "Bearer ", " Bearer token", "Bearer token ",
+		"Bearer  token", "Bearer\ttoken", "Bearer to\tken", "Bearer token,other",
+		"Bearer to\rken", "Bearer to\nken", "Bearer to\x1fken", "Bearer caf\u00e9", "Basic token",
+	} {
+		called := false
+		if verifyBearerToken(authorization, expected, func(_, _ []byte) int {
+			called = true
+			return 1
+		}) {
+			t.Errorf("verifyBearerToken(%q) = true, want false", authorization)
+		}
+		if called {
+			t.Errorf("verifyBearerToken(%q) called comparator", authorization)
+		}
+	}
+}
+
 func TestWebhookRejectsInvalidContentTypeAndJSON(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -150,7 +186,18 @@ func TestWebhookRejectsInvalidContentTypeAndJSON(t *testing.T) {
 		{name: "malformed content type", contentType: "application/json; charset", body: `{"document_id":123}`, status: http.StatusUnsupportedMediaType},
 		{name: "empty", contentType: "application/json", status: http.StatusBadRequest},
 		{name: "malformed", contentType: "application/json", body: `{`, status: http.StatusBadRequest},
+		{name: "empty object", contentType: "application/json", body: `{}`, status: http.StatusBadRequest},
+		{name: "missing key", contentType: "application/json", body: `{"other":123}`, status: http.StatusBadRequest},
+		{name: "duplicate key", contentType: "application/json", body: `{"document_id":123,"document_id":123}`, status: http.StatusBadRequest},
+		{name: "duplicate key different value", contentType: "application/json", body: `{"document_id":123,"document_id":456}`, status: http.StatusBadRequest},
+		{name: "uppercase key", contentType: "application/json", body: `{"DOCUMENT_ID":123}`, status: http.StatusBadRequest},
+		{name: "mixed case key", contentType: "application/json", body: `{"Document_Id":123}`, status: http.StatusBadRequest},
+		{name: "null ID", contentType: "application/json", body: `{"document_id":null}`, status: http.StatusBadRequest},
+		{name: "array top level", contentType: "application/json", body: `[123]`, status: http.StatusBadRequest},
+		{name: "number top level", contentType: "application/json", body: `123`, status: http.StatusBadRequest},
+		{name: "null top level", contentType: "application/json", body: `null`, status: http.StatusBadRequest},
 		{name: "trailing JSON", contentType: "application/json", body: `{"document_id":123}{}`, status: http.StatusBadRequest},
+		{name: "trailing data", contentType: "application/json", body: `{"document_id":123}x`, status: http.StatusBadRequest},
 		{name: "unknown field", contentType: "application/json", body: `{"document_id":123,"secret":"body-canary"}`, status: http.StatusBadRequest},
 		{name: "string ID", contentType: "application/json", body: `{"document_id":"123"}`, status: http.StatusBadRequest},
 		{name: "float ID", contentType: "application/json", body: `{"document_id":1.5}`, status: http.StatusBadRequest},
@@ -158,6 +205,7 @@ func TestWebhookRejectsInvalidContentTypeAndJSON(t *testing.T) {
 		{name: "negative ID", contentType: "application/json", body: `{"document_id":-1}`, status: http.StatusBadRequest},
 		{name: "out of range ID", contentType: "application/json", body: `{"document_id":9223372036854775808}`, status: http.StatusBadRequest},
 		{name: "oversized", contentType: "application/json", body: `{"document_id":123,"padding":"` + strings.Repeat("x", 4096) + `"}`, status: http.StatusRequestEntityTooLarge},
+		{name: "oversized trailing content", contentType: "application/json", body: `{"document_id":123}` + strings.Repeat(" ", 4096), status: http.StatusRequestEntityTooLarge},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

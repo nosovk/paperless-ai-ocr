@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strings"
 
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
 )
@@ -17,7 +16,7 @@ type CandidateEnqueuer interface {
 
 // New constructs the service HTTP routes.
 func New(webhookToken string, enqueuer CandidateEnqueuer) (*http.ServeMux, error) {
-	if strings.TrimSpace(webhookToken) == "" || enqueuer == nil {
+	if !validBearerCredential(webhookToken) || enqueuer == nil {
 		return nil, errors.New("invalid server configuration")
 	}
 

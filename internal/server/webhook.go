@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -8,7 +9,6 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"strings"
 
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
 )
@@ -54,19 +54,32 @@ func (h webhookHandler) serveHTTP(response http.ResponseWriter, request *http.Re
 
 func decodeWebhookPayload(response http.ResponseWriter, request *http.Request) (webhookPayload, int) {
 	request.Body = http.MaxBytesReader(response, request.Body, maxWebhookBodyBytes)
-	decoder := json.NewDecoder(request.Body)
-	decoder.DisallowUnknownFields()
-	var payload webhookPayload
-	if err := decoder.Decode(&payload); err != nil {
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
 		return webhookPayload{}, decodeErrorStatus(err)
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return webhookPayload{}, decodeErrorStatus(err)
-	}
-	if payload.DocumentID <= 0 {
+
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') || !decoder.More() {
 		return webhookPayload{}, http.StatusBadRequest
 	}
-	return payload, 0
+	key, err := decoder.Token()
+	if err != nil || key != "document_id" {
+		return webhookPayload{}, http.StatusBadRequest
+	}
+	var documentID int64
+	if err := decoder.Decode(&documentID); err != nil || documentID <= 0 || decoder.More() {
+		return webhookPayload{}, http.StatusBadRequest
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return webhookPayload{}, http.StatusBadRequest
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return webhookPayload{}, http.StatusBadRequest
+	}
+	return webhookPayload{DocumentID: documentID}, 0
 }
 
 func decodeErrorStatus(err error) int {
@@ -82,10 +95,47 @@ func hashToken(token string) [sha256.Size]byte {
 }
 
 func verifyBearerToken(authorization string, expected [sha256.Size]byte, compare tokenComparator) bool {
-	fields := strings.Fields(authorization)
-	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
+	if len(authorization) < len("Bearer ")+1 || authorization[len("Bearer")] != ' ' ||
+		!equalFoldASCII(authorization[:len("Bearer")], "Bearer") {
 		return false
 	}
-	presented := hashToken(fields[1])
+	credential := authorization[len("Bearer "):]
+	if !validBearerCredential(credential) {
+		return false
+	}
+	presented := hashToken(credential)
 	return compare(presented[:], expected[:]) == 1
+}
+
+func validBearerCredential(credential string) bool {
+	if credential == "" {
+		return false
+	}
+	for index := range len(credential) {
+		character := credential[index]
+		if character <= 0x20 || character >= 0x7f || character == ',' {
+			return false
+		}
+	}
+	return true
+}
+
+func equalFoldASCII(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range len(left) {
+		leftCharacter := left[index]
+		rightCharacter := right[index]
+		if leftCharacter >= 'A' && leftCharacter <= 'Z' {
+			leftCharacter += 'a' - 'A'
+		}
+		if rightCharacter >= 'A' && rightCharacter <= 'Z' {
+			rightCharacter += 'a' - 'A'
+		}
+		if leftCharacter != rightCharacter {
+			return false
+		}
+	}
+	return true
 }
