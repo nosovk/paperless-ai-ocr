@@ -798,6 +798,131 @@ func TestEnsureTagRecoversFromCreateConflictByRelookingUp(t *testing.T) {
 	}
 }
 
+func TestEnsureTagRecoversFromBadRequestByRelookingUp(t *testing.T) {
+	t.Parallel()
+
+	const responseCanary = "canary duplicate validation body"
+	var lookups atomic.Int32
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			if lookups.Add(1) == 1 {
+				io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+				return
+			}
+			io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":89,"name":"duplicate"}]}`)
+		case http.MethodPost:
+			posts.Add(1)
+			writer.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(writer, `{"name":[%q]}`, responseCanary)
+		default:
+			http.Error(writer, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	tag, err := client.EnsureTag(context.Background(), "duplicate")
+	if err != nil {
+		t.Fatalf("EnsureTag() error = %v", err)
+	}
+	if got, want := tag.ID, 89; got != want {
+		t.Errorf("EnsureTag() ID = %d, want %d", got, want)
+	}
+	if got, want := lookups.Load(), int32(2); got != want {
+		t.Errorf("lookup count = %d, want %d", got, want)
+	}
+	if got, want := posts.Load(), int32(1); got != want {
+		t.Errorf("POST count = %d, want %d", got, want)
+	}
+}
+
+func TestIndependentClientsRecoverConcurrentTagCreation(t *testing.T) {
+	t.Parallel()
+
+	const tagName = "cross-client race"
+	var stateMu sync.Mutex
+	var exists bool
+	var lookups atomic.Int32
+	var posts atomic.Int32
+	initialLookupsReady := make(chan struct{})
+	var readyOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			lookup := lookups.Add(1)
+			if lookup <= 2 {
+				if lookup == 2 {
+					readyOnce.Do(func() { close(initialLookupsReady) })
+				}
+				<-initialLookupsReady
+				io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+				return
+			}
+			stateMu.Lock()
+			found := exists
+			stateMu.Unlock()
+			if !found {
+				t.Error("relookup occurred before tag creation")
+			}
+			fmt.Fprintf(writer, `{"count":1,"next":null,"results":[{"id":90,"name":%q}]}`, tagName)
+		case http.MethodPost:
+			posts.Add(1)
+			stateMu.Lock()
+			if exists {
+				stateMu.Unlock()
+				writer.WriteHeader(http.StatusBadRequest)
+				io.WriteString(writer, `{"name":["already exists"]}`)
+				return
+			}
+			exists = true
+			stateMu.Unlock()
+			writer.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(writer, `{"id":90,"name":%q}`, tagName)
+		default:
+			http.Error(writer, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(server.Close)
+	firstClient := newTestClient(t, server.URL, Options{})
+	secondClient := newTestClient(t, server.URL, Options{})
+
+	start := make(chan struct{})
+	results := make(chan Tag, 2)
+	errorsChannel := make(chan error, 2)
+	var waitGroup sync.WaitGroup
+	for _, client := range []*Client{firstClient, secondClient} {
+		waitGroup.Go(func() {
+			<-start
+			tag, err := client.EnsureTag(context.Background(), tagName)
+			results <- tag
+			errorsChannel <- err
+		})
+	}
+	close(start)
+	waitGroup.Wait()
+	close(results)
+	close(errorsChannel)
+
+	for err := range errorsChannel {
+		if err != nil {
+			t.Errorf("EnsureTag() error = %v", err)
+		}
+	}
+	for tag := range results {
+		if got, want := tag.ID, 90; got != want {
+			t.Errorf("EnsureTag() ID = %d, want %d", got, want)
+		}
+	}
+	if got, want := posts.Load(), int32(2); got != want {
+		t.Errorf("POST count = %d, want %d", got, want)
+	}
+	if got, want := lookups.Load(), int32(3); got != want {
+		t.Errorf("lookup count = %d, want %d", got, want)
+	}
+}
+
 func TestEnsureTagConflictRelookupMustFindExactlyOneTag(t *testing.T) {
 	t.Parallel()
 
@@ -823,15 +948,62 @@ func TestEnsureTagConflictRelookupMustFindExactlyOneTag(t *testing.T) {
 					io.WriteString(writer, test.result)
 					return
 				}
-				writer.WriteHeader(http.StatusConflict)
+				writer.WriteHeader(http.StatusBadRequest)
+				io.WriteString(writer, `{"detail":"canary original create body"}`)
 			}))
 			t.Cleanup(server.Close)
 			client := newTestClient(t, server.URL, Options{})
 
 			_, err := client.EnsureTag(context.Background(), "race")
 			assertPaperlessError(t, err)
+			var statusErr *StatusError
+			if !errors.As(err, &statusErr) {
+				t.Fatalf("errors.As(*StatusError) = false: %v", err)
+			}
+			if got, want := statusErr.StatusCode, http.StatusBadRequest; got != want {
+				t.Errorf("StatusCode = %d, want %d", got, want)
+			}
+			if got, want := lookups.Load(), int32(2); got != want {
+				t.Errorf("lookup count = %d, want %d", got, want)
+			}
+			assertRedacted(t, err, "canary original create body")
 		})
 	}
+}
+
+func TestEnsureTagRelookupFailurePreservesOriginalCreateError(t *testing.T) {
+	t.Parallel()
+
+	var lookups atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet {
+			if lookups.Add(1) == 1 {
+				io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+				return
+			}
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(writer, `{"detail":"canary relookup body"}`)
+			return
+		}
+		writer.WriteHeader(http.StatusBadRequest)
+		io.WriteString(writer, `{"detail":"canary original create body"}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	_, err := client.EnsureTag(context.Background(), "race")
+	assertPaperlessError(t, err)
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("errors.As(*StatusError) = false: %v", err)
+	}
+	if got, want := statusErr.StatusCode, http.StatusBadRequest; got != want {
+		t.Errorf("StatusCode = %d, want original %d", got, want)
+	}
+	if got, want := lookups.Load(), int32(2); got != want {
+		t.Errorf("lookup count = %d, want %d", got, want)
+	}
+	assertRedacted(t, err, "canary original create body", "canary relookup body")
 }
 
 func TestRequestDeadlineAndJSONLimit(t *testing.T) {

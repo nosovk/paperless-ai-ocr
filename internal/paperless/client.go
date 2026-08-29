@@ -279,16 +279,14 @@ func (client *Client) EnsureTag(ctx context.Context, name string) (Tag, error) {
 		Name string `json:"name"`
 	}{Name: name}, &created)
 	if err != nil {
+		createErr := err
 		var statusErr *StatusError
-		if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusConflict {
-			return Tag{}, err
+		if !errors.As(createErr, &statusErr) {
+			return Tag{}, createErr
 		}
 		matches, err = client.lookupTags(ctx, name)
-		if err != nil {
-			return Tag{}, err
-		}
-		if len(matches) != 1 {
-			return Tag{}, paperlessError("ensure tag", errors.New("tag conflict did not resolve uniquely"))
+		if err != nil || len(matches) != 1 {
+			return Tag{}, createErr
 		}
 		return matches[0], nil
 	}
