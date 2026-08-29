@@ -46,11 +46,13 @@ func (q *Queue) Enqueue(input EnqueueInput) (Job, bool, error) {
 			input.DocumentID, input.SourceChecksum))
 		if err == nil {
 			if (job.State == StatePending || job.State == StateRetry) && input.Priority > job.Priority {
+				now := q.now().UTC()
 				if _, err := conn.ExecContext(context.Background(), `UPDATE jobs
-					SET priority = ?, updated_at = ? WHERE id = ?`, input.Priority, formatTime(q.now()), job.ID); err != nil {
+					SET priority = ?, updated_at = ? WHERE id = ?`, input.Priority, formatTime(now), job.ID); err != nil {
 					return internalError("cannot promote queued job", err)
 				}
 				job.Priority = input.Priority
+				job.UpdatedAt = now
 			}
 			return nil
 		}
@@ -135,39 +137,46 @@ func (q *Queue) Claim(owner string, leaseDuration time.Duration) (Job, bool, err
 	return job, claimed, err
 }
 
-// ScheduleRetry releases a processing job until a future time.
-func (q *Queue) ScheduleRetry(id int64, owner string, availableAt time.Time, diagnostic SafeDiagnostic) error {
-	if id <= 0 || blank(owner) || !diagnostic.valid() || !availableAt.After(q.now()) {
+// ScheduleRetry releases the active claim generation until a future time.
+func (q *Queue) ScheduleRetry(id int64, attempt int, owner string, availableAt time.Time, diagnostic SafeDiagnostic) error {
+	now := q.now().UTC()
+	if id <= 0 || attempt <= 0 || blank(owner) || !diagnostic.valid() || !availableAt.After(now) {
 		return validationError("invalid retry input")
 	}
 	return q.updateOne(`UPDATE jobs SET state = 'retry', available_at = ?,
 		lease_owner = NULL, lease_expires_at = NULL, error_category = ?, error_message = ?,
-		updated_at = ? WHERE id = ? AND state = 'processing' AND lease_owner = ?`,
-		formatTime(availableAt), diagnostic.Category, diagnostic.Message, formatTime(q.now()), id, owner)
+		updated_at = ? WHERE id = ? AND state = 'processing' AND attempts = ?
+		AND lease_owner = ? AND lease_expires_at > ?`, formatTime(availableAt),
+		diagnostic.Category, diagnostic.Message, formatTime(now), id, attempt, owner, formatTime(now))
 }
 
-// Complete marks an owned processing job completed.
-func (q *Queue) Complete(id int64, owner string) error {
-	if id <= 0 || blank(owner) {
+// Complete marks the active claim generation completed.
+func (q *Queue) Complete(id int64, attempt int, owner string) error {
+	now := q.now().UTC()
+	if id <= 0 || attempt <= 0 || blank(owner) {
 		return validationError("invalid completion input")
 	}
-	now := formatTime(q.now())
+	timestamp := formatTime(now)
 	return q.updateOne(`UPDATE jobs SET state = 'completed',
 		lease_owner = NULL, lease_expires_at = NULL, error_category = NULL,
 		error_message = NULL, completed_at = ?, updated_at = ?
-		WHERE id = ? AND state = 'processing' AND lease_owner = ?`, now, now, id, owner)
+		WHERE id = ? AND state = 'processing' AND attempts = ?
+		AND lease_owner = ? AND lease_expires_at > ?`, timestamp, timestamp, id, attempt, owner, timestamp)
 }
 
-// Fail marks an owned processing job terminally failed using safe diagnostics.
-func (q *Queue) Fail(id int64, owner string, diagnostic SafeDiagnostic) error {
-	if id <= 0 || blank(owner) || !diagnostic.valid() {
+// Fail marks the active claim generation terminally failed.
+func (q *Queue) Fail(id int64, attempt int, owner string, diagnostic SafeDiagnostic) error {
+	now := q.now().UTC()
+	if id <= 0 || attempt <= 0 || blank(owner) || !diagnostic.valid() {
 		return validationError("invalid failure input")
 	}
-	now := formatTime(q.now())
+	timestamp := formatTime(now)
 	return q.updateOne(`UPDATE jobs SET state = 'failed',
 		lease_owner = NULL, lease_expires_at = NULL, error_category = ?, error_message = ?,
 		completed_at = ?, updated_at = ?
-		WHERE id = ? AND state = 'processing' AND lease_owner = ?`, diagnostic.Category, diagnostic.Message, now, now, id, owner)
+		WHERE id = ? AND state = 'processing' AND attempts = ?
+		AND lease_owner = ? AND lease_expires_at > ?`, diagnostic.Category,
+		diagnostic.Message, timestamp, timestamp, id, attempt, owner, timestamp)
 }
 
 // RetryFailed explicitly returns a terminally failed job to the queue.

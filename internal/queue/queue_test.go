@@ -16,7 +16,8 @@ import (
 var testNow = time.Date(2026, time.August, 29, 12, 0, 0, 123456789, time.FixedZone("test", 2*60*60))
 
 func TestEnqueueIsIdempotentAndPromotesCurrentWork(t *testing.T) {
-	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	now := testNow
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)
 
 	first, created, err := q.Enqueue(EnqueueInput{
 		DocumentID: 1, SourceChecksum: "checksum", Priority: PriorityBackfill,
@@ -29,6 +30,8 @@ func TestEnqueueIsIdempotentAndPromotesCurrentWork(t *testing.T) {
 		t.Fatal("Enqueue() created = false, want true")
 	}
 
+	now = now.Add(time.Second)
+	q.now = func() time.Time { return now }
 	duplicate, created, err := q.Enqueue(EnqueueInput{
 		DocumentID: 1, SourceChecksum: "checksum", Priority: PriorityWebhook,
 		Model: "model-b", PromptVersion: "v2",
@@ -48,6 +51,11 @@ func TestEnqueueIsIdempotentAndPromotesCurrentWork(t *testing.T) {
 	if duplicate.Model != "model-a" || duplicate.PromptVersion != "v1" {
 		t.Errorf("duplicate changed processing inputs: model=%q prompt=%q", duplicate.Model, duplicate.PromptVersion)
 	}
+	persisted := loadJob(t, q, duplicate.ID)
+	if !duplicate.UpdatedAt.Equal(now.UTC()) || !duplicate.UpdatedAt.Equal(persisted.UpdatedAt) || !duplicate.UpdatedAt.After(first.UpdatedAt) {
+		t.Errorf("promoted UpdatedAt = %v, persisted = %v, original = %v, want advanced persisted timestamp",
+			duplicate.UpdatedAt, persisted.UpdatedAt, first.UpdatedAt)
+	}
 
 	lowered, created, err := q.Enqueue(EnqueueInput{
 		DocumentID: 1, SourceChecksum: "checksum", Priority: PriorityBackfill,
@@ -64,7 +72,7 @@ func TestEnqueueIsIdempotentAndPromotesCurrentWork(t *testing.T) {
 func TestEnqueueSuppressesCompletedAndFailedHistory(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	completed := enqueueAndClaim(t, q, 1, "completed", PriorityBackfill, "owner")
-	if err := q.Complete(completed.ID, "owner"); err != nil {
+	if err := q.Complete(completed.ID, completed.Attempts, "owner"); err != nil {
 		t.Fatalf("Complete() error = %v", err)
 	}
 
@@ -91,7 +99,7 @@ func TestEnqueueSuppressesCompletedAndFailedHistory(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Claim() = (%+v, %t, %v), want job", claimed, ok, err)
 	}
-	if err := q.Fail(claimed.ID, "owner", SafeDiagnostic{
+	if err := q.Fail(claimed.ID, claimed.Attempts, "owner", SafeDiagnostic{
 		Category: saferr.CategoryProvider, Message: "retry limit reached",
 	}); err != nil {
 		t.Fatalf("Fail() error = %v", err)
@@ -155,7 +163,7 @@ func TestClaimOrdersByPriorityThenFIFOAndSkipsFutureRetry(t *testing.T) {
 	if err != nil || !ok || claimed.ID != webhook.ID {
 		t.Fatalf("first Claim() = (%+v, %t, %v), want webhook %d", claimed, ok, err, webhook.ID)
 	}
-	if err := q.Complete(claimed.ID, "worker"); err != nil {
+	if err := q.Complete(claimed.ID, claimed.Attempts, "worker"); err != nil {
 		t.Fatalf("Complete(webhook) error = %v", err)
 	}
 
@@ -164,7 +172,7 @@ func TestClaimOrdersByPriorityThenFIFOAndSkipsFutureRetry(t *testing.T) {
 		t.Fatalf("second Claim() = (%+v, %t, %v), want oldest backfill %d", claimed, ok, err, backfill1.ID)
 	}
 	future := now.Add(time.Hour)
-	if err := q.ScheduleRetry(claimed.ID, "worker", future, SafeDiagnostic{
+	if err := q.ScheduleRetry(claimed.ID, claimed.Attempts, "worker", future, SafeDiagnostic{
 		Category: saferr.CategoryProvider, Message: "temporarily unavailable",
 	}); err != nil {
 		t.Fatalf("ScheduleRetry() error = %v", err)
@@ -174,7 +182,7 @@ func TestClaimOrdersByPriorityThenFIFOAndSkipsFutureRetry(t *testing.T) {
 	if err != nil || !ok || claimed.ID != backfill2.ID {
 		t.Fatalf("third Claim() = (%+v, %t, %v), want second backfill %d", claimed, ok, err, backfill2.ID)
 	}
-	if err := q.Complete(claimed.ID, "worker"); err != nil {
+	if err := q.Complete(claimed.ID, claimed.Attempts, "worker"); err != nil {
 		t.Fatalf("Complete(backfill) error = %v", err)
 	}
 	if _, ok, err := q.Claim("worker", time.Minute); err != nil || ok {
@@ -263,7 +271,7 @@ func TestProcessingTransitionsRequireStateAndOwner(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
 
-	if err := q.Complete(job.ID, "stale-owner"); errorCategory(err) != saferr.CategoryValidation {
+	if err := q.Complete(job.ID, job.Attempts, "stale-owner"); errorCategory(err) != saferr.CategoryValidation {
 		t.Fatalf("stale Complete() error = %v, want validation error", err)
 	}
 	unchanged := loadJob(t, q, job.ID)
@@ -271,24 +279,109 @@ func TestProcessingTransitionsRequireStateAndOwner(t *testing.T) {
 		t.Fatalf("job after stale transition = %+v, want unchanged processing job", unchanged)
 	}
 
-	if err := q.Complete(job.ID, "owner"); err != nil {
+	if err := q.Complete(job.ID, job.Attempts, "owner"); err != nil {
 		t.Fatalf("Complete() error = %v", err)
 	}
 	completed := loadJob(t, q, job.ID)
 	if completed.State != StateCompleted || completed.CompletedAt.IsZero() || completed.LeaseOwner != "" || completed.ErrorCategory != "" {
 		t.Errorf("completed job = %+v", completed)
 	}
-	if err := q.Fail(job.ID, "owner", SafeDiagnostic{
+	if err := q.Fail(job.ID, job.Attempts, "owner", SafeDiagnostic{
 		Category: saferr.CategoryInternal, Message: "late failure",
 	}); errorCategory(err) != saferr.CategoryValidation {
 		t.Errorf("illegal Fail() error = %v, want validation error", err)
 	}
 }
 
+func TestExpiredClaimRejectsAllProcessingTransitions(t *testing.T) {
+	now := testNow
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner-a")
+	now = job.LeaseExpiresAt
+	q.now = func() time.Time { return now }
+	diagnostic := SafeDiagnostic{Category: saferr.CategoryProvider, Message: "safe failure"}
+
+	tests := []struct {
+		name       string
+		transition func() error
+	}{
+		{"complete", func() error { return q.Complete(job.ID, job.Attempts, "owner-a") }},
+		{"fail", func() error { return q.Fail(job.ID, job.Attempts, "owner-a", diagnostic) }},
+		{"retry", func() error {
+			return q.ScheduleRetry(job.ID, job.Attempts, "owner-a", now.Add(time.Minute), diagnostic)
+		}},
+	}
+	for _, test := range tests {
+		before := loadJob(t, q, job.ID)
+		if err := test.transition(); errorCategory(err) != saferr.CategoryValidation {
+			t.Errorf("%s expired transition error = %v, want validation error", test.name, err)
+		}
+		if after := loadJob(t, q, job.ID); after != before {
+			t.Errorf("job after expired %s = %+v, want unchanged %+v", test.name, after, before)
+		}
+	}
+}
+
+func TestAttemptFencesReclaimedLeaseWithSameOwner(t *testing.T) {
+	now := testNow
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)
+	first := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner-a")
+	now = first.LeaseExpiresAt
+	q.now = func() time.Time { return now }
+	if recovered, err := q.RecoverExpiredLeases(); err != nil || recovered != 1 {
+		t.Fatalf("RecoverExpiredLeases() = (%d, %v), want (1, nil)", recovered, err)
+	}
+	second, ok, err := q.Claim("owner-a", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("reclaim Claim() = (%+v, %t, %v), want job", second, ok, err)
+	}
+	if second.Attempts != first.Attempts+1 {
+		t.Fatalf("reclaimed attempts = %d, want %d", second.Attempts, first.Attempts+1)
+	}
+
+	if err := q.Complete(first.ID, first.Attempts, "owner-a"); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("late Complete() error = %v, want validation error", err)
+	}
+	assertProcessingClaim(t, q, second.ID, second.Attempts, "owner-a")
+	if err := q.Complete(second.ID, second.Attempts, "owner-a"); err != nil {
+		t.Fatalf("current Complete() error = %v", err)
+	}
+	if got := loadJob(t, q, second.ID); got.State != StateCompleted {
+		t.Errorf("current job state = %q, want completed", got.State)
+	}
+}
+
+func TestProcessingTransitionsRejectInvalidAttemptWithoutMutation(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+	diagnostic := SafeDiagnostic{Category: saferr.CategoryProvider, Message: "safe failure"}
+	for _, attempt := range []int{-1, 0, job.Attempts + 1} {
+		transitions := []struct {
+			name       string
+			transition func() error
+		}{
+			{"complete", func() error { return q.Complete(job.ID, attempt, "owner") }},
+			{"fail", func() error { return q.Fail(job.ID, attempt, "owner", diagnostic) }},
+			{"retry", func() error {
+				return q.ScheduleRetry(job.ID, attempt, "owner", testNow.Add(time.Minute), diagnostic)
+			}},
+		}
+		for _, transition := range transitions {
+			before := loadJob(t, q, job.ID)
+			if err := transition.transition(); errorCategory(err) != saferr.CategoryValidation {
+				t.Errorf("%s(attempt %d) error = %v, want validation error", transition.name, attempt, err)
+			}
+			if after := loadJob(t, q, job.ID); after != before {
+				t.Errorf("job after %s attempt %d = %+v, want unchanged %+v", transition.name, attempt, after, before)
+			}
+		}
+	}
+}
+
 func TestFailureAndExplicitRetry(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
-	if err := q.Fail(job.ID, "owner", SafeDiagnostic{
+	if err := q.Fail(job.ID, job.Attempts, "owner", SafeDiagnostic{
 		Category: saferr.CategoryProvider, Message: "retry limit reached",
 	}); err != nil {
 		t.Fatalf("Fail() error = %v", err)
@@ -314,7 +407,7 @@ func TestFailureAndExplicitRetry(t *testing.T) {
 func TestRetryFailedRejectsConflictingCurrentJob(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	failed := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
-	if err := q.Fail(failed.ID, "owner", SafeDiagnostic{
+	if err := q.Fail(failed.ID, failed.Attempts, "owner", SafeDiagnostic{
 		Category: saferr.CategoryProvider, Message: "retry limit reached",
 	}); err != nil {
 		t.Fatalf("Fail() error = %v", err)
@@ -349,13 +442,13 @@ func TestRetryValidation(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
 	valid := SafeDiagnostic{Category: saferr.CategoryProvider, Message: "retry"}
-	if err := q.ScheduleRetry(job.ID, "owner", testNow, valid); errorCategory(err) != saferr.CategoryValidation {
+	if err := q.ScheduleRetry(job.ID, job.Attempts, "owner", testNow, valid); errorCategory(err) != saferr.CategoryValidation {
 		t.Errorf("ScheduleRetry(now) error = %v, want validation error", err)
 	}
 	if _, _, err := q.Claim("", time.Minute); errorCategory(err) != saferr.CategoryValidation {
 		t.Errorf("Claim(blank owner) error = %v, want validation error", err)
 	}
-	if err := q.Complete(job.ID, ""); errorCategory(err) != saferr.CategoryValidation {
+	if err := q.Complete(job.ID, job.Attempts, ""); errorCategory(err) != saferr.CategoryValidation {
 		t.Errorf("Complete(blank owner) error = %v, want validation error", err)
 	}
 }
@@ -373,7 +466,7 @@ func TestTransitionDiagnosticsValidateAndPersistSafeValues(t *testing.T) {
 		q := openTestQueue(t, filepath.Join(t.TempDir(), fmt.Sprintf("valid-%d.db", i)), testNow)
 		job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
 		diagnostic := SafeDiagnostic{Category: category, Message: "Caller-vetted safe value 123"}
-		if err := q.Fail(job.ID, "owner", diagnostic); err != nil {
+		if err := q.Fail(job.ID, job.Attempts, "owner", diagnostic); err != nil {
 			t.Fatalf("Fail(%q) error = %v", category, err)
 		}
 		failed := loadJob(t, q, job.ID)
@@ -396,7 +489,7 @@ func TestTransitionDiagnosticsValidateAndPersistSafeValues(t *testing.T) {
 	for i, diagnostic := range invalid {
 		q := openTestQueue(t, filepath.Join(t.TempDir(), fmt.Sprintf("invalid-%d.db", i)), testNow)
 		job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
-		if err := q.Fail(job.ID, "owner", diagnostic); errorCategory(err) != saferr.CategoryValidation {
+		if err := q.Fail(job.ID, job.Attempts, "owner", diagnostic); errorCategory(err) != saferr.CategoryValidation {
 			t.Errorf("Fail(%+v) error = %v, want validation error", diagnostic, err)
 		}
 		if got := loadJob(t, q, job.ID); got.State != StateProcessing || got.ErrorCategory != "" {
@@ -412,7 +505,7 @@ func TestScheduleRetryPersistsSafeDiagnosticUnchanged(t *testing.T) {
 		Category: saferr.CategoryRendering,
 		Message:  strings.Repeat("x", maxDiagnosticMessageBytes),
 	}
-	if err := q.ScheduleRetry(job.ID, "owner", testNow.Add(time.Minute), diagnostic); err != nil {
+	if err := q.ScheduleRetry(job.ID, job.Attempts, "owner", testNow.Add(time.Minute), diagnostic); err != nil {
 		t.Fatalf("ScheduleRetry() error = %v", err)
 	}
 	retry := loadJob(t, q, job.ID)
@@ -440,7 +533,7 @@ func TestRecoverExpiredLeases(t *testing.T) {
 	if retry.State != StateRetry || retry.LeaseOwner != "" || retry.ErrorCategory != saferr.CategoryInternal || retry.ErrorMessage != "lease expired" || !retry.AvailableAt.Equal(now.UTC()) {
 		t.Errorf("recovered job = %+v", retry)
 	}
-	if err := q.Complete(expired.ID, "old-owner"); errorCategory(err) != saferr.CategoryValidation {
+	if err := q.Complete(expired.ID, expired.Attempts, "old-owner"); errorCategory(err) != saferr.CategoryValidation {
 		t.Errorf("stale Complete() error = %v, want validation error", err)
 	}
 
@@ -546,6 +639,14 @@ func loadJob(t *testing.T, q *Queue, id int64) Job {
 		t.Fatalf("get(%d) error = %v", id, err)
 	}
 	return job
+}
+
+func assertProcessingClaim(t *testing.T, q *Queue, id int64, attempt int, owner string) {
+	t.Helper()
+	job := loadJob(t, q, id)
+	if job.State != StateProcessing || job.Attempts != attempt || job.LeaseOwner != owner {
+		t.Fatalf("job = %+v, want processing attempt %d owner %q", job, attempt, owner)
+	}
 }
 
 func errorCategory(err error) saferr.Category {
