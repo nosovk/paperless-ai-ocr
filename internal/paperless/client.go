@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"slices"
 	"strings"
 	"time"
@@ -82,7 +83,7 @@ func New(baseURL *url.URL, token string, options Options) (*Client, error) {
 
 	clonedURL := *baseURL
 	clonedURL.RawQuery = ""
-	clonedURL.Path = strings.TrimRight(clonedURL.Path, "/") + "/"
+	clonedURL.Path = normalizedBasePath(clonedURL.Path)
 	clonedURL.RawPath = ""
 
 	httpClient := options.HTTPClient
@@ -111,29 +112,28 @@ func (client *Client) WalkDocuments(ctx context.Context, visit func([]Document) 
 		return paperlessError("walk documents", errors.New("nil page callback"))
 	}
 	next := client.endpoint("api/documents/")
-	visited := make(map[string]struct{})
-	for pageNumber := 0; next != nil; pageNumber++ {
-		if pageNumber >= client.maxPages {
-			return paperlessError("walk documents", errors.New("pagination page limit exceeded"))
-		}
-		key := next.String()
-		if _, found := visited[key]; found {
-			return paperlessError("walk documents", errors.New("pagination loop detected"))
-		}
-		visited[key] = struct{}{}
-
+	var callbackErr error
+	err := client.walkPages(ctx, "walk documents", next, func(next *url.URL) (*string, error) {
 		var page documentPage
 		if err := client.doJSON(ctx, "walk documents", http.MethodGet, next, nil, &page); err != nil {
-			return err
+			return nil, err
+		}
+		for _, document := range page.Results {
+			if err := validateDocument(document); err != nil {
+				return nil, paperlessError("walk documents", err)
+			}
 		}
 		if err := visit(page.Results); err != nil {
-			return err
+			callbackErr = err
+			return nil, err
 		}
-		var err error
-		next, err = client.nextURL(next, page.Next)
-		if err != nil {
-			return paperlessError("walk documents", err)
-		}
+		return page.Next, nil
+	})
+	if callbackErr != nil {
+		return paperlessError("walk documents", callbackErr)
+	}
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -144,8 +144,13 @@ func (client *Client) GetDocument(ctx context.Context, documentID int) (Document
 		return Document{}, paperlessError("get document", errors.New("invalid document ID"))
 	}
 	var document Document
-	err := client.doJSON(ctx, "get document", http.MethodGet, client.documentEndpoint(documentID, ""), nil, &document)
-	return document, err
+	if err := client.doJSON(ctx, "get document", http.MethodGet, client.documentEndpoint(documentID, ""), nil, &document); err != nil {
+		return Document{}, err
+	}
+	if err := validateDocument(document); err != nil {
+		return Document{}, paperlessError("get document", err)
+	}
+	return document, nil
 }
 
 // GetChecksum retrieves the source checksum exposed on document detail.
@@ -253,15 +258,23 @@ func (client *Client) EnsureTag(ctx context.Context, name string) (Tag, error) {
 	query.Set("name__iexact", name)
 	endpoint.RawQuery = query.Encode()
 
-	var page tagPage
-	if err := client.doJSON(ctx, "ensure tag", http.MethodGet, endpoint, nil, &page); err != nil {
-		return Tag{}, err
-	}
-	matches := make([]Tag, 0, len(page.Results))
-	for _, tag := range page.Results {
-		if tag.Name == name {
-			matches = append(matches, tag)
+	matches := make([]Tag, 0, 1)
+	if err := client.walkPages(ctx, "ensure tag", endpoint, func(next *url.URL) (*string, error) {
+		var page tagPage
+		if err := client.doJSON(ctx, "ensure tag", http.MethodGet, next, nil, &page); err != nil {
+			return nil, err
 		}
+		for _, tag := range page.Results {
+			if err := validateTag(tag); err != nil {
+				return nil, paperlessError("ensure tag", err)
+			}
+			if tag.Name == name {
+				matches = append(matches, tag)
+			}
+		}
+		return page.Next, nil
+	}); err != nil {
+		return Tag{}, err
 	}
 	if len(matches) > 1 {
 		return Tag{}, paperlessError("ensure tag", errors.New("ambiguous exact tag name"))
@@ -274,7 +287,38 @@ func (client *Client) EnsureTag(ctx context.Context, name string) (Tag, error) {
 	err := client.doJSON(ctx, "ensure tag", http.MethodPost, client.endpoint("api/tags/"), struct {
 		Name string `json:"name"`
 	}{Name: name}, &created)
-	return created, err
+	if err != nil {
+		return Tag{}, err
+	}
+	if err := validateTag(created); err != nil {
+		return Tag{}, paperlessError("ensure tag", err)
+	}
+	return created, nil
+}
+
+func (client *Client) walkPages(ctx context.Context, operation string, first *url.URL, visit func(*url.URL) (*string, error)) error {
+	next := first
+	visited := make(map[string]struct{})
+	for pageNumber := 0; next != nil; pageNumber++ {
+		if pageNumber >= client.maxPages {
+			return paperlessError(operation, errors.New("pagination page limit exceeded"))
+		}
+		key := next.String()
+		if _, found := visited[key]; found {
+			return paperlessError(operation, errors.New("pagination loop detected"))
+		}
+		visited[key] = struct{}{}
+
+		nextReference, err := visit(next)
+		if err != nil {
+			return err
+		}
+		next, err = client.nextURL(next, nextReference)
+		if err != nil {
+			return paperlessError(operation, err)
+		}
+	}
+	return nil
 }
 
 func (client *Client) doJSON(ctx context.Context, operation, method string, endpoint *url.URL, requestBody, responseBody any) error {
@@ -341,7 +385,7 @@ func (client *Client) nextURL(current *url.URL, next *string) (*url.URL, error) 
 		return nil, errors.New("invalid pagination URL")
 	}
 	resolved := current.ResolveReference(parsed)
-	if !sameOrigin(client.baseURL, resolved) || resolved.User != nil || resolved.Fragment != "" {
+	if !allowedURL(client.baseURL, resolved) {
 		return nil, errors.New("pagination URL escaped configured origin")
 	}
 	return resolved, nil
@@ -359,6 +403,25 @@ func canonicalTagIDs(tagIDs []int) ([]int, error) {
 	}
 	slices.Sort(canonical)
 	return slices.Compact(canonical), nil
+}
+
+func validateDocument(document Document) error {
+	if document.ID <= 0 {
+		return errors.New("Paperless returned an invalid document")
+	}
+	for _, tagID := range document.Tags {
+		if tagID <= 0 {
+			return errors.New("Paperless returned an invalid document")
+		}
+	}
+	return nil
+}
+
+func validateTag(tag Tag) error {
+	if tag.ID <= 0 {
+		return errors.New("Paperless returned an invalid tag")
+	}
+	return nil
 }
 
 func decodeLimitedJSON(reader io.Reader, limit int64, destination any) error {
@@ -400,7 +463,7 @@ func redirectPolicy(baseURL *url.URL) func(*http.Request, []*http.Request) error
 		if len(via) >= 10 {
 			return errors.New("too many redirects")
 		}
-		if !sameOrigin(baseURL, request.URL) {
+		if !allowedURL(baseURL, request.URL) {
 			return errors.New("cross-origin redirect rejected")
 		}
 		return nil
@@ -409,6 +472,30 @@ func redirectPolicy(baseURL *url.URL) func(*http.Request, []*http.Request) error
 
 func sameOrigin(left, right *url.URL) bool {
 	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host)
+}
+
+func allowedURL(baseURL, candidate *url.URL) bool {
+	if candidate == nil || !sameOrigin(baseURL, candidate) || candidate.User != nil || candidate.Fragment != "" {
+		return false
+	}
+	escapedPath := candidate.EscapedPath()
+	if strings.Contains(escapedPath, "%") {
+		return false
+	}
+	candidatePath := path.Clean(candidate.Path)
+	basePath := strings.TrimSuffix(baseURL.Path, "/")
+	if basePath == "" {
+		return strings.HasPrefix(candidatePath, "/")
+	}
+	return candidatePath == basePath || strings.HasPrefix(candidatePath, basePath+"/")
+}
+
+func normalizedBasePath(basePath string) string {
+	cleaned := path.Clean("/" + strings.TrimPrefix(basePath, "/"))
+	if cleaned == "/" {
+		return cleaned
+	}
+	return cleaned + "/"
 }
 
 func drain(reader io.Reader) {

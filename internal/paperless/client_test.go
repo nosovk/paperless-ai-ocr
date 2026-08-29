@@ -130,6 +130,49 @@ func TestWalkDocumentsRejectsMalformedPaginationURL(t *testing.T) {
 	assertPaperlessError(t, client.WalkDocuments(context.Background(), func([]Document) error { return nil }))
 }
 
+func TestWalkDocumentsRejectsPaginationOutsideBasePath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		next func(*httptest.Server) string
+	}{
+		{name: "absolute path", next: func(server *httptest.Server) string { return server.URL + "/api/documents/?page=2" }},
+		{name: "relative traversal", next: func(_ *httptest.Server) string { return "../../../api/documents/?page=2" }},
+		{name: "encoded traversal", next: func(_ *httptest.Server) string { return "/paperless/%2e%2e/api/documents/?page=2" }},
+		{name: "path prefix boundary", next: func(_ *httptest.Server) string { return "/paperless2/api/documents/?page=2" }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var requests atomic.Int32
+			var escapedAuth string
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				requests.Add(1)
+				if request.URL.Path != "/paperless/api/documents/" {
+					escapedAuth = request.Header.Get("Authorization")
+					io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+					return
+				}
+				fmt.Fprintf(writer, `{"count":1,"next":%q,"results":[]}`, test.next(server))
+			}))
+			t.Cleanup(server.Close)
+			client := newTestClient(t, server.URL+"/paperless/", Options{})
+
+			assertPaperlessError(t, client.WalkDocuments(context.Background(), func([]Document) error { return nil }))
+			if got, want := requests.Load(), int32(1); got != want {
+				t.Errorf("request count = %d, want %d", got, want)
+			}
+			if escapedAuth != "" {
+				t.Errorf("escaped Authorization = %q, want empty", escapedAuth)
+			}
+		})
+	}
+}
+
 func TestWalkDocumentsStopsForCallbackAndContext(t *testing.T) {
 	t.Parallel()
 
@@ -146,6 +189,43 @@ func TestWalkDocumentsStopsForCallbackAndContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	assertPaperlessError(t, client.WalkDocuments(ctx, func([]Document) error { return nil }))
+}
+
+func TestWalkDocumentsCallbackErrorIsCategorizedAndRedacted(t *testing.T) {
+	t.Parallel()
+
+	const callbackCanary = "canary OCR text and secret"
+	callbackErr := errors.New(callbackCanary)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":1,"tags":[]}]}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	err := client.WalkDocuments(context.Background(), func([]Document) error { return callbackErr })
+	assertPaperlessError(t, err)
+	if !errors.Is(err, callbackErr) {
+		t.Errorf("errors.Is(error, callback error) = false")
+	}
+	assertRedacted(t, err, callbackCanary)
+}
+
+func TestWalkDocumentsReclassifiesSafeCallbackError(t *testing.T) {
+	t.Parallel()
+
+	callbackErr := saferr.New(saferr.CategoryProvider, "canary provider callback")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":1,"tags":[]}]}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	err := client.WalkDocuments(context.Background(), func([]Document) error { return callbackErr })
+	assertPaperlessError(t, err)
+	if !errors.Is(err, callbackErr) {
+		t.Errorf("errors.Is(error, callback error) = false")
+	}
+	assertRedacted(t, err, "canary provider callback")
 }
 
 func TestGetDocumentAndChecksum(t *testing.T) {
@@ -173,6 +253,68 @@ func TestGetDocumentAndChecksum(t *testing.T) {
 	}
 	if checksum != "source-checksum" {
 		t.Errorf("GetChecksum() = %q, want source-checksum", checksum)
+	}
+}
+
+func TestGetDocumentRejectsInvalidDecodedRecord(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "invalid document ID", body: `{"id":0,"content":"canary response content","tags":[]}`},
+		{name: "invalid document tag ID", body: `{"id":1,"content":"canary response content","tags":[0]}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				io.WriteString(writer, test.body)
+			}))
+			t.Cleanup(server.Close)
+			client := newTestClient(t, server.URL, Options{})
+
+			_, err := client.GetDocument(context.Background(), 1)
+			assertPaperlessError(t, err)
+			assertRedacted(t, err, "canary response content")
+		})
+	}
+}
+
+func TestWalkDocumentsRejectsInvalidRecordBeforeVisitor(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "invalid document ID", body: `{"count":1,"next":null,"results":[{"id":-7,"tags":[]}]}`},
+		{name: "invalid document tag ID", body: `{"count":1,"next":null,"results":[{"id":1,"tags":[-9]}]}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				io.WriteString(writer, test.body)
+			}))
+			t.Cleanup(server.Close)
+			client := newTestClient(t, server.URL, Options{})
+			var visited atomic.Bool
+
+			err := client.WalkDocuments(context.Background(), func([]Document) error {
+				visited.Store(true)
+				return nil
+			})
+			assertPaperlessError(t, err)
+			if visited.Load() {
+				t.Error("visitor called with invalid document page")
+			}
+		})
 	}
 }
 
@@ -334,6 +476,147 @@ func TestEnsureTagRejectsAmbiguousDuplicates(t *testing.T) {
 	}())
 }
 
+func TestEnsureTagFindsExactMatchOnLaterPageWithoutCreating(t *testing.T) {
+	t.Parallel()
+
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			posts.Add(1)
+			http.Error(writer, "unexpected create", http.StatusInternalServerError)
+			return
+		}
+		switch request.URL.Query().Get("page") {
+		case "":
+			if got, want := request.URL.Query().Get("name__iexact"), "state & done"; got != want {
+				t.Errorf("name__iexact = %q, want %q", got, want)
+			}
+			io.WriteString(writer, `{"count":2,"next":"?name__iexact=state+%26+done&page=2","results":[{"id":1,"name":"STATE & DONE"}]}`)
+		case "2":
+			io.WriteString(writer, `{"count":2,"next":null,"results":[{"id":2,"name":"state & done"}]}`)
+		default:
+			http.Error(writer, "unexpected page", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	tag, err := client.EnsureTag(context.Background(), "state & done")
+	if err != nil {
+		t.Fatalf("EnsureTag() error = %v", err)
+	}
+	if got, want := tag.ID, 2; got != want {
+		t.Errorf("EnsureTag() ID = %d, want %d", got, want)
+	}
+	if posts.Load() != 0 {
+		t.Errorf("POST count = %d, want 0", posts.Load())
+	}
+}
+
+func TestEnsureTagRejectsDuplicatesAcrossPages(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			t.Error("EnsureTag() created an ambiguous tag")
+			return
+		}
+		if request.URL.Query().Get("page") == "2" {
+			io.WriteString(writer, `{"count":2,"next":null,"results":[{"id":2,"name":"state"}]}`)
+			return
+		}
+		io.WriteString(writer, `{"count":2,"next":"?name__iexact=state&page=2","results":[{"id":1,"name":"state"}]}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	_, err := client.EnsureTag(context.Background(), "state")
+	assertPaperlessError(t, err)
+}
+
+func TestEnsureTagRejectsUnsafePagination(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		maxPages int
+		next     func(*httptest.Server) string
+	}{
+		{name: "loop", next: func(server *httptest.Server) string { return server.URL + "/paperless/api/tags/?name__iexact=state" }},
+		{name: "page limit", maxPages: 1, next: func(_ *httptest.Server) string { return "?name__iexact=state&page=2" }},
+		{name: "subpath escape", next: func(server *httptest.Server) string { return server.URL + "/api/tags/?name__iexact=state&page=2" }},
+		{name: "encoded traversal", next: func(_ *httptest.Server) string { return "/paperless/%2e%2e/api/tags/?name__iexact=state&page=2" }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var requests atomic.Int32
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				requests.Add(1)
+				if request.Method == http.MethodPost {
+					t.Error("EnsureTag() created before safe traversal completed")
+					return
+				}
+				fmt.Fprintf(writer, `{"count":0,"next":%q,"results":[]}`, test.next(server))
+			}))
+			t.Cleanup(server.Close)
+			client := newTestClient(t, server.URL+"/paperless/", Options{MaxPages: test.maxPages})
+
+			_, err := client.EnsureTag(context.Background(), "state")
+			assertPaperlessError(t, err)
+			if test.name == "subpath escape" || test.name == "encoded traversal" {
+				if got, want := requests.Load(), int32(1); got != want {
+					t.Errorf("request count = %d, want %d", got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestEnsureTagRejectsInvalidLookupTag(t *testing.T) {
+	t.Parallel()
+
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			posts.Add(1)
+			return
+		}
+		io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":0,"name":"canary tag name"}]}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	_, err := client.EnsureTag(context.Background(), "canary tag name")
+	assertPaperlessError(t, err)
+	assertRedacted(t, err, "canary tag name")
+	if posts.Load() != 0 {
+		t.Errorf("POST count = %d, want 0", posts.Load())
+	}
+}
+
+func TestEnsureTagRejectsInvalidCreatedTag(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet {
+			io.WriteString(writer, `{"count":0,"next":null,"results":[]}`)
+			return
+		}
+		writer.WriteHeader(http.StatusCreated)
+		io.WriteString(writer, `{"id":-1,"name":"canary created tag"}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	_, err := client.EnsureTag(context.Background(), "canary created tag")
+	assertPaperlessError(t, err)
+	assertRedacted(t, err, "canary created tag")
+}
+
 func TestRequestDeadlineAndJSONLimit(t *testing.T) {
 	t.Parallel()
 
@@ -427,6 +710,50 @@ func TestSameOriginRedirectRetainsAuthorization(t *testing.T) {
 	}
 	if got, want := redirectedAuth, "Token "+testToken; got != want {
 		t.Errorf("redirected Authorization = %q, want %q", got, want)
+	}
+}
+
+func TestSameOriginRedirectOutsideBasePathIsRejected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		location string
+	}{
+		{name: "absolute path", location: "/api/documents/1/"},
+		{name: "relative traversal", location: "../../../../api/documents/1/"},
+		{name: "encoded traversal", location: "/paperless/%2e%2e/api/documents/1/"},
+		{name: "path prefix boundary", location: "/paperless2/api/documents/1/"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var requests atomic.Int32
+			var escapedAuth string
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				requests.Add(1)
+				if request.URL.Path != "/paperless/api/documents/1/" {
+					escapedAuth = request.Header.Get("Authorization")
+					io.WriteString(writer, `{"id":1}`)
+					return
+				}
+				writer.Header().Set("Location", test.location)
+				writer.WriteHeader(http.StatusFound)
+			}))
+			t.Cleanup(server.Close)
+			client := newTestClient(t, server.URL+"/paperless/", Options{})
+
+			_, err := client.GetDocument(context.Background(), 1)
+			assertPaperlessError(t, err)
+			if got, want := requests.Load(), int32(1); got != want {
+				t.Errorf("request count = %d, want %d", got, want)
+			}
+			if escapedAuth != "" {
+				t.Errorf("escaped Authorization = %q, want empty", escapedAuth)
+			}
+		})
 	}
 }
 
