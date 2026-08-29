@@ -454,7 +454,10 @@ func disclosureCandidates(raw []byte, minBytes int) []string {
 	if len(raw) < minBytes {
 		return nil
 	}
-	candidates := []string{string(raw)}
+	var candidates []string
+	if markerBytes(raw) && distinctiveMarker(raw) {
+		candidates = append(candidates, string(raw))
+	}
 	for start := 0; start < len(raw); {
 		for start < len(raw) && !isMarkerByte(raw[start]) {
 			start++
@@ -469,6 +472,15 @@ func disclosureCandidates(raw []byte, minBytes int) []string {
 		start = end + 1
 	}
 	return candidates
+}
+
+func markerBytes(value []byte) bool {
+	for _, character := range value {
+		if !isMarkerByte(character) {
+			return false
+		}
+	}
+	return true
 }
 
 func distinctiveMarker(value []byte) bool {
@@ -486,8 +498,9 @@ func isMarkerByte(value byte) bool {
 
 func TestErrorDisclosesInputChecksFormattingAndUnwrapChain(t *testing.T) {
 	const (
-		raw     = "prefix unique-segment-alpha-83f5 middle unique-segment-beta-27c1 suffix"
-		segment = "unique-segment-beta-27c1"
+		raw      = "prefix unique-segment-alpha-83f5 middle unique-segment-beta-27c1 suffix"
+		segment  = "unique-segment-beta-27c1"
+		complete = "unique-complete-canary-6a91"
 	)
 	tests := []struct {
 		name string
@@ -498,13 +511,33 @@ func TestErrorDisclosesInputChecksFormattingAndUnwrapChain(t *testing.T) {
 		{name: "safe", err: saferr.New(saferr.CategoryProvider, invalidTranscriptionMessage), raw: raw, want: false},
 		{name: "public formatting", err: errors.New("failed: " + raw), raw: raw, want: true},
 		{name: "private unwrap cause", err: saferr.Wrap(saferr.CategoryProvider, invalidTranscriptionMessage, errors.New(raw)), raw: raw, want: true},
+		{name: "complete unique canary", err: errors.New("failed: " + complete), raw: complete, want: true},
 		{name: "raw substring only", err: errors.New("failed: " + segment), raw: raw, want: true},
+		{name: "wrapped raw substring only", err: saferr.Wrap(saferr.CategoryProvider, invalidTranscriptionMessage, errors.New(segment)), raw: raw, want: true},
 		{name: "too short to be meaningful", err: errors.New("x"), raw: "x", want: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if got := errorDisclosesInput(test.err, []byte(test.raw)); got != test.want {
 				t.Errorf("errorDisclosesInput() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestErrorDisclosesInputIgnoresCommonValidationWords(t *testing.T) {
+	err := saferr.New(saferr.CategoryProvider, invalidTranscriptionMessage)
+	for _, raw := range []string{
+		"provider",
+		"transcription",
+		"AI transcription output is invalid",
+		"invalid transcription",
+		"pages",
+		`{"pages":[{"page":1,"text":"invalid transcription","refused":false}]}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			if errorDisclosesInput(err, []byte(raw)) {
+				t.Error("common validation input counted as disclosure")
 			}
 		})
 	}
