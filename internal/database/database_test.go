@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-const supportedSchemaVersion = 2
+const supportedSchemaVersion = 3
 
 func TestOpenCreatesAndConfiguresDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "queue.db")
@@ -76,6 +76,38 @@ func TestOpenUpgradesVersionOneDatabase(t *testing.T) {
 	}
 	if candidates != 1 {
 		t.Errorf("candidates table count = %d, want 1", candidates)
+	}
+}
+
+func TestOpenUpgradesVersionTwoDatabaseAndPreservesCandidates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	db, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatalf("sql.Open(): %v", err)
+	}
+	if err := applyMigrations(db, migrations[:2]); err != nil {
+		t.Fatalf("apply version 2 migrations: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO candidates (
+		document_id, priority, created_at, updated_at
+	) VALUES (42, 100, '2026-08-29T12:00:00Z', '2026-08-29T12:00:01Z')`); err != nil {
+		t.Fatalf("insert version 2 candidate: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version 2 database: %v", err)
+	}
+
+	db = openTestDatabase(t, path)
+	assertPragmaValue(t, db, "user_version", fmt.Sprint(supportedSchemaVersion))
+	var documentID, priority, generation int64
+	var createdAt, updatedAt string
+	if err := db.QueryRow(`SELECT document_id, priority, generation, created_at, updated_at
+		FROM candidates`).Scan(&documentID, &priority, &generation, &createdAt, &updatedAt); err != nil {
+		t.Fatalf("load migrated candidate: %v", err)
+	}
+	if documentID != 42 || priority != 100 || generation != 1 ||
+		createdAt != "2026-08-29T12:00:00Z" || updatedAt != "2026-08-29T12:00:01Z" {
+		t.Fatalf("migrated candidate = (%d, %d, %d, %q, %q)", documentID, priority, generation, createdAt, updatedAt)
 	}
 }
 
