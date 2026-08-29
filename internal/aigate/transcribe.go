@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ const (
 	maxOCRDraftBytes      = 1 << 20
 	maxRequestBytes       = 32 << 20
 	maxOutputTokens       = 8192
+	requestJSONOverhead   = 16 << 10
 )
 
 // Transcription describes one explicitly selected multimodal page request.
@@ -125,6 +127,10 @@ type transcriptionPageSchema struct {
 }
 
 type transcriptionResponse struct {
+	Status            string `json:"status"`
+	IncompleteDetails struct {
+		Reason string `json:"reason"`
+	} `json:"incomplete_details"`
 	Output []struct {
 		Type    string `json:"type"`
 		Content []struct {
@@ -137,6 +143,10 @@ type transcriptionResponse struct {
 
 // Transcribe executes one explicitly selected multimodal Responses API request.
 func (client *Client) Transcribe(ctx context.Context, input Transcription) (json.RawMessage, error) {
+	return client.transcribe(ctx, input, dataURL)
+}
+
+func (client *Client) transcribe(ctx context.Context, input Transcription, encode func(string, []byte) string) (json.RawMessage, error) {
 	if client == nil {
 		return nil, providerError("transcription client is unavailable")
 	}
@@ -149,8 +159,11 @@ func (client *Client) Transcribe(ctx context.Context, input Transcription) (json
 	if err := ctx.Err(); err != nil {
 		return nil, providerContextError("transcription canceled", err)
 	}
+	if transcriptionRequestUpperBound(client.model, input) > maxRequestBytes {
+		return nil, providerError("transcription request exceeded limit")
+	}
 
-	body, err := json.Marshal(client.transcriptionRequest(input))
+	body, err := json.Marshal(client.transcriptionRequest(input, encode))
 	if err != nil || len(body) > maxRequestBytes {
 		return nil, providerError("transcription request exceeded limit")
 	}
@@ -165,7 +178,13 @@ func (client *Client) Transcribe(ctx context.Context, input Transcription) (json
 	request.Header.Set("Content-Type", "application/json")
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return nil, providerContextError("transcription request failed", err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, providerContextError("transcription request failed", err)
+		}
+		if transientTransportError(err) {
+			return nil, newRetryError(RetryUnavailable, 0)
+		}
+		return nil, providerError("transcription request failed")
 	}
 	defer response.Body.Close()
 	data, err := readLimited(response.Body, client.maxResponseBytes)
@@ -210,29 +229,29 @@ func validateTranscription(input Transcription) error {
 	return nil
 }
 
-func (client *Client) transcriptionRequest(input Transcription) transcriptionRequest {
-	content := []transcriptionContent{{Type: "input_text", Text: ocr.Prompt(input.FirstPage, input.LastPage, input.OCRDraft)}}
+func (client *Client) transcriptionRequest(input Transcription, encode func(string, []byte) string) transcriptionRequest {
+	content := []transcriptionContent{{Type: "input_text", Text: ocr.UserPrompt(input.FirstPage, input.LastPage, input.OCRDraft)}}
 	if input.Capability == DirectPDF {
 		content = append(content, transcriptionContent{
 			Type:     "input_file",
 			Filename: transcriptionFilename,
-			FileData: dataURL("application/pdf", input.PDF),
+			FileData: encode("application/pdf", input.PDF),
 		})
 	} else {
 		for _, image := range input.Images {
 			content = append(content, transcriptionContent{
 				Type:     "input_image",
-				ImageURL: dataURL("image/png", image),
+				ImageURL: encode("image/png", image),
 				Detail:   "low",
 			})
 		}
 	}
 	return transcriptionRequest{
 		Model: client.model,
-		Input: []transcriptionIn{{
-			Role:    "user",
-			Content: content,
-		}},
+		Input: []transcriptionIn{
+			{Role: "developer", Content: []transcriptionContent{{Type: "input_text", Text: ocr.DeveloperPrompt()}}},
+			{Role: "user", Content: content},
+		},
 		Text:            transcriptionText{Format: strictTranscriptionFormat()},
 		MaxOutputTokens: maxOutputTokens,
 	}
@@ -240,6 +259,50 @@ func (client *Client) transcriptionRequest(input Transcription) transcriptionReq
 
 func dataURL(mediaType string, data []byte) string {
 	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data)
+}
+
+func transcriptionRequestUpperBound(model string, input Transcription) uint64 {
+	size := uint64(requestJSONOverhead)
+	if !addRequestSize(&size, escapedJSONUpperBound(len(model))) ||
+		!addRequestSize(&size, escapedJSONUpperBound(len(input.OCRDraft))) {
+		return maxRequestBytes + 1
+	}
+	if input.Capability == DirectPDF {
+		if !addRequestSize(&size, dataURLUpperBound(len("application/pdf"), len(input.PDF))) {
+			return maxRequestBytes + 1
+		}
+		return size
+	}
+	for _, image := range input.Images {
+		if !addRequestSize(&size, dataURLUpperBound(len("image/png"), len(image))) {
+			return maxRequestBytes + 1
+		}
+	}
+	return size
+}
+
+func escapedJSONUpperBound(length int) uint64 {
+	if length > maxRequestBytes/6 {
+		return maxRequestBytes + 1
+	}
+	return uint64(length) * 6
+}
+
+func dataURLUpperBound(mediaTypeLength, rawLength int) uint64 {
+	if rawLength > maxRequestBytes {
+		return maxRequestBytes + 1
+	}
+	raw := uint64(rawLength)
+	encoded := ((raw + 2) / 3) * 4
+	return uint64(len("data:;base64,")) + uint64(mediaTypeLength) + encoded
+}
+
+func addRequestSize(total *uint64, value uint64) bool {
+	if value > maxRequestBytes || *total > maxRequestBytes-value {
+		return false
+	}
+	*total += value
+	return true
 }
 
 func strictTranscriptionFormat() transcriptionFormat {
@@ -276,18 +339,33 @@ func transcriptionOutput(data []byte) (json.RawMessage, error) {
 	if err := decodeSingleJSON(data, &response); err != nil {
 		return nil, err
 	}
-	if len(response.Output) != 1 || response.Output[0].Type != "message" || len(response.Output[0].Content) != 1 {
+	if response.Status != "" && response.Status != "completed" {
+		return nil, errors.New("transcription response was not completed")
+	}
+	var text string
+	messages := 0
+	for _, output := range response.Output {
+		switch output.Type {
+		case "reasoning":
+			continue
+		case "message":
+			messages++
+		default:
+			return nil, errors.New("unexpected transcription output item")
+		}
+		if messages != 1 || len(output.Content) != 1 {
+			return nil, errors.New("unexpected transcription output envelope")
+		}
+		content := output.Content[0]
+		if content.Type != "output_text" || content.Text == "" || content.Refusal != "" {
+			return nil, errors.New("unexpected transcription output content")
+		}
+		text = content.Text
+	}
+	if messages != 1 {
 		return nil, errors.New("unexpected transcription output envelope")
 	}
-	content := response.Output[0].Content[0]
-	if content.Type != "output_text" || content.Text == "" || content.Refusal != "" {
-		return nil, errors.New("unexpected transcription output content")
-	}
-	raw := json.RawMessage(content.Text)
-	var value any
-	if err := decodeSingleJSON(raw, &value); err != nil {
-		return nil, err
-	}
+	raw := json.RawMessage(text)
 	return bytes.Clone(raw), nil
 }
 
@@ -296,18 +374,23 @@ func (client *Client) transcriptionStatusError(statusCode int, retryAfter string
 	switch {
 	case statusCode == http.StatusTooManyRequests:
 		class = RetryRateLimit
-	case statusCode >= http.StatusInternalServerError && statusCode < 600:
+	case statusCode == http.StatusRequestTimeout || statusCode == http.StatusConflict || statusCode >= http.StatusInternalServerError && statusCode < 600:
 		class = RetryUnavailable
 	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
 		return providerError("transcription authentication failed")
 	default:
 		return providerError("transcription request was rejected")
 	}
-	return &retryError{
-		class: class,
-		delay: parseRetryAfter(retryAfter, time.Now()),
-		err:   providerError("transcription provider is temporarily unavailable"),
-	}
+	return newRetryError(class, parseRetryAfter(retryAfter, time.Now()))
+}
+
+func newRetryError(class RetryClass, delay time.Duration) error {
+	return &retryError{class: class, delay: delay, err: providerError("transcription provider is temporarily unavailable")}
+}
+
+func transientTransportError(err error) bool {
+	var networkError net.Error
+	return errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary())
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {
