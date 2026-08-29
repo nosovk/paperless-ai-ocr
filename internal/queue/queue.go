@@ -139,44 +139,51 @@ func (q *Queue) Claim(owner string, leaseDuration time.Duration) (Job, bool, err
 
 // ScheduleRetry releases the active claim generation until a future time.
 func (q *Queue) ScheduleRetry(id int64, attempt int, owner string, availableAt time.Time, diagnostic SafeDiagnostic) error {
-	now := q.now().UTC()
-	if id <= 0 || attempt <= 0 || blank(owner) || !diagnostic.valid() || !availableAt.After(now) {
+	if id <= 0 || attempt <= 0 || blank(owner) || !diagnostic.valid() {
 		return validationError("invalid retry input")
 	}
-	return q.updateOne(`UPDATE jobs SET state = 'retry', available_at = ?,
-		lease_owner = NULL, lease_expires_at = NULL, error_category = ?, error_message = ?,
-		updated_at = ? WHERE id = ? AND state = 'processing' AND attempts = ?
-		AND lease_owner = ? AND lease_expires_at > ?`, formatTime(availableAt),
-		diagnostic.Category, diagnostic.Message, formatTime(now), id, attempt, owner, formatTime(now))
+	return q.transitionProcessing(func(conn *sql.Conn, now time.Time) error {
+		if !availableAt.After(now) {
+			return validationError("invalid retry input")
+		}
+		timestamp := formatTime(now)
+		return updateOne(conn, `UPDATE jobs SET state = 'retry', available_at = ?,
+			lease_owner = NULL, lease_expires_at = NULL, error_category = ?, error_message = ?,
+			updated_at = ? WHERE id = ? AND state = 'processing' AND attempts = ?
+			AND lease_owner = ? AND lease_expires_at > ?`, formatTime(availableAt),
+			diagnostic.Category, diagnostic.Message, timestamp, id, attempt, owner, timestamp)
+	})
 }
 
 // Complete marks the active claim generation completed.
 func (q *Queue) Complete(id int64, attempt int, owner string) error {
-	now := q.now().UTC()
 	if id <= 0 || attempt <= 0 || blank(owner) {
 		return validationError("invalid completion input")
 	}
-	timestamp := formatTime(now)
-	return q.updateOne(`UPDATE jobs SET state = 'completed',
-		lease_owner = NULL, lease_expires_at = NULL, error_category = NULL,
-		error_message = NULL, completed_at = ?, updated_at = ?
-		WHERE id = ? AND state = 'processing' AND attempts = ?
-		AND lease_owner = ? AND lease_expires_at > ?`, timestamp, timestamp, id, attempt, owner, timestamp)
+	return q.transitionProcessing(func(conn *sql.Conn, now time.Time) error {
+		timestamp := formatTime(now)
+		return updateOne(conn, `UPDATE jobs SET state = 'completed',
+			lease_owner = NULL, lease_expires_at = NULL, error_category = NULL,
+			error_message = NULL, completed_at = ?, updated_at = ?
+			WHERE id = ? AND state = 'processing' AND attempts = ?
+			AND lease_owner = ? AND lease_expires_at > ?`, timestamp, timestamp, id, attempt, owner, timestamp)
+	})
 }
 
 // Fail marks the active claim generation terminally failed.
 func (q *Queue) Fail(id int64, attempt int, owner string, diagnostic SafeDiagnostic) error {
-	now := q.now().UTC()
 	if id <= 0 || attempt <= 0 || blank(owner) || !diagnostic.valid() {
 		return validationError("invalid failure input")
 	}
-	timestamp := formatTime(now)
-	return q.updateOne(`UPDATE jobs SET state = 'failed',
-		lease_owner = NULL, lease_expires_at = NULL, error_category = ?, error_message = ?,
-		completed_at = ?, updated_at = ?
-		WHERE id = ? AND state = 'processing' AND attempts = ?
-		AND lease_owner = ? AND lease_expires_at > ?`, diagnostic.Category,
-		diagnostic.Message, timestamp, timestamp, id, attempt, owner, timestamp)
+	return q.transitionProcessing(func(conn *sql.Conn, now time.Time) error {
+		timestamp := formatTime(now)
+		return updateOne(conn, `UPDATE jobs SET state = 'failed',
+			lease_owner = NULL, lease_expires_at = NULL, error_category = ?, error_message = ?,
+			completed_at = ?, updated_at = ?
+			WHERE id = ? AND state = 'processing' AND attempts = ?
+			AND lease_owner = ? AND lease_expires_at > ?`, diagnostic.Category,
+			diagnostic.Message, timestamp, timestamp, id, attempt, owner, timestamp)
+	})
 }
 
 // RetryFailed explicitly returns a terminally failed job to the queue.
@@ -228,6 +235,12 @@ func (q *Queue) RecoverExpiredLeases() (int64, error) {
 func (q *Queue) updateOne(statement string, args ...any) error {
 	return q.write(func(conn *sql.Conn) error {
 		return updateOne(conn, statement, args...)
+	})
+}
+
+func (q *Queue) transitionProcessing(fn func(*sql.Conn, time.Time) error) error {
+	return q.write(func(conn *sql.Conn) error {
+		return fn(conn, q.now().UTC())
 	})
 }
 

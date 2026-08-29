@@ -1,6 +1,8 @@
 package queue
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -351,6 +353,60 @@ func TestAttemptFencesReclaimedLeaseWithSameOwner(t *testing.T) {
 	}
 }
 
+func TestCompleteValidatesLeaseAfterWaitingForWriterLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	q1 := openTestQueue(t, path, testNow)
+	q2 := openTestQueue(t, path, testNow)
+	clock := newTestClock(testNow)
+	q2.now = clock.Now
+	job := enqueueAndClaim(t, q1, 1, "checksum", PriorityBackfill, "owner")
+	before := loadJob(t, q1, job.ID)
+
+	lock := holdWriterLock(t, q1.db)
+	result := make(chan error, 1)
+	go func() {
+		result <- q2.Complete(job.ID, job.Attempts, "owner")
+	}()
+	waitForConnectionInUse(t, q2.db)
+	clock.Set(job.LeaseExpiresAt)
+	lock.Release(t)
+
+	if err := <-result; errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("delayed Complete() error = %v, want validation error", err)
+	}
+	if after := loadJob(t, q1, job.ID); after != before {
+		t.Errorf("job after delayed Complete() = %+v, want unchanged %+v", after, before)
+	}
+}
+
+func TestScheduleRetryValidatesAvailabilityAfterWaitingForWriterLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	q1 := openTestQueue(t, path, testNow)
+	q2 := openTestQueue(t, path, testNow)
+	clock := newTestClock(testNow)
+	q2.now = clock.Now
+	job := enqueueAndClaim(t, q1, 1, "checksum", PriorityBackfill, "owner")
+	before := loadJob(t, q1, job.ID)
+	availableAt := testNow.Add(time.Minute)
+	diagnostic := SafeDiagnostic{Category: saferr.CategoryProvider, Message: "safe retry"}
+
+	lock := holdWriterLock(t, q1.db)
+	result := make(chan error, 1)
+	go func() {
+		result <- q2.ScheduleRetry(job.ID, job.Attempts, "owner", availableAt, diagnostic)
+	}()
+	waitForConnectionInUse(t, q2.db)
+	clock.Set(availableAt)
+	lock.Release(t)
+
+	if err := <-result; errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("delayed ScheduleRetry() error = %v, want validation error", err)
+	}
+	if after := loadJob(t, q1, job.ID); after != before {
+		t.Errorf("job after delayed ScheduleRetry() = %+v, want unchanged %+v", after, before)
+	}
+}
+
 func TestProcessingTransitionsRejectInvalidAttemptWithoutMutation(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
@@ -646,6 +702,69 @@ func assertProcessingClaim(t *testing.T, q *Queue, id int64, attempt int, owner 
 	job := loadJob(t, q, id)
 	if job.State != StateProcessing || job.Attempts != attempt || job.LeaseOwner != owner {
 		t.Fatalf("job = %+v, want processing attempt %d owner %q", job, attempt, owner)
+	}
+}
+
+type testClock struct {
+	mu  sync.RWMutex
+	now time.Time
+}
+
+func newTestClock(now time.Time) *testClock {
+	return &testClock{now: now}
+}
+
+func (clock *testClock) Now() time.Time {
+	clock.mu.RLock()
+	defer clock.mu.RUnlock()
+	return clock.now
+}
+
+func (clock *testClock) Set(now time.Time) {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	clock.now = now
+}
+
+type writerLock struct {
+	conn *sql.Conn
+}
+
+func holdWriterLock(t *testing.T, db *sql.DB) writerLock {
+	t.Helper()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("acquire writer connection: %v", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		conn.Close()
+		t.Fatalf("begin writer transaction: %v", err)
+	}
+	t.Cleanup(func() {
+		conn.ExecContext(context.Background(), "ROLLBACK")
+		conn.Close()
+	})
+	return writerLock{conn: conn}
+}
+
+func (lock writerLock) Release(t *testing.T) {
+	t.Helper()
+	if _, err := lock.conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatalf("release writer transaction: %v", err)
+	}
+	if err := lock.conn.Close(); err != nil {
+		t.Fatalf("close writer connection: %v", err)
+	}
+}
+
+func waitForConnectionInUse(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for db.Stats().InUse != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("transition did not reach database contention")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
