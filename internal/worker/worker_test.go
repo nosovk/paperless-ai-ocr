@@ -288,6 +288,126 @@ func TestHeartbeatGenuineRenewalFailureCancelsProcessing(t *testing.T) {
 	}
 }
 
+func TestLostLeaseErrorDoesNotDiscloseOrUnwrapStoreError(t *testing.T) {
+	const canary = "CANARY lease store secret"
+	fixture := newFixture(t, 1, aigate.PageImages)
+	fixture.store.renewErr = errors.New(canary)
+
+	_, err := fixture.worker.Process(context.Background(), fixture.job)
+	if errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("Process() error = %v, want validation", err)
+	}
+	if errors.Is(err, fixture.store.renewErr) || errors.Unwrap(err) != nil {
+		t.Fatalf("Process() error retained store error: %#v", err)
+	}
+	for _, format := range []string{"%s", "%q", "%v", "%+v", "%#v", "%x", "%X", "%d", "%o", "%O", "%b", "%c", "%U", "%e", "%E", "%f", "%F", "%g", "%G", "%p", "%t", "%T"} {
+		formatted := fmt.Sprintf(format, err)
+		if strings.Contains(formatted, canary) {
+			t.Fatalf("format %q disclosed store data: %s", format, formatted)
+		}
+	}
+}
+
+func TestProcessRejectsConcurrentCallsWithoutDuplicateWorkOrTransition(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		job  func(queue.Job) queue.Job
+	}{
+		{name: "same claim", job: func(job queue.Job) queue.Job { return job }},
+		{name: "different claim", job: func(job queue.Job) queue.Job {
+			job.ID++
+			job.DocumentID++
+			return job
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFixture(t, 1, aigate.PageImages)
+			release := make(chan struct{})
+			fixture.transcriber.wait = release
+			first := make(chan error, 1)
+			go func() {
+				_, err := fixture.worker.Process(context.Background(), fixture.job)
+				first <- err
+			}()
+			waitForTranscriberCalls(t, fixture.transcriber, 1)
+
+			duplicateDone := make(chan error, 1)
+			go func() {
+				_, err := fixture.worker.Process(context.Background(), test.job(fixture.job))
+				duplicateDone <- err
+			}()
+			select {
+			case err := <-duplicateDone:
+				if errorCategory(err) != saferr.CategoryValidation {
+					t.Fatalf("duplicate Process() error = %v, want validation", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("duplicate Process() did not return immediately")
+			}
+			if fixture.store.failed || fixture.store.retried || fixture.transcriber.callCount() != 1 || fixture.renderer.calls != 1 {
+				t.Fatalf("duplicate changed state: failed=%t retried=%t model/render=%d/%d", fixture.store.failed, fixture.store.retried, fixture.transcriber.callCount(), fixture.renderer.calls)
+			}
+
+			close(release)
+			if err := <-first; err != nil {
+				t.Fatalf("first Process() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestProcessRetriesWrappedModelDeadlineWhileParentActive(t *testing.T) {
+	deadlineErr := fmt.Errorf("provider request: %w", context.DeadlineExceeded)
+	fixture := newFixture(t, 1, aigate.PageImages)
+	fixture.transcriber.errors = []error{deadlineErr, deadlineErr, nil}
+
+	if _, err := fixture.worker.Process(context.Background(), fixture.job); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if fixture.transcriber.callCount() != 3 || fmt.Sprint(fixture.sleeps) != "[1s 2s]" || fixture.store.retried || fixture.store.failed {
+		t.Fatalf("attempts/sleeps/retry/fail = %d/%v/%t/%t", fixture.transcriber.callCount(), fixture.sleeps, fixture.store.retried, fixture.store.failed)
+	}
+}
+
+func TestProcessExhaustsWrappedModelDeadlineAsSafeUnavailable(t *testing.T) {
+	const canary = "CANARY provider deadline secret"
+	deadlineErr := fmt.Errorf("%s: %w", canary, context.DeadlineExceeded)
+	fixture := newFixture(t, 1, aigate.PageImages)
+	fixture.transcriber.errors = []error{deadlineErr, deadlineErr, deadlineErr}
+
+	_, err := fixture.worker.Process(context.Background(), fixture.job)
+	if fixture.transcriber.callCount() != 3 || fmt.Sprint(fixture.sleeps) != "[1s 2s]" || fixture.store.retried || !fixture.store.failed {
+		t.Fatalf("attempts/sleeps/retry/fail = %d/%v/%t/%t", fixture.transcriber.callCount(), fixture.sleeps, fixture.store.retried, fixture.store.failed)
+	}
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(fmt.Sprintf("%s|%q|%v|%+v|%#v", err, err, err, err, err), canary) {
+		t.Fatalf("Process() returned unsafe deadline error: %#v", err)
+	}
+}
+
+func TestProcessParentCancellationDuringWrappedModelDeadlineSchedulesRetry(t *testing.T) {
+	fixture := newFixture(t, 1, aigate.PageImages)
+	ctx, cancel := context.WithCancel(context.Background())
+	fixture.transcriber.after = cancel
+	fixture.transcriber.errors = []error{fmt.Errorf("provider: %w", context.DeadlineExceeded)}
+
+	_, err := fixture.worker.Process(ctx, fixture.job)
+	if !errors.Is(err, context.Canceled) || !fixture.store.retried || fixture.store.failed || fixture.transcriber.callCount() != 1 || len(fixture.sleeps) != 0 {
+		t.Fatalf("Process() = %v, retry/fail/calls/sleeps=%t/%t/%d/%v", err, fixture.store.retried, fixture.store.failed, fixture.transcriber.callCount(), fixture.sleeps)
+	}
+}
+
+func TestProcessParentDeadlineDuringWrappedModelDeadlineSchedulesRetry(t *testing.T) {
+	fixture := newFixture(t, 1, aigate.PageImages)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	fixture.transcriber.errors = []error{fmt.Errorf("provider: %w", context.DeadlineExceeded)}
+
+	_, err := fixture.worker.Process(ctx, fixture.job)
+	if !errors.Is(err, context.DeadlineExceeded) || !fixture.store.retried || fixture.store.failed || fixture.transcriber.callCount() != 0 || len(fixture.sleeps) != 0 {
+		t.Fatalf("Process() = %v, retry/fail/calls/sleeps=%t/%t/%d/%v", err, fixture.store.retried, fixture.store.failed, fixture.transcriber.callCount(), fixture.sleeps)
+	}
+}
+
 func TestProcessShutdownPreservesSuccessCancellationAndDeadline(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -424,6 +544,24 @@ func TestProcessRejectsExcessiveInspectorPageCountBeforeBatchesOrModel(t *testin
 	}
 }
 
+func TestProcessSourceBudgetOverflowStopsBeforeInspectRenderOrModel(t *testing.T) {
+	fixture := newFixture(t, 1, aigate.PageImages)
+	fixture.worker.options.WorkspaceOptions.TemporaryByteBudget = int64(len(fixture.paperless.pdf) - 1)
+	inspectorCalls := 0
+	fixture.worker.options.Inspector = inspectorFunc(func(context.Context, *pdf.Workspace, string) (pdf.Info, error) {
+		inspectorCalls++
+		return pdf.Info{Pages: 1}, nil
+	})
+
+	_, err := fixture.worker.Process(context.Background(), fixture.job)
+	if errorCategory(err) != saferr.CategoryRendering || inspectorCalls != 0 || fixture.renderer.calls != 0 || fixture.transcriber.callCount() != 0 || !fixture.store.failed {
+		t.Fatalf("Process() = %v, inspect/render/model/fail=%d/%d/%d/%t", err, inspectorCalls, fixture.renderer.calls, fixture.transcriber.callCount(), fixture.store.failed)
+	}
+	if _, err := os.Stat(fixture.workspacePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("os.Stat(workspace) error = %v, want os.ErrNotExist", err)
+	}
+}
+
 type fixture struct {
 	worker        *Worker
 	job           queue.Job
@@ -495,6 +633,7 @@ type fakeStore struct {
 	renewStarted chan struct{}
 	failErr      error
 	retryErr     error
+	renewErr     error
 }
 
 func (store *fakeStore) RenewLeaseContext(ctx context.Context, _ int64, _ int, _ string, _ time.Duration) error {
@@ -517,6 +656,9 @@ func (store *fakeStore) RenewLeaseContext(ctx context.Context, _ int64, _ int, _
 	}
 	if renewErrAt != 0 && renames >= renewErrAt {
 		return saferr.New(saferr.CategoryValidation, "stale lease")
+	}
+	if store.renewErr != nil {
+		return store.renewErr
 	}
 	return nil
 }
@@ -623,6 +765,23 @@ type fakeTranscriber struct {
 	after                    func()
 	wait                     <-chan struct{}
 	waitContext              bool
+}
+
+func (transcriber *fakeTranscriber) callCount() int {
+	transcriber.mu.Lock()
+	defer transcriber.mu.Unlock()
+	return transcriber.calls
+}
+
+func waitForTranscriberCalls(t *testing.T, transcriber *fakeTranscriber, calls int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for transcriber.callCount() < calls {
+		if time.Now().After(deadline) {
+			t.Fatalf("Transcribe() calls = %d, want %d", transcriber.callCount(), calls)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (transcriber *fakeTranscriber) Transcribe(ctx context.Context, input aigate.Transcription) (json.RawMessage, error) {

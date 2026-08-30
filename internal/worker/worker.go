@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/nosovk/paperless-ai-ocr/internal/aigate"
@@ -90,6 +91,7 @@ type Options struct {
 // Worker processes exactly one already claimed job.
 type Worker struct {
 	options Options
+	active  atomic.Bool
 }
 
 // Result is validated content awaiting Task 14 finalization.
@@ -101,10 +103,9 @@ type Result struct {
 	Content        string
 }
 
-type lostLeaseError struct{ err error }
+type lostLeaseError struct{}
 
-func (err *lostLeaseError) Error() string { return "validation: active job lease was lost" }
-func (err *lostLeaseError) Unwrap() error { return err.err }
+func (*lostLeaseError) Error() string { return "active job lease was lost" }
 
 // New validates deterministic worker dependencies.
 func New(options Options) (*Worker, error) {
@@ -158,6 +159,10 @@ func (worker *Worker) Process(ctx context.Context, job queue.Job) (Result, error
 	if ctx == nil {
 		return Result{}, saferr.New(saferr.CategoryValidation, "invalid claimed job")
 	}
+	if !worker.active.CompareAndSwap(false, true) {
+		return Result{}, saferr.New(saferr.CategoryValidation, "worker is already processing a job")
+	}
+	defer worker.active.Store(false)
 	processCtx, cancel := context.WithTimeout(ctx, worker.options.DocumentDeadline)
 	heartbeatDone := make(chan error, 1)
 	go worker.heartbeat(processCtx, job, cancel, heartbeatDone)
@@ -178,7 +183,7 @@ func (worker *Worker) Process(ctx context.Context, job queue.Job) (Result, error
 	}
 	var lostLease *lostLeaseError
 	if errors.As(err, &lostLease) {
-		return Result{}, err
+		return Result{}, saferr.New(saferr.CategoryValidation, "active job lease was lost")
 	}
 	safeErr := publicError(err)
 	if transitionErr := worker.fail(job, category(safeErr)); transitionErr != nil {
@@ -206,7 +211,7 @@ func (worker *Worker) heartbeat(ctx context.Context, job queue.Job, cancel conte
 					return
 				}
 				cancel()
-				done <- &lostLeaseError{err: err}
+				done <- &lostLeaseError{}
 				return
 			}
 		}
@@ -247,25 +252,22 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 			err = closeErr
 		}
 	}()
-	path, err := workspace.Path(sourceName)
+	file, err := workspace.Create(ctx, sourceName)
 	if err != nil {
 		return Result{}, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return Result{}, saferr.New(saferr.CategoryRendering, "source workspace file creation failed")
-	}
+	path := file.Name()
 	hash := sha256.New()
 	downloadErr := worker.options.Paperless.DownloadOriginal(ctx, documentID, io.MultiWriter(file, hash))
 	if downloadErr == nil {
 		downloadErr = file.Sync()
 	}
-	closeErr := file.Close()
 	if downloadErr != nil {
+		_ = file.Abort()
 		return Result{}, downloadErr
 	}
-	if closeErr != nil {
-		return Result{}, saferr.New(saferr.CategoryRendering, "source workspace file close failed")
+	if err := file.Close(); err != nil {
+		return Result{}, err
 	}
 	if err := worker.renew(ctx, job); err != nil {
 		return Result{}, err
@@ -382,11 +384,23 @@ func (worker *Worker) transcribeAndCheckpoint(ctx context.Context, job queue.Job
 		if err == nil {
 			break
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ocr.Batch{}, ctxErr
+		}
 		if worker.options.Unsupported(err) {
 			return ocr.Batch{}, err
 		}
-		_, retryAfter, retryable := worker.options.Retry(err)
+		var retryAfter time.Duration
+		var retryable bool
+		if errors.Is(err, context.DeadlineExceeded) {
+			retryable = true
+		} else {
+			_, retryAfter, retryable = worker.options.Retry(err)
+		}
 		if !retryable || attempt == worker.options.ModelAttempts {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return ocr.Batch{}, saferr.New(saferr.CategoryProvider, "transcription service unavailable")
+			}
 			return ocr.Batch{}, err
 		}
 		delay := retryAfter
@@ -436,7 +450,7 @@ func (worker *Worker) renew(ctx context.Context, job queue.Job) error {
 		return err
 	}
 	if err := worker.options.Store.RenewLeaseContext(ctx, job.ID, job.Attempts, job.LeaseOwner, worker.options.LeaseDuration); err != nil {
-		return &lostLeaseError{err: err}
+		return &lostLeaseError{}
 	}
 	return nil
 }

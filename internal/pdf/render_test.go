@@ -277,6 +277,77 @@ func TestRenderByteLimits(t *testing.T) {
 	}
 }
 
+func TestRenderSharesBudgetWithSourceAndReleasesActualOutput(t *testing.T) {
+	workspace := newTestWorkspace(t, context.Background(), 78, WorkspaceOptions{TemporaryByteBudget: 13})
+	file, err := workspace.Create(context.Background(), "combined.pdf")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := file.Write([]byte("safe")); err != nil {
+		t.Fatalf("source Write() error = %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("source Close() error = %v", err)
+	}
+	renderer := newTestRenderer(t, RenderOptions{Executable: writeRenderExecutable(t, `printf '\211PNG\r\n\032\nx' >"$9-1.png"`)})
+
+	if err := renderer.Render(context.Background(), workspace, "combined.pdf", 1, 1, func([]Page) error {
+		if workspace.reserved != 13 {
+			return fmt.Errorf("reserved during callback = %d, want 13", workspace.reserved)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Render() exact combined fit error = %v", err)
+	}
+	if workspace.reserved != 4 {
+		t.Fatalf("reserved after render = %d, want source 4", workspace.reserved)
+	}
+
+	renderer = newTestRenderer(t, RenderOptions{Executable: writeRenderExecutable(t, `printf '\211PNG\r\n\032\nxy' >"$9-1.png"`)})
+	if err := renderer.Render(context.Background(), workspace, "combined.pdf", 1, 1, func([]Page) error { return nil }); err == nil {
+		t.Fatal("Render() combined +1 error = nil")
+	}
+	if workspace.reserved != 4 {
+		t.Fatalf("reserved after overflow = %d, want source 4", workspace.reserved)
+	}
+	if err := workspace.Close(); err != nil {
+		t.Fatalf("Workspace.Close() error = %v", err)
+	}
+}
+
+func TestRenderAccountsExistingOutputWithoutReservingDiskSpaceTwice(t *testing.T) {
+	calls := 0
+	workspace, err := newWorkspace(context.Background(), 79, WorkspaceOptions{TemporaryByteBudget: 13}, workspaceHooks{
+		root: t.TempDir(),
+		availableBytes: func(string) (int64, error) {
+			calls++
+			if calls >= 5 {
+				return 0, nil
+			}
+			return 100, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("newWorkspace() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workspace.Close() })
+	file, err := workspace.Create(context.Background(), "existing.pdf")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := file.Write([]byte("safe")); err != nil {
+		t.Fatalf("source Write() error = %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("source Close() error = %v", err)
+	}
+	renderer := newTestRenderer(t, RenderOptions{Executable: writeRenderExecutable(t, `printf '\211PNG\r\n\032\nx' >"$9-1.png"`)})
+
+	if err := renderer.Render(context.Background(), workspace, "existing.pdf", 1, 1, func([]Page) error { return nil }); err != nil {
+		t.Fatalf("Render() error = %v", err)
+	}
+}
+
 func TestRenderOutputHugeRangeFailsSafely(t *testing.T) {
 	_, err := collectRenderedPages(t.TempDir(), 1, int(^uint(0)>>1), 1)
 	assertRenderingError(t, err)
