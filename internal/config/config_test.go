@@ -139,7 +139,7 @@ func TestLoadOverridesDefaults(t *testing.T) {
 		"HTTP_PORT":               "9090",
 		"POLL_INTERVAL":           "30m",
 		"RENDER_DPI":              "300",
-		"BATCH_SIZE":              "8",
+		"BATCH_SIZE":              "4",
 		"MODEL_ATTEMPTS":          "4",
 		"RENDER_TIMEOUT":          "90s",
 		"MODEL_TIMEOUT":           "2m30s",
@@ -164,7 +164,7 @@ func TestLoadOverridesDefaults(t *testing.T) {
 	if got, want := config.RenderDPI, 300; got != want {
 		t.Errorf("RenderDPI = %d, want %d", got, want)
 	}
-	if got, want := config.BatchSize, 8; got != want {
+	if got, want := config.BatchSize, 4; got != want {
 		t.Errorf("BatchSize = %d, want %d", got, want)
 	}
 	if got, want := config.ModelAttempts, 4; got != want {
@@ -193,6 +193,7 @@ func TestLoadRejectsInvalidScalarOverrides(t *testing.T) {
 		{name: "HTTP_PORT", value: "65536"},
 		{name: "RENDER_DPI", value: "-1"},
 		{name: "BATCH_SIZE", value: "zero"},
+		{name: "BATCH_SIZE", value: "6"},
 		{name: "MODEL_ATTEMPTS", value: "0"},
 	}
 

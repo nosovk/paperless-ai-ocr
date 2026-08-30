@@ -1082,6 +1082,56 @@ func TestRecoverExpiredLeasesIncludesExactBoundaryOnly(t *testing.T) {
 	}
 }
 
+func TestBatchCheckpointsAreFencedByParentLease(t *testing.T) {
+	now := testNow
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+	ranges := []BatchRange{{FirstPage: 1, LastPage: 5}, {FirstPage: 6, LastPage: 7}}
+	batches, err := q.EnsureBatchesContext(context.Background(), job.ID, job.Attempts, "owner", ranges, 200, "png")
+	if err != nil || len(batches) != 2 || batches[0].State != StatePending {
+		t.Fatalf("EnsureBatchesContext() = (%+v, %v)", batches, err)
+	}
+	canonical := `{"pages":[{"page":1,"text":"one","refused":false}]}`
+	if err := q.CheckpointBatchContext(context.Background(), job.ID, job.Attempts, "owner", ranges[0], 200, "png", canonical); err != nil {
+		t.Fatalf("CheckpointBatchContext() error = %v", err)
+	}
+	if err := q.CheckpointBatchContext(context.Background(), job.ID, job.Attempts, "owner", ranges[0], 200, "png", canonical); err != nil {
+		t.Fatalf("idempotent CheckpointBatchContext() error = %v", err)
+	}
+	if err := q.CheckpointBatchContext(context.Background(), job.ID, job.Attempts, "owner", ranges[0], 200, "png", `{"pages":[{"page":1,"text":"changed","refused":false}]}`); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("mismatched CheckpointBatchContext() error = %v, want validation", err)
+	}
+	batches, err = q.ListBatchesContext(context.Background(), job.ID, job.Attempts, "owner")
+	if err != nil || batches[0].ResultText != canonical || batches[0].State != StateCompleted {
+		t.Fatalf("ListBatchesContext() = (%+v, %v)", batches, err)
+	}
+	if _, err := q.EnsureBatchesContext(context.Background(), job.ID, job.Attempts, "owner", []BatchRange{{FirstPage: 1, LastPage: 7}}, 200, "png"); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("incompatible EnsureBatchesContext() error = %v, want validation", err)
+	}
+	now = job.LeaseExpiresAt
+	q.now = func() time.Time { return now }
+	if err := q.CheckpointBatchContext(context.Background(), job.ID, job.Attempts, "owner", ranges[1], 200, "png", canonical); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("stale CheckpointBatchContext() error = %v, want validation", err)
+	}
+}
+
+func TestRenewLeaseContextFencesAttemptOwnerAndExpiry(t *testing.T) {
+	now := testNow
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+	now = now.Add(30 * time.Second)
+	q.now = func() time.Time { return now }
+	if err := q.RenewLeaseContext(context.Background(), job.ID, job.Attempts, "owner", 2*time.Minute); err != nil {
+		t.Fatalf("RenewLeaseContext() error = %v", err)
+	}
+	if got := loadJob(t, q, job.ID).LeaseExpiresAt; !got.Equal(now.Add(2 * time.Minute).UTC()) {
+		t.Errorf("renewed lease = %v", got)
+	}
+	if err := q.RenewLeaseContext(context.Background(), job.ID, job.Attempts, "stale", time.Minute); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("stale RenewLeaseContext() error = %v, want validation", err)
+	}
+}
+
 func TestPublicDatabaseErrorsDoNotExposeDriverDetails(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	if _, err := q.db.Exec("DROP TABLE jobs"); err != nil {

@@ -10,6 +10,37 @@ import (
 	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
 )
 
+func TestBoundDraft(t *testing.T) {
+	if got := BoundDraft(""); got != "" {
+		t.Errorf("BoundDraft(empty) = %q, want empty", got)
+	}
+	short := "native text"
+	if got := BoundDraft(short); got != short {
+		t.Errorf("BoundDraft(short) = %q, want unchanged", got)
+	}
+	huge := strings.Repeat("x", MaxDraftBytes+100)
+	got := BoundDraft(huge)
+	if len(got) > MaxDraftBytes || !utf8.ValidString(got) || !strings.HasSuffix(got, draftTruncationMarker) {
+		t.Errorf("BoundDraft(huge) length/UTF-8/marker = %d/%t/%t", len(got), utf8.ValidString(got), strings.HasSuffix(got, draftTruncationMarker))
+	}
+	boundary := strings.Repeat("x", MaxDraftBytes-len(draftTruncationMarker)-1) + "€" + strings.Repeat("secret", 20)
+	got = BoundDraft(boundary)
+	if !utf8.ValidString(got) || strings.Contains(got, "secret") || len(got) > MaxDraftBytes {
+		t.Errorf("BoundDraft(UTF-8 boundary) valid/secret/length = %t/%t/%d", utf8.ValidString(got), strings.Contains(got, "secret"), len(got))
+	}
+}
+
+func TestCanonicalValidate(t *testing.T) {
+	raw := []byte(" { \n \"pages\" : [ { \"refused\" : false, \"text\" : \"one\", \"page\" : 1 } ] } \n")
+	batch, canonical, err := ValidateCanonical(raw, 1, 1)
+	if err != nil {
+		t.Fatalf("ValidateCanonical() error = %v", err)
+	}
+	if batch.FirstPage() != 1 || string(canonical) != `{"pages":[{"page":1,"text":"one","refused":false}]}` {
+		t.Errorf("ValidateCanonical() = (%+v, %s)", batch, canonical)
+	}
+}
+
 func TestValidateAcceptsExactOrderedPages(t *testing.T) {
 	tests := []struct {
 		name      string

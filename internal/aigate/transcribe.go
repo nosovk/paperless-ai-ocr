@@ -59,6 +59,16 @@ type retryError struct {
 	err   error
 }
 
+type unsupportedAttachmentError struct {
+	err error
+}
+
+func (err *unsupportedAttachmentError) Error() string { return err.err.Error() }
+func (err *unsupportedAttachmentError) Format(state fmt.State, verb rune) {
+	fmt.Fprintf(state, "%"+string(verb), err.err)
+}
+func (err *unsupportedAttachmentError) Unwrap() error { return err.err }
+
 func (err *retryError) Error() string { return err.err.Error() }
 
 func (err *retryError) Format(state fmt.State, verb rune) {
@@ -74,6 +84,23 @@ func Retry(err error) (RetryClass, time.Duration, bool) {
 		return "", 0, false
 	}
 	return retry.class, retry.delay, true
+}
+
+// UnsupportedAttachment reports an explicit structured provider rejection of
+// an attachment transport without exposing provider response data.
+func UnsupportedAttachment(err error) bool {
+	_, ok := errors.AsType[*unsupportedAttachmentError](err)
+	return ok
+}
+
+// DirectPDFEligible reports whether a document fits the direct PDF contract.
+func DirectPDFEligible(pageCount int, pdf []byte) bool {
+	return pageCount > 0 && pageCount <= maxPagesPerRequest && len(pdf) > 0 && len(pdf) <= maxAttachmentBytes
+}
+
+// AttachmentEligible reports whether one attachment fits the input limit.
+func AttachmentEligible(data []byte) bool {
+	return len(data) > 0 && len(data) <= maxAttachmentBytes
 }
 
 type transcriptionRequest struct {
@@ -191,7 +218,7 @@ func (client *Client) transcribe(ctx context.Context, input Transcription, encod
 	defer response.Body.Close()
 	data, err := readLimited(response.Body, client.maxResponseBytes)
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, client.transcriptionStatusError(response.StatusCode, response.Header.Get("Retry-After"))
+		return nil, client.transcriptionStatusError(response.StatusCode, response.Header.Get("Retry-After"), data)
 	}
 	if err != nil {
 		return nil, providerError("transcription response was invalid")
@@ -371,7 +398,7 @@ func transcriptionOutput(data []byte) (json.RawMessage, error) {
 	return bytes.Clone(raw), nil
 }
 
-func (client *Client) transcriptionStatusError(statusCode int, retryAfter string) error {
+func (client *Client) transcriptionStatusError(statusCode int, retryAfter string, data []byte) error {
 	var class RetryClass
 	switch {
 	case statusCode == http.StatusTooManyRequests:
@@ -381,9 +408,20 @@ func (client *Client) transcriptionStatusError(statusCode int, retryAfter string
 	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
 		return providerError("transcription authentication failed")
 	default:
+		if statusCode == http.StatusBadRequest && unsupportedAttachmentResponse(data) {
+			return &unsupportedAttachmentError{err: providerError("transcription attachment is unsupported")}
+		}
 		return providerError("transcription request was rejected")
 	}
 	return newRetryError(class, parseRetryAfter(retryAfter, time.Now()))
+}
+
+func unsupportedAttachmentResponse(data []byte) bool {
+	var response providerErrorResponse
+	if decodeSingleJSON(data, &response) != nil {
+		return false
+	}
+	return response.Error.Code == "unsupported_file" || response.Error.Code == "unsupported_attachment" || response.Error.Type == "unsupported_file"
 }
 
 func newRetryError(class RetryClass, delay time.Duration) error {

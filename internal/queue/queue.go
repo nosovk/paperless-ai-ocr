@@ -11,6 +11,9 @@ import (
 	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
 )
 
+const batchColumns = `id, job_id, page_start, page_end, render_dpi, render_format,
+	state, result_text, created_at, updated_at, completed_at`
+
 const (
 	timestampLayout           = "2006-01-02T15:04:05.000000000Z07:00"
 	maxDiagnosticMessageBytes = 256
@@ -275,17 +278,132 @@ func (q *Queue) Claim(owner string, leaseDuration time.Duration) (Job, bool, err
 	return job, claimed, err
 }
 
+// RenewLease extends the active parent job lease.
+func (q *Queue) RenewLease(id int64, attempt int, owner string, leaseDuration time.Duration) error {
+	return q.RenewLeaseContext(context.Background(), id, attempt, owner, leaseDuration)
+}
+
+// RenewLeaseContext extends the active parent job lease using the caller context.
+func (q *Queue) RenewLeaseContext(ctx context.Context, id int64, attempt int, owner string, leaseDuration time.Duration) error {
+	if id <= 0 || attempt <= 0 || blank(owner) || leaseDuration <= 0 {
+		return validationError("invalid lease renewal input")
+	}
+	return q.writeContext(ctx, func(conn *sql.Conn) error {
+		now := q.now().UTC()
+		return updateOneContext(ctx, conn, `UPDATE jobs SET lease_expires_at = ?, updated_at = ?
+			WHERE id = ? AND state = 'processing' AND attempts = ? AND lease_owner = ?
+			AND lease_expires_at > ?`, formatTime(now.Add(leaseDuration)), formatTime(now),
+			id, attempt, owner, formatTime(now))
+	})
+}
+
+// EnsureBatchesContext creates or verifies the exact batch plan under the active parent lease.
+func (q *Queue) EnsureBatchesContext(ctx context.Context, id int64, attempt int, owner string, ranges []BatchRange, dpi int, format string) ([]Batch, error) {
+	if id <= 0 || attempt <= 0 || blank(owner) || !validBatchRanges(ranges) || dpi <= 0 || blank(format) {
+		return nil, validationError("invalid batch plan")
+	}
+	var batches []Batch
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
+		if err := requireActiveLease(ctx, conn, q.now().UTC(), id, attempt, owner); err != nil {
+			return err
+		}
+		var err error
+		batches, err = listBatches(ctx, conn, id)
+		if err != nil {
+			return err
+		}
+		if len(batches) != 0 {
+			if !sameBatchPlan(batches, ranges, dpi, format) {
+				return validationError("batch plan does not match existing checkpoints")
+			}
+			return nil
+		}
+		now := formatTime(q.now())
+		for _, pageRange := range ranges {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO batches (
+				job_id, page_start, page_end, render_dpi, render_format, state,
+				attempts, available_at, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)`, id, pageRange.FirstPage,
+				pageRange.LastPage, dpi, format, now, now, now); err != nil {
+				return internalError("cannot create batch checkpoints", err)
+			}
+		}
+		batches, err = listBatches(ctx, conn, id)
+		return err
+	})
+	return batches, err
+}
+
+// ListBatchesContext loads checkpoints while verifying the active parent lease.
+func (q *Queue) ListBatchesContext(ctx context.Context, id int64, attempt int, owner string) ([]Batch, error) {
+	if id <= 0 || attempt <= 0 || blank(owner) {
+		return nil, validationError("invalid batch list input")
+	}
+	var batches []Batch
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
+		if err := requireActiveLease(ctx, conn, q.now().UTC(), id, attempt, owner); err != nil {
+			return err
+		}
+		var err error
+		batches, err = listBatches(ctx, conn, id)
+		return err
+	})
+	return batches, err
+}
+
+// CheckpointBatchContext stores canonical validated JSON under the active parent lease.
+func (q *Queue) CheckpointBatchContext(ctx context.Context, id int64, attempt int, owner string, pageRange BatchRange, dpi int, format, resultText string) error {
+	if id <= 0 || attempt <= 0 || blank(owner) || !validBatchRange(pageRange) || dpi <= 0 || blank(format) || blank(resultText) {
+		return validationError("invalid batch checkpoint input")
+	}
+	return q.writeContext(ctx, func(conn *sql.Conn) error {
+		now := q.now().UTC()
+		if err := requireActiveLease(ctx, conn, now, id, attempt, owner); err != nil {
+			return err
+		}
+		var state State
+		var existing sql.NullString
+		if err := conn.QueryRowContext(ctx, `SELECT state, result_text FROM batches WHERE job_id = ?
+			AND page_start = ? AND page_end = ? AND render_dpi = ? AND render_format = ?`,
+			id, pageRange.FirstPage, pageRange.LastPage, dpi, format).Scan(&state, &existing); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return validationError("batch checkpoint does not match planned range")
+			}
+			return internalError("cannot inspect batch checkpoint", err)
+		}
+		if state == StateCompleted {
+			if existing.String == resultText {
+				return nil
+			}
+			return validationError("completed batch checkpoint cannot be replaced")
+		}
+		if state != StatePending {
+			return validationError("batch checkpoint is not pending")
+		}
+		return updateOneContext(ctx, conn, `UPDATE batches SET state = 'completed', result_text = ?,
+			completed_at = ?, updated_at = ? WHERE job_id = ? AND page_start = ? AND page_end = ?
+			AND render_dpi = ? AND render_format = ? AND state = 'pending'`,
+			resultText, formatTime(now), formatTime(now), id, pageRange.FirstPage,
+			pageRange.LastPage, dpi, format)
+	})
+}
+
 // ScheduleRetry releases the active claim generation until a future time.
 func (q *Queue) ScheduleRetry(id int64, attempt int, owner string, availableAt time.Time, diagnostic SafeDiagnostic) error {
+	return q.ScheduleRetryContext(context.Background(), id, attempt, owner, availableAt, diagnostic)
+}
+
+// ScheduleRetryContext releases the active claim generation using the caller context.
+func (q *Queue) ScheduleRetryContext(ctx context.Context, id int64, attempt int, owner string, availableAt time.Time, diagnostic SafeDiagnostic) error {
 	if id <= 0 || attempt <= 0 || blank(owner) || !diagnostic.valid() {
 		return validationError("invalid retry input")
 	}
-	return q.transitionProcessing(func(conn *sql.Conn, now time.Time) error {
+	return q.transitionProcessingContext(ctx, func(conn *sql.Conn, now time.Time) error {
 		if !availableAt.After(now) {
 			return validationError("invalid retry input")
 		}
 		timestamp := formatTime(now)
-		return updateOne(conn, `UPDATE jobs SET state = 'retry', available_at = ?,
+		return updateOneContext(ctx, conn, `UPDATE jobs SET state = 'retry', available_at = ?,
 			lease_owner = NULL, lease_expires_at = NULL, error_category = ?, error_message = ?,
 			updated_at = ? WHERE id = ? AND state = 'processing' AND attempts = ?
 			AND lease_owner = ? AND lease_expires_at > ?`, formatTime(availableAt),
@@ -310,12 +428,17 @@ func (q *Queue) Complete(id int64, attempt int, owner string) error {
 
 // Fail marks the active claim generation terminally failed.
 func (q *Queue) Fail(id int64, attempt int, owner string, diagnostic SafeDiagnostic) error {
+	return q.FailContext(context.Background(), id, attempt, owner, diagnostic)
+}
+
+// FailContext marks the active claim generation terminally failed using the caller context.
+func (q *Queue) FailContext(ctx context.Context, id int64, attempt int, owner string, diagnostic SafeDiagnostic) error {
 	if id <= 0 || attempt <= 0 || blank(owner) || !diagnostic.valid() {
 		return validationError("invalid failure input")
 	}
-	return q.transitionProcessing(func(conn *sql.Conn, now time.Time) error {
+	return q.transitionProcessingContext(ctx, func(conn *sql.Conn, now time.Time) error {
 		timestamp := formatTime(now)
-		return updateOne(conn, `UPDATE jobs SET state = 'failed',
+		return updateOneContext(ctx, conn, `UPDATE jobs SET state = 'failed',
 			lease_owner = NULL, lease_expires_at = NULL, error_category = ?, error_message = ?,
 			completed_at = ?, updated_at = ?
 			WHERE id = ? AND state = 'processing' AND attempts = ?
@@ -377,13 +500,21 @@ func (q *Queue) updateOne(statement string, args ...any) error {
 }
 
 func (q *Queue) transitionProcessing(fn func(*sql.Conn, time.Time) error) error {
-	return q.write(func(conn *sql.Conn) error {
+	return q.transitionProcessingContext(context.Background(), fn)
+}
+
+func (q *Queue) transitionProcessingContext(ctx context.Context, fn func(*sql.Conn, time.Time) error) error {
+	return q.writeContext(ctx, func(conn *sql.Conn) error {
 		return fn(conn, q.now().UTC())
 	})
 }
 
 func updateOne(conn *sql.Conn, statement string, args ...any) error {
-	result, err := conn.ExecContext(context.Background(), statement, args...)
+	return updateOneContext(context.Background(), conn, statement, args...)
+}
+
+func updateOneContext(ctx context.Context, conn *sql.Conn, statement string, args ...any) error {
+	result, err := conn.ExecContext(ctx, statement, args...)
 	if err != nil {
 		return internalError("cannot transition queued job", err)
 	}
@@ -395,6 +526,84 @@ func updateOne(conn *sql.Conn, statement string, args ...any) error {
 		return validationError("illegal job transition or stale lease owner")
 	}
 	return nil
+}
+
+func requireActiveLease(ctx context.Context, conn *sql.Conn, now time.Time, id int64, attempt int, owner string) error {
+	var active int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE id = ?
+		AND state = 'processing' AND attempts = ? AND lease_owner = ? AND lease_expires_at > ?`,
+		id, attempt, owner, formatTime(now)).Scan(&active); err != nil {
+		return internalError("cannot validate active job lease", err)
+	}
+	if active != 1 {
+		return validationError("illegal job transition or stale lease owner")
+	}
+	return nil
+}
+
+func listBatches(ctx context.Context, conn *sql.Conn, jobID int64) ([]Batch, error) {
+	rows, err := conn.QueryContext(ctx, `SELECT `+batchColumns+` FROM batches
+		WHERE job_id = ? ORDER BY page_start, page_end`, jobID)
+	if err != nil {
+		return nil, internalError("cannot load batch checkpoints", err)
+	}
+	defer rows.Close()
+	var batches []Batch
+	for rows.Next() {
+		var batch Batch
+		var result, createdAt, updatedAt, completedAt sql.NullString
+		if err := rows.Scan(&batch.ID, &batch.JobID, &batch.FirstPage, &batch.LastPage,
+			&batch.RenderDPI, &batch.RenderFormat, &batch.State, &result, &createdAt,
+			&updatedAt, &completedAt); err != nil {
+			return nil, internalError("cannot load batch checkpoints", err)
+		}
+		batch.ResultText = result.String
+		var parseErr error
+		if batch.CreatedAt, parseErr = parseTime(createdAt.String); parseErr != nil {
+			return nil, internalError("cannot load batch checkpoints", parseErr)
+		}
+		if batch.UpdatedAt, parseErr = parseTime(updatedAt.String); parseErr != nil {
+			return nil, internalError("cannot load batch checkpoints", parseErr)
+		}
+		if completedAt.Valid {
+			if batch.CompletedAt, parseErr = parseTime(completedAt.String); parseErr != nil {
+				return nil, internalError("cannot load batch checkpoints", parseErr)
+			}
+		}
+		batches = append(batches, batch)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError("cannot load batch checkpoints", err)
+	}
+	return batches, nil
+}
+
+func validBatchRange(pageRange BatchRange) bool {
+	return pageRange.FirstPage > 0 && pageRange.LastPage >= pageRange.FirstPage && pageRange.LastPage-pageRange.FirstPage < 5
+}
+
+func validBatchRanges(ranges []BatchRange) bool {
+	if len(ranges) == 0 || ranges[0].FirstPage != 1 {
+		return false
+	}
+	for index, pageRange := range ranges {
+		if !validBatchRange(pageRange) || index > 0 && pageRange.FirstPage != ranges[index-1].LastPage+1 {
+			return false
+		}
+	}
+	return true
+}
+
+func sameBatchPlan(batches []Batch, ranges []BatchRange, dpi int, format string) bool {
+	if len(batches) != len(ranges) {
+		return false
+	}
+	for index, batch := range batches {
+		if batch.FirstPage != ranges[index].FirstPage || batch.LastPage != ranges[index].LastPage || batch.RenderDPI != dpi || batch.RenderFormat != format {
+			return false
+		}
+	}
+	return true
 }
 
 func (q *Queue) get(id int64) (Job, error) {

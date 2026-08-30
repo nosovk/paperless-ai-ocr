@@ -98,7 +98,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	batchSize, err := positiveInt("BATCH_SIZE", defaultBatchSize, math.MaxInt)
+	batchSize, err := positiveInt("BATCH_SIZE", defaultBatchSize, 5)
 	if err != nil {
 		return Config{}, err
 	}

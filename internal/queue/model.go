@@ -71,3 +71,24 @@ type Job struct {
 	UpdatedAt      time.Time
 	CompletedAt    time.Time
 }
+
+// BatchRange is an exact inclusive planned page range.
+type BatchRange struct {
+	FirstPage int
+	LastPage  int
+}
+
+// Batch is a durable checkpoint owned by its parent job lease.
+type Batch struct {
+	ID           int64
+	JobID        int64
+	FirstPage    int
+	LastPage     int
+	RenderDPI    int
+	RenderFormat string
+	State        State
+	ResultText   string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	CompletedAt  time.Time
+}

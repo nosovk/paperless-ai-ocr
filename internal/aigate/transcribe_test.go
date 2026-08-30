@@ -164,6 +164,41 @@ func TestTranscribeRejectsInvalidInputBeforeNetwork(t *testing.T) {
 	}
 }
 
+func TestDirectPDFEligible(t *testing.T) {
+	if !DirectPDFEligible(5, make([]byte, maxAttachmentBytes)) {
+		t.Fatal("DirectPDFEligible(maximum input) = false, want true")
+	}
+	for _, test := range []struct {
+		pages int
+		pdf   []byte
+	}{
+		{pages: 0, pdf: []byte{1}},
+		{pages: maxPagesPerRequest + 1, pdf: []byte{1}},
+		{pages: 1},
+		{pages: 1, pdf: make([]byte, maxAttachmentBytes+1)},
+	} {
+		if DirectPDFEligible(test.pages, test.pdf) {
+			t.Errorf("DirectPDFEligible(%d, %d bytes) = true, want false", test.pages, len(test.pdf))
+		}
+	}
+}
+
+func TestTranscribeClassifiesUnsupportedAttachmentWithoutDisclosure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(writer, `{"error":{"type":"invalid_request_error","code":"unsupported_file","param":"input","message":"CANARY-provider-secret"}}`)
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL+"/v1", "key", "model", ClientOptions{})
+	_, err := client.Transcribe(context.Background(), Transcription{Capability: DirectPDF, FirstPage: 1, LastPage: 1, PDF: []byte{1}})
+	if !UnsupportedAttachment(err) {
+		t.Fatalf("UnsupportedAttachment(%v) = false, want true", err)
+	}
+	if strings.Contains(fmt.Sprintf("%v|%+v|%#v", err, err, err), "CANARY") {
+		t.Fatalf("unsupported error disclosed provider body: %v", err)
+	}
+}
+
 func TestTranscribeRejectsExcessiveEncodedRequestBeforeNetwork(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))

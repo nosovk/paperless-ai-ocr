@@ -13,6 +13,9 @@ import (
 )
 
 const (
+	// MaxDraftBytes is the maximum native OCR evidence included in a request.
+	MaxDraftBytes = 1 << 20
+
 	maxRawBatchBytes      = 64 << 10
 	maxPageTextBytes      = 32 << 10
 	maxBatchTextBytes     = 60 << 10
@@ -20,6 +23,7 @@ const (
 
 	invalidTranscriptionMessage = "AI transcription output is invalid"
 	invalidJoinMessage          = "validated transcription batches are invalid"
+	draftTruncationMarker       = "\n[untrusted native OCR draft truncated]"
 )
 
 // Page is one validated transcription page.
@@ -123,6 +127,42 @@ func Validate(raw []byte, firstPage, lastPage int) (Batch, error) {
 	}
 
 	return Batch{firstPage: firstPage, lastPage: lastPage, pages: pages}, nil
+}
+
+// ValidateCanonical validates a batch and returns its compact canonical JSON.
+func ValidateCanonical(raw []byte, firstPage, lastPage int) (Batch, json.RawMessage, error) {
+	batch, err := Validate(raw, firstPage, lastPage)
+	if err != nil {
+		return Batch{}, nil, err
+	}
+	canonicalPages := make([]struct {
+		Page    int    `json:"page"`
+		Text    string `json:"text"`
+		Refused bool   `json:"refused"`
+	}, len(batch.pages))
+	for index, page := range batch.pages {
+		canonicalPages[index].Page = page.number
+		canonicalPages[index].Text = page.text
+	}
+	canonical, err := json.Marshal(struct {
+		Pages any `json:"pages"`
+	}{Pages: canonicalPages})
+	if err != nil {
+		return Batch{}, nil, invalidTranscriptionError()
+	}
+	return batch, canonical, nil
+}
+
+// BoundDraft returns deterministic, UTF-8-safe untrusted OCR evidence.
+func BoundDraft(draft string) string {
+	if len(draft) <= MaxDraftBytes {
+		return draft
+	}
+	limit := MaxDraftBytes - len(draftTruncationMarker)
+	for limit > 0 && !utf8.ValidString(draft[:limit]) {
+		limit--
+	}
+	return draft[:limit] + draftTruncationMarker
 }
 
 func literalObjectKeys(raw []byte) bool {
