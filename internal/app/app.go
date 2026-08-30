@@ -64,7 +64,8 @@ type Runtime interface {
 	Close() error
 }
 
-// Options injects lifecycle dependencies and deterministic timing.
+// Options injects lifecycle dependencies and deterministic timing. Logger is
+// caller-owned and remains open after Run returns.
 type Options struct {
 	Runtime         Runtime
 	Readiness       *server.Readiness
@@ -430,7 +431,6 @@ func Run(parent context.Context, options Options) error {
 		return saferr.New(saferr.CategoryInternal, "shutdown failed")
 	}
 	_ = options.Logger.Shutdown()
-	_ = options.Logger.Close(shutdownCtx)
 	return nil
 }
 

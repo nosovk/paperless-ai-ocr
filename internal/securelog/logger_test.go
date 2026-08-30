@@ -146,6 +146,29 @@ func TestLoggerWriterFailureDoesNotDiscloseCause(t *testing.T) {
 	}
 }
 
+func TestLoggerWriterPanicIsSafe(t *testing.T) {
+	const canary = "CANARY synchronous writer panic"
+	logger := New(panicValueWriter{value: canary})
+	var err error
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("Startup() panic = %v", recovered)
+			}
+		}()
+		err = logger.Startup()
+	}()
+	if err == nil || err.Error() != "secure log write failed" {
+		t.Fatalf("Startup() error = %v", err)
+	}
+	if strings.Contains(fmt.Sprintf("%v", err), canary) || errors.Unwrap(err) != nil {
+		t.Fatalf("panic data exposed: %v", err)
+	}
+	if err := logger.Ready(); err == nil {
+		t.Fatal("logger accepted entry after writer panic")
+	}
+}
+
 func TestLoggerRejectsShortWrite(t *testing.T) {
 	err := New(shortWriter{}).Startup()
 	if err == nil || err.Error() != "secure log write failed" {
@@ -258,6 +281,65 @@ func TestAsyncLoggerCloseIsBoundedByContext(t *testing.T) {
 	writer.unblock()
 }
 
+func TestAsyncLoggerCloseLinearizesWithProducers(t *testing.T) {
+	writer := &countingLineWriter{}
+	logger, err := NewAsync(writer, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var accepted atomic.Uint64
+	var wait sync.WaitGroup
+	start := make(chan struct{})
+	for worker := range 20 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			for sequence := range 1000 {
+				if logger.JobClaimed(int64(worker*1000+sequence+1)) == nil {
+					accepted.Add(1)
+				}
+			}
+		}()
+	}
+	close(start)
+	time.Sleep(time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := logger.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wait.Wait()
+	if err := logger.JobClaimed(999999); err == nil {
+		t.Fatal("post-close call succeeded")
+	}
+	if writer.Lines() != accepted.Load() {
+		t.Fatalf("successful close wrote %d of %d accepted entries", writer.Lines(), accepted.Load())
+	}
+}
+
+func TestAsyncLoggerFailureAccountsAcceptedEntries(t *testing.T) {
+	writer := &failAfterWriter{allowed: 5}
+	logger, err := NewAsync(writer, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for documentID := int64(1); documentID <= 100; documentID++ {
+		_ = logger.JobClaimed(documentID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := logger.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.JobClaimed(200); err == nil {
+		t.Fatal("post-failure call succeeded")
+	}
+	if got, want := writer.Lines()+logger.Dropped(), uint64(101); got != want {
+		t.Fatalf("written+dropped = %d, want attempted calls %d", got, want)
+	}
+}
+
 type errorWriter struct{ err error }
 
 func (writer errorWriter) Write([]byte) (int, error) { return 0, writer.err }
@@ -303,6 +385,10 @@ type panicWriter struct{}
 
 func (panicWriter) Write([]byte) (int, error) { panic("CANARY writer panic") }
 
+type panicValueWriter struct{ value string }
+
+func (writer panicValueWriter) Write([]byte) (int, error) { panic(writer.value) }
+
 type shortThenRecordWriter struct{ calls atomic.Int64 }
 
 func (writer *shortThenRecordWriter) Write(data []byte) (int, error) {
@@ -328,3 +414,27 @@ func (buffer *lockedBuffer) String() string {
 	defer buffer.mu.Unlock()
 	return buffer.Buffer.String()
 }
+
+type countingLineWriter struct{ lines atomic.Uint64 }
+
+func (writer *countingLineWriter) Write(data []byte) (int, error) {
+	writer.lines.Add(uint64(bytes.Count(data, []byte{'\n'})))
+	return len(data), nil
+}
+
+func (writer *countingLineWriter) Lines() uint64 { return writer.lines.Load() }
+
+type failAfterWriter struct {
+	allowed uint64
+	lines   atomic.Uint64
+}
+
+func (writer *failAfterWriter) Write(data []byte) (int, error) {
+	if writer.lines.Load() >= writer.allowed {
+		return 0, errors.New("CANARY failed sink")
+	}
+	writer.lines.Add(uint64(bytes.Count(data, []byte{'\n'})))
+	return len(data), nil
+}
+
+func (writer *failAfterWriter) Lines() uint64 { return writer.lines.Load() }

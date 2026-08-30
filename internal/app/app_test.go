@@ -195,6 +195,42 @@ func TestRunIgnoresBlockedLoggerDuringShutdownAndLeaseSettlement(t *testing.T) {
 		t.Fatalf("release/close = (%+v, %t)", runtime.released, runtime.closed)
 	}
 	writer.unblock()
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+	defer closeCancel()
+	if err := logger.Close(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunDoesNotCloseCallerOwnedLogger(t *testing.T) {
+	var output bytes.Buffer
+	logger, err := securelog.NewAsync(&output, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	runtime := &fakeRuntime{events: make(chan string, 16), claimResults: []claimResult{{}}}
+	done := make(chan error, 1)
+	go func() {
+		options := testOptions(t, runtime)
+		options.Logger = logger
+		done <- Run(ctx, options)
+	}()
+	for range 6 {
+		<-runtime.events
+	}
+	cancel(context.Canceled)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.Ready(); err != nil {
+		t.Fatalf("caller-owned logger was closed: %v", err)
+	}
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+	defer closeCancel()
+	if err := logger.Close(closeCtx); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRunInitialReconciliationFailureNeverBecomesReady(t *testing.T) {

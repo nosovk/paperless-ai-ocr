@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
@@ -33,12 +32,12 @@ type Logger struct {
 }
 
 type asyncLogger struct {
+	mu      sync.Mutex
 	entries chan entry
-	close   chan struct{}
 	done    chan struct{}
-	closed  atomic.Bool
-	failed  atomic.Bool
-	dropped atomic.Uint64
+	closed  bool
+	failed  bool
+	dropped uint64
 }
 
 type entry struct {
@@ -57,14 +56,14 @@ func New(writer io.Writer) *Logger {
 	return &Logger{writer: writer}
 }
 
-// NewAsync creates a nonblocking logger with a bounded in-memory queue.
+// NewAsync creates a nonblocking logger with a bounded in-memory queue. A nil
+// return from an event method means the entry was accepted before Close began.
 func NewAsync(writer io.Writer, capacity int) (*Logger, error) {
 	if writer == nil || capacity <= 0 {
 		return nil, errInvalidEntry
 	}
 	async := &asyncLogger{
 		entries: make(chan entry, capacity),
-		close:   make(chan struct{}, 1),
 		done:    make(chan struct{}),
 	}
 	logger := &Logger{writer: writer, async: async}
@@ -127,22 +126,24 @@ func (logger *Logger) write(value entry) error {
 		return errWriteEntry
 	}
 	if logger.async != nil {
-		if logger.async.closed.Load() || logger.async.failed.Load() {
-			logger.async.dropped.Add(1)
+		logger.async.mu.Lock()
+		defer logger.async.mu.Unlock()
+		if logger.async.closed || logger.async.failed {
+			logger.async.dropped++
 			return errDropEntry
 		}
 		select {
 		case logger.async.entries <- value:
 			return nil
 		default:
-			logger.async.dropped.Add(1)
+			logger.async.dropped++
 			return errDropEntry
 		}
 	}
 	return logger.writeEntry(value)
 }
 
-func (logger *Logger) writeEntry(value entry) error {
+func (logger *Logger) writeEntry(value entry) (err error) {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return errWriteEntry
@@ -150,6 +151,11 @@ func (logger *Logger) writeEntry(value entry) error {
 	data = append(data, '\n')
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
+	defer func() {
+		if recover() != nil {
+			err = errWriteEntry
+		}
+	}()
 	for len(data) > 0 {
 		written, err := logger.writer.Write(data)
 		if err != nil || written <= 0 || written > len(data) {
@@ -162,42 +168,34 @@ func (logger *Logger) writeEntry(value entry) error {
 
 func (logger *Logger) runAsync() {
 	defer close(logger.async.done)
-	defer func() {
-		if recover() != nil {
-			logger.async.failed.Store(true)
-		}
-	}()
-	for {
-		select {
-		case value := <-logger.async.entries:
-			if err := logger.writeEntry(value); err != nil {
-				logger.async.failed.Store(true)
-				return
+	for value := range logger.async.entries {
+		if err := logger.writeEntry(value); err != nil {
+			logger.async.mu.Lock()
+			logger.async.failed = true
+			logger.async.dropped++
+			queued := len(logger.async.entries)
+			for range queued {
+				<-logger.async.entries
+				logger.async.dropped++
 			}
-		case <-logger.async.close:
-			for {
-				select {
-				case value := <-logger.async.entries:
-					if err := logger.writeEntry(value); err != nil {
-						logger.async.failed.Store(true)
-						return
-					}
-				default:
-					return
-				}
-			}
+			logger.async.mu.Unlock()
+			return
 		}
 	}
 }
 
-// Close stops accepting entries and waits for queued entries within ctx.
+// Close atomically stops acceptance and waits for accepted entries within ctx.
+// If the sink fails, accepted but unwritten entries are included in Dropped.
 func (logger *Logger) Close(ctx context.Context) error {
 	if logger == nil || logger.async == nil {
 		return nil
 	}
-	if logger.async.closed.CompareAndSwap(false, true) {
-		logger.async.close <- struct{}{}
+	logger.async.mu.Lock()
+	if !logger.async.closed {
+		logger.async.closed = true
+		close(logger.async.entries)
 	}
+	logger.async.mu.Unlock()
 	select {
 	case <-logger.async.done:
 		return nil
@@ -206,12 +204,14 @@ func (logger *Logger) Close(ctx context.Context) error {
 	}
 }
 
-// Dropped returns the number of entries rejected after saturation or failure.
+// Dropped returns rejected entries plus accepted entries lost after sink failure.
 func (logger *Logger) Dropped() uint64 {
 	if logger == nil || logger.async == nil {
 		return 0
 	}
-	return logger.async.dropped.Load()
+	logger.async.mu.Lock()
+	defer logger.async.mu.Unlock()
+	return logger.async.dropped
 }
 
 func validTerminalState(state queue.State) bool {
