@@ -16,7 +16,7 @@ POLICY_INPUTS = (
     ".github/workflows/ci.yml",
     ".github/workflows/release.yml",
     "scripts/release-metadata.sh",
-    "scripts/check-release-tags.sh",
+    "scripts/release-state.sh",
 )
 
 
@@ -182,30 +182,76 @@ def mutate_bypass_head_check(text: str) -> str:
     )
 
 
-def immutable_step() -> str:
+def release_state_step() -> str:
     return (
-        "      - name: Reject existing immutable release tags\n"
+        "      - name: Determine release state\n"
+        "        id: release-state\n"
         "        env:\n"
         "          IMAGE: ghcr.io/${{ github.repository }}\n"
         "          VERSION: ${{ steps.release-metadata.outputs.version }}\n"
-        "        run: bash scripts/check-release-tags.sh\n"
+        "        run: bash scripts/release-state.sh\n"
     )
 
 
-def mutate_remove_immutable_check(text: str) -> str:
-    return text.replace(immutable_step(), "", 1)
+def mutate_remove_release_state(text: str) -> str:
+    return text.replace(release_state_step(), "", 1)
 
 
-def mutate_relocate_immutable_check(text: str) -> str:
-    step = immutable_step()
+def mutate_relocate_release_state(text: str) -> str:
+    step = release_state_step()
     return text.replace(step, "", 1).replace("      - name: Attest image provenance\n", step + "      - name: Attest image provenance\n", 1)
 
 
-def mutate_comment_immutable_check(text: str) -> str:
+def mutate_comment_release_state(text: str) -> str:
     return text.replace(
-        immutable_step(),
-        "      # Reject existing immutable release tags\n"
-        "      # run: bash scripts/check-release-tags.sh\n",
+        release_state_step(),
+        "      # Determine release state\n"
+        "      # run: bash scripts/release-state.sh\n",
+        1,
+    )
+
+
+def mutate_release_concurrency(text: str) -> str:
+    return text.replace("  group: release-container-image", "  group: release-${{ github.ref }}", 1)
+
+
+def mutate_add_major_minor_tag(text: str) -> str:
+    return text.replace(
+        "            type=semver,pattern={{version}},value=${{ steps.release-metadata.outputs.version }}\n",
+        "            type=semver,pattern={{version}},value=${{ steps.release-metadata.outputs.version }}\n"
+        "            type=semver,pattern={{major}}.{{minor}},value=${{ steps.release-metadata.outputs.version }}\n",
+        1,
+    )
+
+
+def mutate_unconditional_build(text: str) -> str:
+    return text.replace(
+        "        if: steps.release-state.outputs.publish == 'true'\n",
+        "",
+        1,
+    )
+
+
+def mutate_publish_output_to_build(text: str) -> str:
+    return text.replace(
+        "      digest: ${{ steps.final-digest.outputs.digest }}",
+        "      digest: ${{ steps.build.outputs.digest }}",
+        1,
+    )
+
+
+def mutate_attestation_to_build(text: str) -> str:
+    return text.replace(
+        "          subject-digest: ${{ steps.final-digest.outputs.digest }}",
+        "          subject-digest: ${{ steps.build.outputs.digest }}",
+        1,
+    )
+
+
+def mutate_summary_to_build(text: str) -> str:
+    return text.replace(
+        "          DIGEST: ${{ steps.final-digest.outputs.digest }}",
+        "          DIGEST: ${{ steps.build.outputs.digest }}",
         1,
     )
 
@@ -302,13 +348,20 @@ def main() -> None:
             run_mutant("unpinned QEMU image", ".github/workflows/release.yml", mutate_qemu_image, ref),
             run_mutant("missing checkout binding", "scripts/release-metadata.sh", mutate_remove_head_check, ref),
             run_mutant("bypassed checkout binding", "scripts/release-metadata.sh", mutate_bypass_head_check, ref),
-            run_mutant("missing immutable tag check", ".github/workflows/release.yml", mutate_remove_immutable_check, ref),
-            run_mutant("immutable tag check after push", ".github/workflows/release.yml", mutate_relocate_immutable_check, ref),
-            run_mutant("immutable tag check only in comment", ".github/workflows/release.yml", mutate_comment_immutable_check, ref),
+            run_mutant("per-tag release concurrency", ".github/workflows/release.yml", mutate_release_concurrency, ref),
+            run_mutant("mutable major.minor release tag", ".github/workflows/release.yml", mutate_add_major_minor_tag, ref),
+            run_mutant("missing release state check", ".github/workflows/release.yml", mutate_remove_release_state, ref),
+            run_mutant("release state check after push", ".github/workflows/release.yml", mutate_relocate_release_state, ref),
+            run_mutant("release state check only in comment", ".github/workflows/release.yml", mutate_comment_release_state, ref),
             run_mutant("publish validation disabled", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Validate release tag and metadata before publication", "if: false"), ref),
             run_mutant("publish validation allowed to fail", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Validate release tag and metadata before publication", "continue-on-error: true"), ref),
-            run_mutant("immutable tag check disabled", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Reject existing immutable release tags", "if: false"), ref),
-            run_mutant("immutable tag check allowed to fail", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Reject existing immutable release tags", "continue-on-error: true"), ref),
+            run_mutant("release state check disabled", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Determine release state", "if: false"), ref),
+            run_mutant("release state check allowed to fail", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Determine release state", "continue-on-error: true"), ref),
+            run_mutant("unconditional release build", ".github/workflows/release.yml", mutate_unconditional_build, ref),
+            run_mutant("conditional final digest", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Resolve final digest", "if: steps.release-state.outputs.publish == 'true'"), ref),
+            run_mutant("publish output bypasses final digest", ".github/workflows/release.yml", mutate_publish_output_to_build, ref),
+            run_mutant("attestation bypasses final digest", ".github/workflows/release.yml", mutate_attestation_to_build, ref),
+            run_mutant("summary bypasses final digest", ".github/workflows/release.yml", mutate_summary_to_build, ref),
             run_mutant("missing deterministic created label", ".github/workflows/release.yml", mutate_remove_created_label, ref),
             run_mutant("missing deterministic created annotation", ".github/workflows/release.yml", mutate_remove_created_annotation, ref),
         )

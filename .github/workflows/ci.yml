@@ -34,7 +34,7 @@ jobs:
           python3 scripts/workflow-policy-test.py
           python3 scripts/workflow-policy-regression-test.py
           bash scripts/release-metadata-test.sh
-          bash scripts/check-release-tags-test.sh
+          bash scripts/release-state-test.sh
       - name: Check formatting
         shell: bash
         run: |

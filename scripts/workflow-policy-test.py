@@ -208,7 +208,7 @@ def assert_ci(workflow: Workflow) -> None:
     require("python3 scripts/workflow-policy-test.py" in policy, "CI must run workflow policy validation")
     require("python3 scripts/workflow-policy-regression-test.py" in policy, "CI must run policy mutation tests")
     require("bash scripts/release-metadata-test.sh" in policy, "CI must test release metadata validation")
-    require("bash scripts/check-release-tags-test.sh" in policy, "CI must test immutable release tags")
+    require("bash scripts/release-state-test.sh" in policy, "CI must test recoverable release state")
     require("gofmt -l" in test_steps["Check formatting"].text, "CI formatting step must run gofmt")
     require("go vet ./..." in test_steps["Vet"].text, "CI vet step missing")
     require("go test ./..." in test_steps["Unit tests"].text, "CI unit test step missing")
@@ -238,6 +238,11 @@ def assert_release(workflow: Workflow) -> None:
     require(tag_lines == ["- 'v*'"], "release tag trigger must be exactly v*")
     require(workflow.top("permissions").values() == {"contents": "read"}, "release workflow permissions must be contents: read")
     require(
+        workflow.top("concurrency").values()
+        == {"group": "release-container-image", "cancel-in-progress": "false"},
+        "release publication must use one non-cancelling global concurrency group",
+    )
+    require(
         workflow.top("env").values()
         == {
             "ACTIONLINT_VERSION": "v1.7.12",
@@ -262,7 +267,7 @@ def assert_release(workflow: Workflow) -> None:
         "verify must validate the release tag",
     )
     policy = verify_steps["Validate workflow policy"].text
-    for command in ("actionlint .github/workflows/ci.yml .github/workflows/release.yml", "python3 scripts/workflow-policy-test.py", "python3 scripts/workflow-policy-regression-test.py", "bash scripts/release-metadata-test.sh", "bash scripts/check-release-tags-test.sh"):
+    for command in ("actionlint .github/workflows/ci.yml .github/workflows/release.yml", "python3 scripts/workflow-policy-test.py", "python3 scripts/workflow-policy-regression-test.py", "bash scripts/release-metadata-test.sh", "bash scripts/release-state-test.sh"):
         require(command in policy, f"verify policy step missing: {command}")
     required_steps = {
         "Check formatting": "gofmt -l",
@@ -297,31 +302,49 @@ def assert_release(workflow: Workflow) -> None:
     metadata = publish_steps["Generate image metadata"].text
     require("DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index" in metadata, "multi-arch annotations must cover manifest and index")
     require("flavor: latest=false" in metadata and "value=latest" not in metadata.lower(), "release must not publish latest")
-    for tag in ("type=raw,value=${{ steps.release-metadata.outputs.version }}", "type=semver,pattern={{version}},value=${{ steps.release-metadata.outputs.version }}", "type=semver,pattern={{major}}.{{minor}},value=${{ steps.release-metadata.outputs.version }}"):
+    for tag in ("type=raw,value=${{ steps.release-metadata.outputs.version }}", "type=semver,pattern={{version}},value=${{ steps.release-metadata.outputs.version }}"):
         require(tag in metadata, f"release metadata missing tag rule: {tag}")
+    require("pattern={{major}}.{{minor}}" not in metadata, "release must not publish a mutable major.minor alias")
     created = "org.opencontainers.image.created=${{ steps.release-metadata.outputs.created }}"
     require(metadata.count(created) == 2, "deterministic created metadata must override both labels and annotations")
     require(f"          labels: |\n            {created}" in metadata, "created label override is misplaced")
     require(f"          annotations: |\n            {created}" in metadata, "created annotation override is misplaced")
-    immutable_name = "Reject existing immutable release tags"
-    immutable = publish_steps[immutable_name]
-    assert_required_step(immutable, "bash scripts/check-release-tags.sh", "publish must reject existing immutable tags")
+    state_name = "Determine release state"
+    state = publish_steps[state_name]
+    assert_required_step(state, "bash scripts/release-state.sh", "publish must determine recoverable release state")
+    require(state.values().get("id") == "release-state", "release state step must expose outputs")
     require(
-        immutable.child("env").values()
+        state.child("env").values()
         == {
             "IMAGE": "ghcr.io/${{ github.repository }}",
             "VERSION": "${{ steps.release-metadata.outputs.version }}",
         },
-        "immutable tag check inputs are invalid",
+        "release state inputs are invalid",
     )
-    require(names.index("Generate image metadata") < names.index(immutable_name) < names.index("Build and push image"), "immutable tag check must run after metadata and before push")
-    build = publish_steps["Build and push image"].text
+    require(names.index("Generate image metadata") < names.index(state_name) < names.index("Build and push image"), "release state must be determined after metadata and before push")
+    build_step = publish_steps["Build and push image"]
+    require("        if: steps.release-state.outputs.publish == 'true'" in build_step.lines, "build and push must run only for an unpublished release")
+    build = build_step.text
     for value in ("platforms: linux/amd64,linux/arm64", "push: true", "VERSION=${{ steps.release-metadata.outputs.version }}", "REVISION=${{ github.sha }}", "CREATED=${{ steps.release-metadata.outputs.created }}", "sbom: true", "provenance: mode=max"):
         require(value in build, f"publish build missing: {value}")
+    final_digest = publish_steps["Resolve final digest"]
+    require("if" not in final_digest.values(), "final digest resolution must always run after release state succeeds")
+    require(final_digest.values().get("id") == "final-digest", "final digest step must expose its verified digest")
+    for value in (
+        "PUBLISH: ${{ steps.release-state.outputs.publish }}",
+        "EXISTING_DIGEST: ${{ steps.release-state.outputs.digest }}",
+        "BUILT_DIGEST: ${{ steps.build.outputs.digest }}",
+        "printf 'digest=%s\\n' \"$digest\" >> \"$GITHUB_OUTPUT\"",
+        "^sha256:[0-9a-f]{64}$",
+    ):
+        require(value in final_digest.text, f"final digest resolution missing: {value}")
+    require(names.index("Build and push image") < names.index("Resolve final digest") < names.index("Attest image provenance"), "final digest must be resolved after the optional build and before attestation")
+    require(publish.child("outputs").values() == {"digest": "${{ steps.final-digest.outputs.digest }}"}, "publish output must use the verified final digest")
     attest = publish_steps["Attest image provenance"].text
-    for value in ("subject-name: ghcr.io/${{ github.repository }}", "subject-digest: ${{ steps.build.outputs.digest }}", "push-to-registry: true", "create-storage-record: false"):
+    for value in ("subject-name: ghcr.io/${{ github.repository }}", "subject-digest: ${{ steps.final-digest.outputs.digest }}", "push-to-registry: true", "create-storage-record: false"):
         require(value in attest, f"attestation missing: {value}")
     summary = publish_steps["Summarize release"].text
+    require("DIGEST: ${{ steps.final-digest.outputs.digest }}" in summary, "release summary must use the verified final digest")
     require("GITHUB_STEP_SUMMARY" in summary and "Package visibility is not controlled by this workflow" in summary, "release summary is incomplete")
 
 
