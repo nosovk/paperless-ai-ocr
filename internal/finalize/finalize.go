@@ -237,6 +237,9 @@ func (finalizer *Finalizer) process(ctx context.Context, job queue.Job, result w
 	if err != nil {
 		return &admissionError{cause: err}
 	}
+	if state.Dispatch == queue.DispatchReserved {
+		return &ambiguousDispatchError{}
+	}
 	stage := state.Stage
 	documentID, err := safeDocumentID(job.DocumentID)
 	if err != nil {
@@ -286,9 +289,6 @@ func (finalizer *Finalizer) process(ctx context.Context, job queue.Job, result w
 		stage = queue.FinalizationFailedTagRemoved
 	}
 	if stage == queue.FinalizationFailedTagRemoved {
-		if state.Dispatch == queue.DispatchReserved {
-			return &ambiguousDispatchError{}
-		}
 		if state.Dispatch == queue.DispatchNone {
 			if err := finalizer.options.Store.SetDispatchStateContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, queue.DispatchNone, queue.DispatchReserved); err != nil {
 				return err

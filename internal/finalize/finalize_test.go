@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -186,6 +187,32 @@ func TestProcessDoesNotRepeatAmbiguousDispatch(t *testing.T) {
 	assertSafeError(t, err, saferr.CategoryProvider)
 	if slices.Contains(fixture.trace.snapshot(), "dispatch") || slices.Contains(fixture.trace.snapshot(), "retry") {
 		t.Errorf("ambiguous dispatch was repeated or retried: %q", fixture.trace.snapshot())
+	}
+}
+
+func TestProcessReservedDispatchPreemptsChangedChecksumWithoutPaperlessCall(t *testing.T) {
+	fixture := newFixture(t, queue.FinalizationFailedTagRemoved)
+	fixture.store.dispatch = queue.DispatchReserved
+	fixture.paperless.document.Checksum = "changed-secret-checksum"
+
+	err := fixture.finalizer.Process(context.Background(), fixture.job, fixture.result)
+	assertSafeError(t, err, saferr.CategoryProvider)
+	if got, want := fixture.store.failedDiagnostic, (queue.SafeDiagnostic{
+		Category: saferr.CategoryProvider,
+		Message:  uncertainDispatchDiagnostic,
+	}); got != want {
+		t.Errorf("failed diagnostic = %+v, want %+v", got, want)
+	}
+	trace := fixture.trace.snapshot()
+	if slices.Contains(trace, "get-document") || slices.Contains(trace, "update-content") ||
+		slices.ContainsFunc(trace, func(value string) bool {
+			return strings.HasPrefix(value, "ensure-tag:") || strings.HasPrefix(value, "update-tags:")
+		}) ||
+		slices.Contains(trace, "dispatch") {
+		t.Errorf("reserved dispatch performed Paperless effect: %q", trace)
+	}
+	if !slices.Equal(trace, []string{"renew", "stage", "fail"}) {
+		t.Errorf("trace = %q, want admission then terminal failure", trace)
 	}
 }
 
@@ -398,6 +425,7 @@ type fakeStore struct {
 	admissionToken   string
 	admissionAttempt int
 	failCheckpoint   queue.FinalizationStage
+	failedDiagnostic queue.SafeDiagnostic
 }
 
 func (store *fakeStore) RenewLeaseContext(context.Context, int64, int, string, time.Duration) error {
@@ -449,8 +477,9 @@ func (store *fakeStore) CompleteContext(context.Context, int64, int, string) err
 	return nil
 }
 
-func (store *fakeStore) FailContext(context.Context, int64, int, string, queue.SafeDiagnostic) error {
+func (store *fakeStore) FailContext(_ context.Context, _ int64, _ int, _ string, diagnostic queue.SafeDiagnostic) error {
 	store.trace.add("fail")
+	store.failedDiagnostic = diagnostic
 	return nil
 }
 
