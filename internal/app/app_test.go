@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
 	"github.com/nosovk/paperless-ai-ocr/internal/reconcile"
 	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
+	"github.com/nosovk/paperless-ai-ocr/internal/securelog"
 	"github.com/nosovk/paperless-ai-ocr/internal/server"
 	"github.com/nosovk/paperless-ai-ocr/internal/worker"
 )
@@ -90,6 +92,64 @@ func TestRunStartupOrderAndReadiness(t *testing.T) {
 		t.Fatal("readiness remained true after shutdown")
 	}
 	runtime.assertOrder(t, "cancel", "close")
+}
+
+func TestRunLogsOnlySafeLifecycleAndJobFields(t *testing.T) {
+	const (
+		documentID = int64(424242)
+		checksum   = "CANARY-source-checksum"
+		owner      = "CANARY-lease-owner"
+		model      = "CANARY-model-name"
+		content    = "CANARY-transcription-output"
+	)
+	var logs bytes.Buffer
+	ctx, cancel := context.WithCancelCause(context.Background())
+	runtime := &fakeRuntime{
+		events: make(chan string, 16),
+		claimResults: []claimResult{{job: queue.Job{
+			ID: 1, DocumentID: documentID, SourceChecksum: checksum, Attempts: 1,
+			LeaseOwner: owner, Model: model, State: queue.StateProcessing,
+		}, ok: true}},
+	}
+	runtime.process = func(context.Context, queue.Job) (worker.Result, error) {
+		defer cancel(context.Canceled)
+		return worker.Result{DocumentID: documentID, Content: content, SourceChecksum: checksum}, nil
+	}
+	options := testOptions(t, runtime)
+	options.Logger = securelog.New(&logs)
+	if err := Run(ctx, options); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	output := logs.String()
+	for _, want := range []string{
+		`"event":"startup"`, `"event":"ready"`, `"event":"job_claimed"`,
+		`"document_id":424242`, `"event":"job_finished"`, `"state":"completed"`,
+		`"event":"shutdown"`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs missing %q: %s", want, output)
+		}
+	}
+	for _, canary := range []string{checksum, owner, model, content} {
+		if strings.Contains(output, canary) {
+			t.Errorf("logs disclosed %q: %s", canary, output)
+		}
+	}
+}
+
+func TestRunLogsOnlySafeBackgroundFailureCategory(t *testing.T) {
+	const canary = "CANARY private reconciliation body and token"
+	var logs bytes.Buffer
+	runtime := &fakeRuntime{events: make(chan string, 16), reconcileErr: errors.New(canary)}
+	options := testOptions(t, runtime)
+	options.Logger = securelog.New(&logs)
+	if err := Run(context.Background(), options); err != errBackground {
+		t.Fatalf("Run() error = %v, want background sentinel", err)
+	}
+	if output := logs.String(); !strings.Contains(output, `"event":"background_failure","category":"internal"`) || strings.Contains(output, canary) {
+		t.Fatalf("logs = %s", output)
+	}
 }
 
 func TestRunInitialReconciliationFailureNeverBecomesReady(t *testing.T) {

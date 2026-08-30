@@ -60,7 +60,7 @@ func TestDevelopmentCommandBehavior(t *testing.T) {
 		if got := stdout.String(); got != "" {
 			t.Errorf("stdout = %q, want empty", got)
 		}
-		if got, want := stderr.String(), "paperless-ai-ocr: startup failed\n"; got != want {
+		if got, want := stderr.String(), "{\"level\":\"error\",\"event\":\"background_failure\",\"category\":\"configuration\"}\n"; got != want {
 			t.Errorf("stderr = %q, want %q", got, want)
 		}
 	})

@@ -1257,8 +1257,8 @@ func TestCallerRedirectPolicyIsPreserved(t *testing.T) {
 
 	_, err := client.GetDocument(context.Background(), 1)
 	assertPaperlessError(t, err)
-	if !errors.Is(err, callerErr) {
-		t.Errorf("errors.Is(error, caller error) = false")
+	if errors.Is(err, callerErr) {
+		t.Errorf("errors.Is(error, caller error) = true")
 	}
 	if got, want := policyCalls.Load(), int32(1); got != want {
 		t.Errorf("caller policy calls = %d, want %d", got, want)

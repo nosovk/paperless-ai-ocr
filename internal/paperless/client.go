@@ -121,7 +121,7 @@ func (client *Client) Ping(ctx context.Context) error {
 	}
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return paperlessError("ping", err)
+		return paperlessHTTPError("ping", err)
 	}
 	defer response.Body.Close()
 	drainLimit(response.Body, pingDrainBytes)
@@ -236,7 +236,7 @@ func (client *Client) DownloadOriginal(ctx context.Context, documentID int, dest
 	}
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return paperlessError("download original", err)
+		return paperlessHTTPError("download original", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
@@ -246,12 +246,12 @@ func (client *Client) DownloadOriginal(ctx context.Context, documentID int, dest
 
 	written, err := io.CopyBuffer(destination, io.LimitReader(response.Body, client.maxDownloadBytes), make([]byte, downloadBufferBytes))
 	if err != nil {
-		return paperlessError("download original", err)
+		return paperlessHTTPError("download original", err)
 	}
 	var probe [1]byte
 	probeBytes, probeErr := response.Body.Read(probe[:])
 	if probeErr != nil && !errors.Is(probeErr, io.EOF) {
-		return paperlessError("download original", probeErr)
+		return paperlessHTTPError("download original", probeErr)
 	}
 	if written == client.maxDownloadBytes && probeBytes != 0 {
 		return paperlessError("download original", errors.New("download response exceeded limit"))
@@ -420,7 +420,7 @@ func (client *Client) doJSON(ctx context.Context, operation, method string, endp
 	}
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return paperlessError(operation, err)
+		return paperlessHTTPError(operation, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
@@ -432,7 +432,7 @@ func (client *Client) doJSON(ctx context.Context, operation, method string, endp
 		return nil
 	}
 	if err := decodeLimitedJSON(response.Body, client.maxJSONResponseBytes, responseBody); err != nil {
-		return paperlessError(operation, err)
+		return paperlessHTTPError(operation, err)
 	}
 	return nil
 }
@@ -593,6 +593,20 @@ func drainLimit(reader io.Reader, limit int64) {
 
 func paperlessError(operation string, cause error) error {
 	return saferr.Wrap(saferr.CategoryPaperless, operation+" failed", cause)
+}
+
+func paperlessHTTPError(operation string, cause error) error {
+	if errors.Is(cause, context.Canceled) {
+		return saferr.Wrap(saferr.CategoryPaperless, operation+" failed", context.Canceled)
+	}
+	if errors.Is(cause, context.DeadlineExceeded) {
+		return saferr.Wrap(saferr.CategoryPaperless, operation+" failed", context.DeadlineExceeded)
+	}
+	var statusError *StatusError
+	if errors.As(cause, &statusError) {
+		return saferr.Wrap(saferr.CategoryPaperless, operation+" failed", statusError)
+	}
+	return saferr.New(saferr.CategoryPaperless, operation+" failed")
 }
 
 func defaultValue[T time.Duration | int64 | int](value, fallback T) T {

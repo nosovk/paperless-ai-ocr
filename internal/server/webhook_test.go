@@ -136,6 +136,27 @@ func TestWebhookRejectsUnauthorizedRequestsUniformly(t *testing.T) {
 	}
 }
 
+func TestWebhookAuthenticatesBeforeReadingBody(t *testing.T) {
+	enqueuer := &spyEnqueuer{}
+	body := &readTrackingBody{}
+	request := httptest.NewRequest(http.MethodPost, "/webhooks/paperless", nil)
+	request.Body = body
+	request.Header.Set("Authorization", "Bearer wrong-CANARY-token")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	newTestMux(t, testToken, enqueuer).ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	if body.reads != 0 {
+		t.Errorf("body reads = %d, want 0", body.reads)
+	}
+	if calls := enqueuer.snapshot(); len(calls) != 0 {
+		t.Errorf("enqueue calls = %v, want none", calls)
+	}
+}
+
 func TestWebhookAcceptsCaseInsensitiveBearerScheme(t *testing.T) {
 	enqueuer := &spyEnqueuer{}
 	response := performWebhook(t, newTestMux(t, testToken, enqueuer), "bEaReR "+testToken, "application/json; charset=utf-8", `{"document_id":123}`)
@@ -391,4 +412,42 @@ func assertCandidate(t *testing.T, db *sql.DB, documentID int64, priority queue.
 	if gotCount != count || gotPriority != priority {
 		t.Errorf("candidate = (count %d, priority %d), want (%d, %d)", gotCount, gotPriority, count, priority)
 	}
+}
+
+func FuzzWebhookPayload(f *testing.F) {
+	for _, seed := range []string{
+		`{"document_id":1}`,
+		`{"document_id":1,"document_id":2}`,
+		`{"document_id":1,"unknown":"CANARY"}`,
+		`{"document_id":1}{}`,
+		"{\xff}",
+		`{"document_id":1,"padding":"` + strings.Repeat("x", 4096) + `"}`,
+	} {
+		f.Add(seed, true)
+		f.Add(seed, false)
+	}
+	f.Fuzz(func(t *testing.T, body string, authorized bool) {
+		if len(body) > maxWebhookBodyBytes*2 {
+			body = body[:maxWebhookBodyBytes*2]
+		}
+		enqueuer := &spyEnqueuer{}
+		authorization := "Bearer wrong-token"
+		if authorized {
+			authorization = "Bearer " + testToken
+		}
+		response := performWebhook(t, newTestMux(t, testToken, enqueuer), authorization, "application/json", body)
+		validStatus := map[int]bool{
+			http.StatusAccepted: true, http.StatusBadRequest: true, http.StatusUnauthorized: true,
+			http.StatusRequestEntityTooLarge: true,
+		}
+		if !validStatus[response.Code] {
+			t.Fatalf("status = %d for %q", response.Code, body)
+		}
+		if strings.Contains(body, "CANARY") && (strings.Contains(response.Body.String(), "CANARY") || strings.Contains(response.Header().Get("WWW-Authenticate"), "CANARY")) {
+			t.Fatalf("response disclosed marked input %q", body)
+		}
+		if !authorized && len(enqueuer.snapshot()) != 0 {
+			t.Fatal("unauthorized request enqueued")
+		}
+	})
 }

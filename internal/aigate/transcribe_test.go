@@ -688,3 +688,38 @@ func socketError(cause error) error {
 		Err:    cause,
 	}
 }
+
+func FuzzProviderResponse(f *testing.F) {
+	for _, seed := range []string{
+		`{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"pages\":[]}"}]}]}`,
+		`{"output":[{"type":"message","content":[{"type":"refusal","refusal":"CANARY"}]}]}`,
+		`{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].file_data"}}`,
+		`{"output":[]} {}`,
+		"{\xff}",
+	} {
+		f.Add(seed, http.StatusOK)
+		f.Add(seed, http.StatusBadRequest)
+	}
+	f.Fuzz(func(t *testing.T, responseBody string, statusCode int) {
+		if len(responseBody) > 1<<16 {
+			responseBody = responseBody[:1<<16]
+		}
+		if statusCode < 100 || statusCode > 599 {
+			statusCode = http.StatusBadRequest
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.WriteHeader(statusCode)
+			_, _ = io.WriteString(writer, responseBody)
+		}))
+		defer server.Close()
+		client := newTestClient(t, server.URL+"/v1", "key", "model", ClientOptions{})
+		_, err := client.Transcribe(context.Background(), Transcription{Capability: DirectPDF, FirstPage: 1, LastPage: 1, PDF: []byte{1}})
+		if err != nil {
+			for _, formatted := range []string{err.Error(), fmt.Sprintf("%v", err), fmt.Sprintf("%+v", err), fmt.Sprintf("%q", err)} {
+				if strings.Contains(responseBody, "CANARY") && strings.Contains(formatted, "CANARY") {
+					t.Fatalf("error disclosed marked provider response %q", formatted)
+				}
+			}
+		}
+	})
+}

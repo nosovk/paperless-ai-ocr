@@ -16,6 +16,8 @@ import (
 	"github.com/nosovk/paperless-ai-ocr/internal/buildinfo"
 	"github.com/nosovk/paperless-ai-ocr/internal/config"
 	"github.com/nosovk/paperless-ai-ocr/internal/observability"
+	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
+	"github.com/nosovk/paperless-ai-ocr/internal/securelog"
 	"github.com/nosovk/paperless-ai-ocr/internal/server"
 )
 
@@ -41,22 +43,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 		)
 		return 0
 	}
+	logger := securelog.New(stderr)
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintln(stderr, "paperless-ai-ocr: startup failed")
+		_ = logger.BackgroundFailure(saferr.CategoryConfiguration)
 		return 1
 	}
 	readiness := server.NewReadiness()
 	metrics := observability.NewMetrics()
 	service, err := app.NewService(cfg, readiness, metrics)
 	if err != nil {
-		fmt.Fprintln(stderr, "paperless-ai-ocr: startup failed")
+		_ = logger.BackgroundFailure(saferr.CategoryInternal)
 		return 1
 	}
 	listener, err := net.Listen("tcp", ":"+strconv.Itoa(cfg.HTTPPort))
 	if err != nil {
 		_ = service.Runtime.Close()
-		fmt.Fprintln(stderr, "paperless-ai-ocr: startup failed")
+		_ = logger.BackgroundFailure(saferr.CategoryInternal)
 		return 1
 	}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -65,11 +68,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		Runtime: service.Runtime, Readiness: readiness, Metrics: metrics, Listener: listener,
 		HTTPServer: productionHTTPServer(service.Handler), Handler: service.Handler,
 		PollInterval: cfg.PollInterval, IdleInterval: app.DefaultIdleInterval(),
+		Logger: logger,
 	})
 	stop()
 	<-signalStopped
 	if err != nil {
-		fmt.Fprintln(stderr, "paperless-ai-ocr: runtime failed")
 		return 1
 	}
 	return 0

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -26,6 +27,7 @@ import (
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
 	"github.com/nosovk/paperless-ai-ocr/internal/reconcile"
 	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
+	"github.com/nosovk/paperless-ai-ocr/internal/securelog"
 	"github.com/nosovk/paperless-ai-ocr/internal/server"
 	"github.com/nosovk/paperless-ai-ocr/internal/worker"
 )
@@ -73,6 +75,7 @@ type Options struct {
 	PollInterval    time.Duration
 	IdleInterval    time.Duration
 	ShutdownTimeout time.Duration
+	Logger          *securelog.Logger
 }
 
 // Service contains the concrete production runtime and HTTP handler.
@@ -278,6 +281,12 @@ func Run(parent context.Context, options Options) error {
 	if shutdownTimeout < 0 {
 		return saferr.New(saferr.CategoryConfiguration, "invalid application configuration")
 	}
+	if options.Logger == nil {
+		options.Logger = securelog.New(io.Discard)
+	}
+	if err := options.Logger.Startup(); err != nil {
+		return saferr.New(saferr.CategoryInternal, "logging failed")
+	}
 	options.Metrics.SetQueueDepthCollector(options.Runtime.QueueDepth)
 
 	ctx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
@@ -318,6 +327,7 @@ func Run(parent context.Context, options Options) error {
 	var loops sync.WaitGroup
 	background := func(err error) {
 		if err != nil && ctx.Err() == nil {
+			_ = options.Logger.BackgroundFailure(errorCategory(err))
 			options.Readiness.Set(false)
 			cancel(errBackground)
 		}
@@ -334,6 +344,11 @@ func Run(parent context.Context, options Options) error {
 	}
 	if startupErr == nil && ctx.Err() == nil {
 		options.Readiness.Set(true)
+		if err := options.Logger.Ready(); err != nil {
+			background(err)
+		}
+	}
+	if startupErr == nil && ctx.Err() == nil {
 		loops.Add(2)
 		go func() {
 			defer loops.Done()
@@ -346,6 +361,7 @@ func Run(parent context.Context, options Options) error {
 	}
 
 	if startupErr != nil {
+		_ = options.Logger.BackgroundFailure(errorCategory(startupErr))
 		cancel(saferr.New(saferr.CategoryInternal, "startup failed"))
 	} else if ctx.Err() == nil {
 		select {
@@ -416,6 +432,9 @@ func Run(parent context.Context, options Options) error {
 	}
 	if releaseErr != nil || shutdownErr != nil || closeErr != nil {
 		return saferr.New(saferr.CategoryInternal, "shutdown failed")
+	}
+	if err := options.Logger.Shutdown(); err != nil {
+		return saferr.New(saferr.CategoryInternal, "logging failed")
 	}
 	return nil
 }
@@ -497,16 +516,26 @@ func workerLoop(ctx context.Context, options Options, activeMu *sync.Mutex, acti
 		activeMu.Lock()
 		*active = job
 		activeMu.Unlock()
+		started := time.Now()
+		if job.DocumentID > 0 {
+			if err := options.Logger.JobClaimed(job.DocumentID); err != nil {
+				background(err)
+				return
+			}
+		}
 		result, processErr := options.Runtime.Process(ctx, job)
+		var outcomeState queue.State
 		if processErr == nil {
 			processErr = options.Runtime.FinalizeSuccess(ctx, job, result)
 			if processErr == nil {
 				options.Metrics.RecordJobOutcome(observability.OutcomeSuccess)
+				outcomeState = queue.StateCompleted
 			}
 		} else if options.Runtime.Terminal(ctx, job, processErr) {
 			processErr = options.Runtime.FinalizeFailure(ctx, job)
 			if processErr == nil {
 				options.Metrics.RecordJobOutcome(observability.OutcomeFailure)
+				outcomeState = queue.StateFailed
 			}
 		}
 		settled := processErr == nil
@@ -515,6 +544,7 @@ func workerLoop(ctx context.Context, options Options, activeMu *sync.Mutex, acti
 			settled = err == nil && found && terminalState(state)
 			if settled && state == queue.StateRetry {
 				options.Metrics.RecordRetry()
+				outcomeState = queue.StateRetry
 			}
 			if ctx.Err() == nil && !settled {
 				background(processErr)
@@ -522,6 +552,12 @@ func workerLoop(ctx context.Context, options Options, activeMu *sync.Mutex, acti
 			}
 		}
 		if settled {
+			if job.DocumentID > 0 && outcomeState != "" {
+				if err := options.Logger.JobFinished(job.DocumentID, outcomeState, time.Since(started)); err != nil {
+					background(err)
+					return
+				}
+			}
 			activeMu.Lock()
 			*active = queue.Job{}
 			activeMu.Unlock()
@@ -533,6 +569,14 @@ func workerLoop(ctx context.Context, options Options, activeMu *sync.Mutex, acti
 			return
 		}
 	}
+}
+
+func errorCategory(err error) saferr.Category {
+	var safeError *saferr.Error
+	if errors.As(err, &safeError) {
+		return safeError.Category()
+	}
+	return saferr.CategoryInternal
 }
 
 func wait(ctx context.Context, duration time.Duration) bool {
