@@ -2,12 +2,14 @@ package securelog
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,16 +66,15 @@ func TestLoggerRejectsInvalidTypedValuesWithoutWriting(t *testing.T) {
 	var output bytes.Buffer
 	logger := New(&output)
 	for name, call := range map[string]func() error{
-		"document ID": func() error { return logger.JobClaimed(0) },
-		"page range":  func() error { return logger.BatchCompleted(1, 0, 2, time.Second) },
-		"page span":   func() error { return logger.BatchCompleted(1, 1, 6, time.Second) },
-		"page bound":  func() error { return logger.BatchCompleted(1, 10_001, 10_001, time.Second) },
-		"duration":    func() error { return logger.JobFinished(1, queue.StateCompleted, -1) },
-		"duration bound": func() error {
-			return logger.JobFinished(1, queue.StateCompleted, 24*time.Hour+time.Nanosecond)
-		},
-		"state":    func() error { return logger.JobFinished(1, queue.State("completed\nCANARY"), time.Second) },
-		"category": func() error { return logger.BackgroundFailure(saferr.Category("provider\nCANARY")) },
+		"document ID":        func() error { return logger.JobClaimed(0) },
+		"page range":         func() error { return logger.BatchCompleted(1, 0, 2, time.Second) },
+		"page span":          func() error { return logger.BatchCompleted(1, 1, 6, time.Second) },
+		"page bound":         func() error { return logger.BatchCompleted(1, 10_001, 10_001, time.Second) },
+		"duration":           func() error { return logger.JobFinished(1, queue.StateCompleted, -1) },
+		"pending outcome":    func() error { return logger.JobFinished(1, queue.StatePending, time.Second) },
+		"processing outcome": func() error { return logger.JobFinished(1, queue.StateProcessing, time.Second) },
+		"state":              func() error { return logger.JobFinished(1, queue.State("completed\nCANARY"), time.Second) },
+		"category":           func() error { return logger.BackgroundFailure(saferr.Category("provider\nCANARY")) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := call(); err == nil || strings.Contains(err.Error(), "CANARY") {
@@ -83,6 +84,18 @@ func TestLoggerRejectsInvalidTypedValuesWithoutWriting(t *testing.T) {
 	}
 	if output.Len() != 0 {
 		t.Fatalf("invalid entries wrote %q", output.String())
+	}
+}
+
+func TestLoggerAcceptsLongDuration(t *testing.T) {
+	var output bytes.Buffer
+	logger := New(&output)
+	duration := 72*time.Hour + 123*time.Millisecond
+	if err := logger.JobFinished(1, queue.StateCompleted, duration); err != nil {
+		t.Fatalf("JobFinished() error = %v", err)
+	}
+	if !strings.Contains(output.String(), `"duration_ms":259200123`) {
+		t.Fatalf("log = %q, want long duration", output.String())
 	}
 }
 
@@ -140,6 +153,111 @@ func TestLoggerRejectsShortWrite(t *testing.T) {
 	}
 }
 
+func TestAsyncLoggerCallsAreNonblockingAndDropsWhenFull(t *testing.T) {
+	writer := newBlockingWriter()
+	logger, err := NewAsync(writer, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.unblock()
+	if err := logger.Startup(); err != nil {
+		t.Fatal(err)
+	}
+	writer.waitStarted(t)
+	if err := logger.Ready(); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if err := logger.JobClaimed(1); err == nil {
+		t.Fatal("saturated logger error = nil")
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("saturated logger blocked for %s", elapsed)
+	}
+	if logger.Dropped() == 0 {
+		t.Fatal("drop count = 0")
+	}
+}
+
+func TestAsyncLoggerPoisonedSinkDropsFurtherEntries(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		writer io.Writer
+	}{
+		{name: "error", writer: errorWriter{err: errors.New("CANARY writer secret")}},
+		{name: "short write", writer: &shortThenRecordWriter{}},
+		{name: "panic", writer: panicWriter{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			logger, err := NewAsync(test.writer, 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = logger.Startup()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := logger.Close(ctx); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+			if err := logger.Ready(); err == nil {
+				t.Fatal("poisoned/closed logger accepted entry")
+			}
+			if logger.Dropped() == 0 {
+				t.Fatal("drop count = 0")
+			}
+		})
+	}
+}
+
+func TestAsyncLoggerConcurrentCallsProduceCompleteLines(t *testing.T) {
+	var output lockedBuffer
+	logger, err := NewAsync(&output, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wait sync.WaitGroup
+	for documentID := int64(1); documentID <= 100; documentID++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			_ = logger.JobClaimed(documentID)
+		}()
+	}
+	wait.Wait()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := logger.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("invalid JSON line %q", line)
+		}
+	}
+}
+
+func TestAsyncLoggerCloseIsBoundedByContext(t *testing.T) {
+	writer := newBlockingWriter()
+	logger, err := NewAsync(writer, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.Startup(); err != nil {
+		t.Fatal(err)
+	}
+	writer.waitStarted(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if err := logger.Close(ctx); err == nil {
+		t.Fatal("Close() error = nil")
+	}
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("Close() blocked for %s", elapsed)
+	}
+	writer.unblock()
+}
+
 type errorWriter struct{ err error }
 
 func (writer errorWriter) Write([]byte) (int, error) { return 0, writer.err }
@@ -147,3 +265,66 @@ func (writer errorWriter) Write([]byte) (int, error) { return 0, writer.err }
 type shortWriter struct{}
 
 func (shortWriter) Write(data []byte) (int, error) { return len(data) - 1, nil }
+
+type blockingWriter struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingWriter() *blockingWriter {
+	return &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (writer *blockingWriter) Write(data []byte) (int, error) {
+	writer.once.Do(func() { close(writer.started) })
+	<-writer.release
+	return len(data), nil
+}
+
+func (writer *blockingWriter) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start")
+	}
+}
+
+func (writer *blockingWriter) unblock() {
+	select {
+	case <-writer.release:
+	default:
+		close(writer.release)
+	}
+}
+
+type panicWriter struct{}
+
+func (panicWriter) Write([]byte) (int, error) { panic("CANARY writer panic") }
+
+type shortThenRecordWriter struct{ calls atomic.Int64 }
+
+func (writer *shortThenRecordWriter) Write(data []byte) (int, error) {
+	if writer.calls.Add(1) == 1 {
+		return len(data) / 2, errors.New("CANARY short write")
+	}
+	return len(data), nil
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (buffer *lockedBuffer) Write(data []byte) (int, error) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.Buffer.Write(data)
+}
+
+func (buffer *lockedBuffer) String() string {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.Buffer.String()
+}

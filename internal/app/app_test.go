@@ -152,6 +152,51 @@ func TestRunLogsOnlySafeBackgroundFailureCategory(t *testing.T) {
 	}
 }
 
+func TestRunIgnoresBlockedLoggerDuringShutdownAndLeaseSettlement(t *testing.T) {
+	started := make(chan struct{})
+	writer := newBlockingLogWriter()
+	logger, err := securelog.NewAsync(writer, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{
+		events:            make(chan string, 16),
+		claimResults:      []claimResult{{job: queue.Job{ID: 7, DocumentID: 42, Attempts: 2, LeaseOwner: "owner", State: queue.StateProcessing}, ok: true}},
+		state:             queue.StateProcessing,
+		stateFound:        true,
+		releaseOK:         true,
+		stateAfterRelease: queue.StateRetry,
+		process: func(ctx context.Context, _ queue.Job) (worker.Result, error) {
+			close(started)
+			<-ctx.Done()
+			return worker.Result{}, ctx.Err()
+		},
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		options := testOptions(t, runtime)
+		options.Logger = logger
+		options.ShutdownTimeout = 50 * time.Millisecond
+		done <- Run(ctx, options)
+	}()
+	writer.waitStarted(t)
+	<-started
+	cancel(context.Canceled)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run() blocked on logger")
+	}
+	if runtime.released.ID != 7 || !runtime.closed {
+		t.Fatalf("release/close = (%+v, %t)", runtime.released, runtime.closed)
+	}
+	writer.unblock()
+}
+
 func TestRunInitialReconciliationFailureNeverBecomesReady(t *testing.T) {
 	readiness := server.NewReadiness()
 	runtime := &fakeRuntime{
@@ -695,3 +740,36 @@ func newTestListener(t *testing.T) net.Listener {
 }
 
 var _ = httptest.NewRecorder
+
+type blockingLogWriter struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingLogWriter() *blockingLogWriter {
+	return &blockingLogWriter{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (writer *blockingLogWriter) Write(data []byte) (int, error) {
+	writer.once.Do(func() { close(writer.started) })
+	<-writer.release
+	return len(data), nil
+}
+
+func (writer *blockingLogWriter) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("logger writer did not start")
+	}
+}
+
+func (writer *blockingLogWriter) unblock() {
+	select {
+	case <-writer.release:
+	default:
+		close(writer.release)
+	}
+}

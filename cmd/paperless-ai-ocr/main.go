@@ -30,20 +30,34 @@ const (
 	readTimeout       = 10 * time.Second
 	writeTimeout      = 10 * time.Second
 	idleTimeout       = 60 * time.Second
+	logQueueCapacity  = 256
+	logCloseTimeout   = 100 * time.Millisecond
 )
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "--version" {
 		metadata := buildinfo.Current()
-		fmt.Fprintf(stdout,
+		if _, err := fmt.Fprintf(stdout,
 			"paperless-ai-ocr version=%s revision=%s build_time=%s\n",
 			metadata.Version,
 			metadata.Revision,
 			metadata.BuildTime,
-		)
+		); err != nil {
+			_, _ = io.WriteString(stderr, "paperless-ai-ocr: output failed\n")
+			return 1
+		}
 		return 0
 	}
-	logger := securelog.New(stderr)
+	logger, err := securelog.NewAsync(stderr, logQueueCapacity)
+	if err != nil {
+		_, _ = io.WriteString(stderr, "paperless-ai-ocr: logging initialization failed\n")
+		return 1
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), logCloseTimeout)
+		defer cancel()
+		_ = logger.Close(ctx)
+	}()
 	cfg, err := config.Load()
 	if err != nil {
 		_ = logger.BackgroundFailure(saferr.CategoryConfiguration)

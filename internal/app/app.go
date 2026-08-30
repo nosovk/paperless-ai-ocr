@@ -284,9 +284,7 @@ func Run(parent context.Context, options Options) error {
 	if options.Logger == nil {
 		options.Logger = securelog.New(io.Discard)
 	}
-	if err := options.Logger.Startup(); err != nil {
-		return saferr.New(saferr.CategoryInternal, "logging failed")
-	}
+	_ = options.Logger.Startup()
 	options.Metrics.SetQueueDepthCollector(options.Runtime.QueueDepth)
 
 	ctx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
@@ -344,9 +342,7 @@ func Run(parent context.Context, options Options) error {
 	}
 	if startupErr == nil && ctx.Err() == nil {
 		options.Readiness.Set(true)
-		if err := options.Logger.Ready(); err != nil {
-			background(err)
-		}
+		_ = options.Logger.Ready()
 	}
 	if startupErr == nil && ctx.Err() == nil {
 		loops.Add(2)
@@ -433,9 +429,8 @@ func Run(parent context.Context, options Options) error {
 	if releaseErr != nil || shutdownErr != nil || closeErr != nil {
 		return saferr.New(saferr.CategoryInternal, "shutdown failed")
 	}
-	if err := options.Logger.Shutdown(); err != nil {
-		return saferr.New(saferr.CategoryInternal, "logging failed")
-	}
+	_ = options.Logger.Shutdown()
+	_ = options.Logger.Close(shutdownCtx)
 	return nil
 }
 
@@ -518,10 +513,7 @@ func workerLoop(ctx context.Context, options Options, activeMu *sync.Mutex, acti
 		activeMu.Unlock()
 		started := time.Now()
 		if job.DocumentID > 0 {
-			if err := options.Logger.JobClaimed(job.DocumentID); err != nil {
-				background(err)
-				return
-			}
+			_ = options.Logger.JobClaimed(job.DocumentID)
 		}
 		result, processErr := options.Runtime.Process(ctx, job)
 		var outcomeState queue.State
@@ -553,10 +545,7 @@ func workerLoop(ctx context.Context, options Options, activeMu *sync.Mutex, acti
 		}
 		if settled {
 			if job.DocumentID > 0 && outcomeState != "" {
-				if err := options.Logger.JobFinished(job.DocumentID, outcomeState, time.Since(started)); err != nil {
-					background(err)
-					return
-				}
+				_ = options.Logger.JobFinished(job.DocumentID, outcomeState, time.Since(started))
 			}
 			activeMu.Lock()
 			*active = queue.Job{}

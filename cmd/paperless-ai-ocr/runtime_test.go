@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -68,3 +69,21 @@ func TestRunStderrDoesNotExposeConfigurationCanaries(t *testing.T) {
 		t.Error("stderr disclosed document ID")
 	}
 }
+
+func TestVersionOutputFailureIsSafe(t *testing.T) {
+	const canary = "CANARY private stdout writer path"
+	var stderr bytes.Buffer
+	if code := run([]string{"--version"}, errorOutputWriter{err: errors.New(canary)}, &stderr); code != 1 {
+		t.Fatalf("run() = %d, want 1", code)
+	}
+	if got, want := stderr.String(), "paperless-ai-ocr: output failed\n"; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	if strings.Contains(stderr.String(), canary) {
+		t.Fatal("stderr exposed output error")
+	}
+}
+
+type errorOutputWriter struct{ err error }
+
+func (writer errorOutputWriter) Write([]byte) (int, error) { return 0, writer.err }
