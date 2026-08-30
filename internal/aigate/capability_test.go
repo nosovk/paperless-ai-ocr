@@ -752,22 +752,33 @@ func assertSafeErrorChain(t *testing.T, err error, canaries ...string) {
 }
 
 func FuzzCapabilityProviderResponse(f *testing.F) {
+	type oracle struct {
+		success     bool
+		unsupported bool
+	}
+	seeds := map[string]oracle{}
+	addSeed := func(body string, statusCode int, directPDF bool, want oracle) {
+		f.Add(body, statusCode, directPDF)
+		seeds[fmt.Sprintf("%d\x00%t\x00%s", statusCode, directPDF, body)] = want
+	}
 	for _, seed := range []struct {
 		body       string
 		statusCode int
 		directPDF  bool
+		want       oracle
 	}{
-		{body: `{"output":[{"type":"message","content":[{"type":"output_text","text":"` + probeNonce + `"}]}],"private":"FUZZ-CAPABILITY-SECRET"}`, statusCode: http.StatusOK, directPDF: true},
-		{body: `{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].file_data","message":"FUZZ-CAPABILITY-SECRET"}}`, statusCode: http.StatusBadRequest, directPDF: true},
-		{body: `{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].image_url","message":"FUZZ-CAPABILITY-SECRET"}}`, statusCode: http.StatusUnprocessableEntity},
-		{body: `{"output":[],"output":[{"type":"message","content":[]}],"private":"FUZZ-DUPLICATE-SECRET"}`, statusCode: http.StatusOK, directPDF: true},
-		{body: `{"output":[],"unknown":"FUZZ-UNKNOWN-SECRET"}`, statusCode: http.StatusOK},
+		{body: `{"output":[{"type":"message","content":[{"type":"output_text","text":"` + probeNonce + `"}]}]}`, statusCode: http.StatusOK, directPDF: true, want: oracle{success: true}},
+		{body: `{"output":[{"type":"message","content":[{"type":"output_text","text":"` + probeNonce + `"}]}]}`, statusCode: http.StatusOK, want: oracle{success: true}},
+		{body: `{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].file_data","message":"FUZZ-CAPABILITY-SECRET"}}`, statusCode: http.StatusBadRequest, directPDF: true, want: oracle{unsupported: true}},
+		{body: `{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].image_url","message":"FUZZ-CAPABILITY-SECRET"}}`, statusCode: http.StatusUnprocessableEntity, want: oracle{unsupported: true}},
+		{body: `{"output":[],"output":[{"type":"message","content":[{"type":"output_text","text":"` + probeNonce + `"}]}]}`, statusCode: http.StatusOK, directPDF: true},
+		{body: `{"output":[{"type":"message","content":[{"type":"output_text","text":"` + probeNonce + `"}]}],"unknown":"FUZZ-UNKNOWN-SECRET"}`, statusCode: http.StatusOK},
 		{body: `{"output":[]} {"trailing":"FUZZ-TRAILING-SECRET"}`, statusCode: http.StatusOK},
 		{body: "{\xffFUZZ-MALFORMED-SECRET}", statusCode: http.StatusBadRequest},
-		{body: `{"private":"FUZZ-UNICODE-\ud800"}`, statusCode: http.StatusOK},
+		{body: `{"output":[{"type":"message","content":[{"type":"output_text","text":"FUZZ-UNICODE-\ud800"}]}]}`, statusCode: http.StatusOK},
 		{body: `{"padding":"FUZZ-OVERSIZE-SECRET-` + strings.Repeat("x", 60<<10) + `"}`, statusCode: http.StatusOK},
 	} {
-		f.Add(seed.body, seed.statusCode, seed.directPDF)
+		addSeed(seed.body, seed.statusCode, seed.directPDF, seed.want)
 	}
 	f.Fuzz(func(t *testing.T, responseBody string, statusCode int, directPDF bool) {
 		if len(responseBody) > 1<<16 {
@@ -797,5 +808,33 @@ func FuzzCapabilityProviderResponse(f *testing.F) {
 			}
 			assertFuzzErrorSafe(t, err, responseBody, "FUZZ-CAPABILITY-HEADER-SECRET", "FUZZ-CAPABILITY-URL-SECRET", "FUZZ-CAPABILITY-KEY-SECRET", "FUZZ-CAPABILITY-MODEL-SECRET")
 		}
+		if want, found := seeds[fmt.Sprintf("%d\x00%t\x00%s", statusCode, directPDF, responseBody)]; found {
+			if want.success {
+				if unsupported || err != nil {
+					t.Fatalf("supported seed = (%t, %v), want false, nil", unsupported, err)
+				}
+				return
+			}
+			if unsupported != want.unsupported {
+				t.Fatalf("seed unsupported = %t, want %t", unsupported, want.unsupported)
+			}
+			if !want.unsupported && err == nil {
+				t.Fatal("invalid seed error = nil")
+			}
+		}
 	})
+}
+
+func TestDecodeSingleJSONAcceptsValidReplacementCharacter(t *testing.T) {
+	var response struct {
+		Value string `json:"value"`
+	}
+	data := append([]byte(`{"value":"`), 0xef, 0xbf, 0xbd)
+	data = append(data, []byte(`"}`)...)
+	if err := decodeSingleJSON(data, &response); err != nil {
+		t.Fatalf("decodeSingleJSON() error = %v", err)
+	}
+	if response.Value != string(rune(0xfffd)) {
+		t.Fatalf("value = %q, want replacement character", response.Value)
+	}
 }

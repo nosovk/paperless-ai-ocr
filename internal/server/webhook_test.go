@@ -33,6 +33,11 @@ type readTrackingBody struct {
 	reads int
 }
 
+type countingReadBody struct {
+	reader *strings.Reader
+	reads  int
+}
+
 func (body *readTrackingBody) Read([]byte) (int, error) {
 	body.reads++
 	return 0, errors.New("body-read-canary")
@@ -41,6 +46,13 @@ func (body *readTrackingBody) Read([]byte) (int, error) {
 func (*readTrackingBody) Close() error {
 	return nil
 }
+
+func (body *countingReadBody) Read(buffer []byte) (int, error) {
+	body.reads++
+	return body.reader.Read(buffer)
+}
+
+func (*countingReadBody) Close() error { return nil }
 
 func (e *spyEnqueuer) EnqueueCandidate(_ context.Context, documentID int64, priority queue.Priority) (bool, error) {
 	e.mu.Lock()
@@ -415,18 +427,32 @@ func assertCandidate(t *testing.T, db *sql.DB, documentID int64, priority queue.
 }
 
 func FuzzWebhookPayload(f *testing.F) {
-	for _, seed := range []string{
-		`{"document_id":1}`,
+	type oracle struct {
+		status     int
+		enqueue    int
+		documentID int64
+	}
+	seeds := map[string]oracle{}
+	addSeed := func(body string, authorized bool, want oracle) {
+		f.Add(body, authorized)
+		seeds[fmt.Sprintf("%t\x00%s", authorized, body)] = want
+	}
+	valid := `{"document_id":918273645}`
+	addSeed(valid, true, oracle{status: http.StatusAccepted, enqueue: 1, documentID: 918273645})
+	for _, body := range []string{
 		`{"document_id":1,"document_id":2}`,
 		`{"document_id":1,"unknown":"CANARY"}`,
 		`{"document_id":1}{}`,
 		"{\xff}",
 		`{"document_id":1,"text":"FUZZ-UNICODE-\ud800"}`,
 		`{"document_id":1,"unknown":{"nested":"FUZZ-NESTED-SECRET"}}`,
-		`{"document_id":1,"padding":"` + strings.Repeat("x", 4096) + `"}`,
 	} {
-		f.Add(seed, true)
-		f.Add(seed, false)
+		addSeed(body, true, oracle{status: http.StatusBadRequest})
+	}
+	oversized := `{"document_id":1,"padding":"` + strings.Repeat("x", 4096) + `"}`
+	addSeed(oversized, true, oracle{status: http.StatusRequestEntityTooLarge})
+	for _, body := range []string{valid, oversized, "{\xff}"} {
+		addSeed(body, false, oracle{status: http.StatusUnauthorized})
 	}
 	f.Fuzz(func(t *testing.T, body string, authorized bool) {
 		if len(body) > maxWebhookBodyBytes*2 {
@@ -437,7 +463,19 @@ func FuzzWebhookPayload(f *testing.F) {
 		if authorized {
 			authorization = "Bearer " + testToken
 		}
-		response := performWebhook(t, newTestMux(t, testToken, enqueuer), authorization, "application/json", body)
+		var response *httptest.ResponseRecorder
+		var requestBody *countingReadBody
+		if authorized {
+			response = performWebhook(t, newTestMux(t, testToken, enqueuer), authorization, "application/json", body)
+		} else {
+			requestBody = &countingReadBody{reader: strings.NewReader(body)}
+			request := httptest.NewRequest(http.MethodPost, "/webhooks/paperless", nil)
+			request.Body = requestBody
+			request.Header.Set("Authorization", authorization)
+			request.Header.Set("Content-Type", "application/json")
+			response = httptest.NewRecorder()
+			newTestMux(t, testToken, enqueuer).ServeHTTP(response, request)
+		}
 		validStatus := map[int]bool{
 			http.StatusAccepted: true, http.StatusBadRequest: true, http.StatusUnauthorized: true,
 			http.StatusRequestEntityTooLarge: true,
@@ -452,6 +490,21 @@ func FuzzWebhookPayload(f *testing.F) {
 		}
 		if !authorized && len(enqueuer.snapshot()) != 0 {
 			t.Fatal("unauthorized request enqueued")
+		}
+		if !authorized && requestBody.reads != 0 {
+			t.Fatalf("unauthorized body reads = %d, want 0", requestBody.reads)
+		}
+		if want, found := seeds[fmt.Sprintf("%t\x00%s", authorized, body)]; found {
+			if response.Code != want.status {
+				t.Fatalf("seed status = %d, want %d", response.Code, want.status)
+			}
+			calls := enqueuer.snapshot()
+			if len(calls) != want.enqueue {
+				t.Fatalf("seed enqueue count = %d, want %d", len(calls), want.enqueue)
+			}
+			if want.enqueue == 1 && (calls[0].documentID != want.documentID || calls[0].priority != queue.PriorityWebhook) {
+				t.Fatalf("seed enqueue = %+v, want document %d at webhook priority", calls[0], want.documentID)
+			}
 		}
 	})
 }

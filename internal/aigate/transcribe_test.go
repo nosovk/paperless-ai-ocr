@@ -690,20 +690,33 @@ func socketError(cause error) error {
 }
 
 func FuzzProviderResponse(f *testing.F) {
-	for _, seed := range []string{
-		`{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"pages\":[]}"}]}]}`,
+	type oracle struct {
+		success    bool
+		retry      bool
+		retryClass RetryClass
+		message    string
+	}
+	seeds := map[string]oracle{}
+	addSeed := func(body string, statusCode int, want oracle) {
+		f.Add(body, statusCode)
+		seeds[fmt.Sprintf("%d\x00%s", statusCode, body)] = want
+	}
+	valid := `{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"pages\":[]}"}]}]}`
+	addSeed(valid, http.StatusOK, oracle{success: true})
+	for _, body := range []string{
 		`{"output":[{"type":"message","content":[{"type":"refusal","refusal":"FUZZ-SECRET-REFUSAL"}]}]}`,
 		`{"output":[{"type":"message","content":[{"type":"output_text","text":"{}","text":"FUZZ-DUPLICATE-SECRET"}]}]}`,
 		`{"output":[{"type":"message","content":[{"type":"output_text","text":"{}","unknown":"FUZZ-UNKNOWN-SECRET"}]}],"unknown":"FUZZ-ROOT-SECRET"}`,
-		`{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].file_data","message":"FUZZ-ERROR-SECRET"}}`,
 		`{"output":[]} {}`,
 		"{\xff}",
 		`{"output":[{"type":"message","content":[{"type":"output_text","text":"FUZZ-UNICODE-\ud800"}]}]}`,
 		`{"padding":"FUZZ-OVERSIZE-SECRET-` + strings.Repeat("x", 60<<10) + `"}`,
 	} {
-		f.Add(seed, http.StatusOK)
-		f.Add(seed, http.StatusBadRequest)
+		addSeed(body, http.StatusOK, oracle{})
 	}
+	addSeed(`{"error":{"message":"FUZZ-RATE-LIMIT-SECRET"}}`, http.StatusTooManyRequests, oracle{retry: true, retryClass: RetryRateLimit})
+	addSeed(`{"error":{"message":"FUZZ-UNAVAILABLE-SECRET"}}`, http.StatusBadGateway, oracle{retry: true, retryClass: RetryUnavailable})
+	addSeed(`{"error":{"message":"FUZZ-AUTH-SECRET"}}`, http.StatusUnauthorized, oracle{message: "provider: transcription authentication failed"})
 	f.Fuzz(func(t *testing.T, responseBody string, statusCode int) {
 		if len(responseBody) > 1<<16 {
 			responseBody = responseBody[:1<<16]
@@ -718,9 +731,27 @@ func FuzzProviderResponse(f *testing.F) {
 		}))
 		defer server.Close()
 		client := newTestClient(t, server.URL+"/v1", "key", "model", ClientOptions{})
-		_, err := client.Transcribe(context.Background(), Transcription{Capability: DirectPDF, FirstPage: 1, LastPage: 1, PDF: []byte{1}})
+		raw, err := client.Transcribe(context.Background(), Transcription{Capability: DirectPDF, FirstPage: 1, LastPage: 1, PDF: []byte{1}})
 		if err != nil {
 			assertFuzzErrorSafe(t, err, responseBody, "FUZZ-HEADER-SECRET", server.URL, "key", "model")
+		}
+		if want, found := seeds[fmt.Sprintf("%d\x00%s", statusCode, responseBody)]; found {
+			if want.success {
+				if err != nil || string(raw) != `{"pages":[]}` {
+					t.Fatalf("valid seed = (%s, %v), want successful pages", raw, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("invalid seed error = nil")
+			}
+			class, _, retry := Retry(err)
+			if retry != want.retry || retry && class != want.retryClass {
+				t.Fatalf("seed retry = (%q, %t), want (%q, %t)", class, retry, want.retryClass, want.retry)
+			}
+			if want.message != "" && err.Error() != want.message {
+				t.Fatalf("seed error = %q, want %q", err.Error(), want.message)
+			}
 		}
 	})
 }

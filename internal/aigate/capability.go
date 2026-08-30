@@ -8,6 +8,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
+	"unicode/utf8"
 
 	"github.com/nosovk/paperless-ai-ocr/testdata/probe"
 )
@@ -66,9 +68,10 @@ type probeResponse struct {
 
 type providerErrorResponse struct {
 	Error struct {
-		Type  string  `json:"type"`
-		Code  string  `json:"code"`
-		Param *string `json:"param"`
+		Type    string  `json:"type"`
+		Code    string  `json:"code"`
+		Param   *string `json:"param"`
+		Message string  `json:"message"`
 	} `json:"error"`
 }
 
@@ -272,7 +275,11 @@ func readLimited(reader io.Reader, limit int64) ([]byte, error) {
 }
 
 func decodeSingleJSON(data []byte, destination any) error {
+	if err := validateJSONTokens(data); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
 		return err
 	}
@@ -281,4 +288,99 @@ func decodeSingleJSON(data []byte, destination any) error {
 		return errors.New("response contained trailing data")
 	}
 	return nil
+}
+
+func validateJSONTokens(data []byte) error {
+	if !utf8.Valid(data) || !json.Valid(data) {
+		return errors.New("response JSON was invalid")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	var validateValue func() error
+	validateValue = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		switch value := token.(type) {
+		case string:
+			return nil
+		case json.Delim:
+			switch value {
+			case '{':
+				keys := make(map[string]struct{})
+				for decoder.More() {
+					keyToken, err := decoder.Token()
+					if err != nil {
+						return err
+					}
+					key, ok := keyToken.(string)
+					if !ok {
+						return errors.New("response object key was invalid")
+					}
+					if _, found := keys[key]; found {
+						return errors.New("response contained duplicate fields")
+					}
+					keys[key] = struct{}{}
+					if err := validateValue(); err != nil {
+						return err
+					}
+				}
+			case '[':
+				for decoder.More() {
+					if err := validateValue(); err != nil {
+						return err
+					}
+				}
+			default:
+				return errors.New("response delimiter was invalid")
+			}
+			_, err = decoder.Token()
+			return err
+		default:
+			return nil
+		}
+	}
+	if err := validateValue(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("response contained trailing data")
+	}
+	return validateSurrogateEscapes(data)
+}
+
+func validateSurrogateEscapes(data []byte) error {
+	for index := 0; index+6 <= len(data); index++ {
+		if data[index] != '\\' || data[index+1] != 'u' || escapedBackslash(data, index) {
+			continue
+		}
+		value, err := strconv.ParseUint(string(data[index+2:index+6]), 16, 16)
+		if err != nil {
+			continue
+		}
+		if value >= 0xd800 && value <= 0xdbff {
+			if index+12 > len(data) || data[index+6] != '\\' || data[index+7] != 'u' {
+				return errors.New("response contained invalid Unicode")
+			}
+			low, err := strconv.ParseUint(string(data[index+8:index+12]), 16, 16)
+			if err != nil || low < 0xdc00 || low > 0xdfff {
+				return errors.New("response contained invalid Unicode")
+			}
+			index += 11
+			continue
+		}
+		if value >= 0xdc00 && value <= 0xdfff {
+			return errors.New("response contained invalid Unicode")
+		}
+		index += 5
+	}
+	return nil
+}
+
+func escapedBackslash(data []byte, index int) bool {
+	preceding := 0
+	for index--; index >= 0 && data[index] == '\\'; index-- {
+		preceding++
+	}
+	return preceding%2 == 1
 }

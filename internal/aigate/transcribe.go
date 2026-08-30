@@ -161,7 +161,8 @@ type transcriptionResponse struct {
 		Reason string `json:"reason"`
 	} `json:"incomplete_details"`
 	Output []struct {
-		Type    string `json:"type"`
+		Type    string          `json:"type"`
+		Summary json.RawMessage `json:"summary"`
 		Content []struct {
 			Type    string `json:"type"`
 			Text    string `json:"text"`
