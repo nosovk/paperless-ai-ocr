@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -134,6 +135,81 @@ func TestProcessRetriesModelWithRetryAfterAndExhausts(t *testing.T) {
 	}
 	if fixture.store.diagnostic.Message != "OCR processing failed" {
 		t.Errorf("diagnostic = %+v", fixture.store.diagnostic)
+	}
+}
+
+func TestNewBoundsModelAttempts(t *testing.T) {
+	fixture := newFixture(t, 1, aigate.PageImages)
+	options := fixture.worker.options
+
+	for _, test := range []struct {
+		name  string
+		value int
+		want  int
+	}{
+		{name: "default", value: 0, want: defaultModelAttempts},
+		{name: "minimum", value: 1, want: 1},
+		{name: "maximum", value: 10, want: 10},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options.ModelAttempts = test.value
+			worker, err := New(options)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			if worker.options.ModelAttempts != test.want {
+				t.Errorf("ModelAttempts = %d, want %d", worker.options.ModelAttempts, test.want)
+			}
+		})
+	}
+
+	for _, value := range []int{-1, 11, math.MaxInt} {
+		t.Run(strconv.Itoa(value), func(t *testing.T) {
+			options.ModelAttempts = value
+			if _, err := New(options); err == nil {
+				t.Fatalf("New(ModelAttempts: %d) error = nil", value)
+			}
+		})
+	}
+}
+
+func TestBackoffDelayGrowsAndSaturates(t *testing.T) {
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{attempt: 1, want: time.Second},
+		{attempt: 2, want: 2 * time.Second},
+		{attempt: 5, want: 16 * time.Second},
+		{attempt: 6, want: maximumBackoff},
+		{attempt: 10, want: maximumBackoff},
+		{attempt: strconv.IntSize - 1, want: maximumBackoff},
+		{attempt: strconv.IntSize, want: maximumBackoff},
+		{attempt: math.MaxInt, want: maximumBackoff},
+	}
+
+	previous := time.Duration(0)
+	for _, test := range tests {
+		delay := backoffDelay(test.attempt, func(time.Duration) time.Duration { return 0 })
+		if delay != test.want {
+			t.Errorf("backoffDelay(%d) = %s, want %s", test.attempt, delay, test.want)
+		}
+		if delay <= 0 {
+			t.Errorf("backoffDelay(%d) = %s, want positive", test.attempt, delay)
+		}
+		if delay < previous {
+			t.Errorf("backoffDelay(%d) = %s, want at least %s", test.attempt, delay, previous)
+		}
+		previous = delay
+	}
+}
+
+func TestBackoffDelayClampsJitter(t *testing.T) {
+	if got := backoffDelay(1, func(time.Duration) time.Duration { return time.Duration(math.MaxInt64) }); got != maximumBackoff {
+		t.Errorf("backoffDelay() with large positive jitter = %s, want %s", got, maximumBackoff)
+	}
+	if got := backoffDelay(1, func(time.Duration) time.Duration { return time.Duration(math.MinInt64) }); got != defaultBackoff {
+		t.Errorf("backoffDelay() with negative jitter = %s, want %s", got, defaultBackoff)
 	}
 }
 

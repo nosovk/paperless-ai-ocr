@@ -25,6 +25,7 @@ const (
 	sourceName              = "source.pdf"
 	renderFormat            = "png"
 	defaultModelAttempts    = 3
+	maximumModelAttempts    = 10
 	defaultLeaseDuration    = 5 * time.Minute
 	defaultRetryDelay       = time.Minute
 	defaultDocumentDeadline = 6 * time.Hour
@@ -115,7 +116,7 @@ func New(options Options) (*Worker, error) {
 	if options.ModelAttempts == 0 {
 		options.ModelAttempts = defaultModelAttempts
 	}
-	if options.ModelAttempts < 0 {
+	if options.ModelAttempts < 0 || options.ModelAttempts > maximumModelAttempts {
 		return nil, saferr.New(saferr.CategoryConfiguration, "invalid worker configuration")
 	}
 	if options.LeaseDuration == 0 {
@@ -390,8 +391,7 @@ func (worker *Worker) transcribeAndCheckpoint(ctx context.Context, job queue.Job
 		}
 		delay := retryAfter
 		if delay <= 0 {
-			base := min(defaultBackoff<<uint(attempt-1), maximumBackoff)
-			delay = min(base+max(0, worker.options.Jitter(base)), maximumBackoff)
+			delay = backoffDelay(attempt, worker.options.Jitter)
 		}
 		if err := worker.options.Sleep(ctx, delay); err != nil {
 			return ocr.Batch{}, err
@@ -411,6 +411,24 @@ func (worker *Worker) transcribeAndCheckpoint(ctx context.Context, job queue.Job
 		return ocr.Batch{}, err
 	}
 	return batch, nil
+}
+
+func backoffDelay(attempt int, jitter func(time.Duration) time.Duration) time.Duration {
+	const saturationExponent = 5
+
+	exponent := max(attempt-1, 0)
+	if exponent >= saturationExponent {
+		return maximumBackoff
+	}
+	base := defaultBackoff << uint(exponent)
+	extra := jitter(base)
+	if extra <= 0 {
+		return base
+	}
+	if extra >= maximumBackoff-base {
+		return maximumBackoff
+	}
+	return base + extra
 }
 
 func (worker *Worker) renew(ctx context.Context, job queue.Job) error {

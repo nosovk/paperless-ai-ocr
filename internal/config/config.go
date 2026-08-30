@@ -18,6 +18,7 @@ const (
 	defaultRenderDPI             = 200
 	defaultBatchSize             = 5
 	defaultModelAttempts         = 3
+	maximumModelAttempts         = 10
 	defaultRenderTimeout         = 5 * time.Minute
 	defaultModelTimeout          = 3 * time.Minute
 	defaultDocumentDeadline      = 6 * time.Hour
@@ -102,7 +103,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	modelAttempts, err := positiveInt("MODEL_ATTEMPTS", defaultModelAttempts, math.MaxInt)
+	modelAttempts, err := positiveInt("MODEL_ATTEMPTS", defaultModelAttempts, maximumModelAttempts)
 	if err != nil {
 		return Config{}, err
 	}

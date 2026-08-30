@@ -1,7 +1,9 @@
 package config
 
 import (
+	"math"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -184,6 +186,27 @@ func TestLoadOverridesDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsBoundedModelAttempts(t *testing.T) {
+	for _, value := range []string{"1", "10"} {
+		t.Run(value, func(t *testing.T) {
+			setValidEnvironment(t)
+			t.Setenv("MODEL_ATTEMPTS", value)
+
+			config, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			want, err := strconv.Atoi(value)
+			if err != nil {
+				t.Fatalf("strconv.Atoi(%q) error = %v", value, err)
+			}
+			if config.ModelAttempts != want {
+				t.Errorf("ModelAttempts = %d, want %d", config.ModelAttempts, want)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsInvalidScalarOverrides(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -195,6 +218,8 @@ func TestLoadRejectsInvalidScalarOverrides(t *testing.T) {
 		{name: "BATCH_SIZE", value: "zero"},
 		{name: "BATCH_SIZE", value: "6"},
 		{name: "MODEL_ATTEMPTS", value: "0"},
+		{name: "MODEL_ATTEMPTS", value: "11"},
+		{name: "MODEL_ATTEMPTS", value: strconv.Itoa(math.MaxInt)},
 	}
 
 	for _, test := range tests {
