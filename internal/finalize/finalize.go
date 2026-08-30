@@ -3,7 +3,10 @@ package finalize
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -16,13 +19,14 @@ import (
 )
 
 const (
-	completeTagName      = "ai-ocr-complete"
-	failedTagName        = "ai-ocr-failed"
-	defaultLeaseDuration = 5 * time.Minute
-	defaultRetryDelay    = time.Minute
-	transitionTimeout    = 5 * time.Second
-	retryDiagnostic      = "OCR finalization interrupted"
-	failedDiagnostic     = "OCR processing failed"
+	completeTagName             = "ai-ocr-complete"
+	failedTagName               = "ai-ocr-failed"
+	defaultLeaseDuration        = 5 * time.Minute
+	defaultRetryDelay           = time.Minute
+	transitionTimeout           = 5 * time.Second
+	retryDiagnostic             = "OCR finalization interrupted"
+	failedDiagnostic            = "OCR processing failed"
+	uncertainDispatchDiagnostic = "Paperless AI dispatch outcome is uncertain"
 )
 
 var errSourceChanged = errors.New("source changed")
@@ -30,8 +34,11 @@ var errSourceChanged = errors.New("source changed")
 // Store is the lease-fenced durable finalization contract.
 type Store interface {
 	RenewLeaseContext(context.Context, int64, int, string, time.Duration) error
-	FinalizationStageContext(context.Context, int64, int, string) (queue.FinalizationStage, error)
-	AdvanceFinalizationContext(context.Context, int64, int, string, queue.FinalizationStage, queue.FinalizationStage) error
+	AcquireFinalizationContext(context.Context, int64, int, string, string, time.Duration) (queue.FinalizationState, error)
+	RenewFinalizationContext(context.Context, int64, int, string, string, time.Duration) error
+	FinalizationStateContext(context.Context, int64, int, string, string) (queue.FinalizationState, error)
+	AdvanceFinalizationContext(context.Context, int64, int, string, string, queue.FinalizationStage, queue.FinalizationStage) error
+	SetDispatchStateContext(context.Context, int64, int, string, string, queue.DispatchState, queue.DispatchState) error
 	CompleteContext(context.Context, int64, int, string) error
 	FailContext(context.Context, int64, int, string, queue.SafeDiagnostic) error
 	ScheduleRetryContext(context.Context, int64, int, string, time.Time, queue.SafeDiagnostic) error
@@ -58,6 +65,7 @@ type Options struct {
 	LeaseDuration time.Duration
 	RetryDelay    time.Duration
 	Now           func() time.Time
+	Token         func() (string, error)
 }
 
 // Finalizer applies exactly one already claimed result at a time.
@@ -69,6 +77,16 @@ type Finalizer struct {
 type lostLeaseError struct{}
 
 func (*lostLeaseError) Error() string { return "active job lease was lost" }
+
+type ambiguousDispatchError struct{ cause error }
+
+func (*ambiguousDispatchError) Error() string     { return "Paperless AI dispatch outcome is uncertain" }
+func (err *ambiguousDispatchError) Unwrap() error { return err.cause }
+
+type admissionError struct{ cause error }
+
+func (*admissionError) Error() string     { return "finalization admission failed" }
+func (err *admissionError) Unwrap() error { return err.cause }
 
 // New validates finalizer dependencies.
 func New(options Options) (*Finalizer, error) {
@@ -87,6 +105,9 @@ func New(options Options) (*Finalizer, error) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
+	if options.Token == nil {
+		options.Token = randomToken
+	}
 	return &Finalizer{options: options}, nil
 }
 
@@ -99,10 +120,14 @@ func (finalizer *Finalizer) Process(ctx context.Context, job queue.Job, result w
 	if err := validateSuccessInput(ctx, job, result); err != nil {
 		return err
 	}
+	token, err := finalizer.options.Token()
+	if err != nil || strings.TrimSpace(token) == "" {
+		return saferr.New(saferr.CategoryInternal, "cannot create finalization admission")
+	}
 	processCtx, cancel := context.WithCancel(ctx)
 	heartbeatDone := make(chan error, 1)
-	go finalizer.heartbeat(processCtx, job, cancel, heartbeatDone)
-	err := finalizer.process(processCtx, job, result)
+	go finalizer.heartbeat(processCtx, job, token, cancel, heartbeatDone)
+	err = finalizer.process(processCtx, job, result, token)
 	cancel()
 	if heartbeatErr := <-heartbeatDone; heartbeatErr != nil {
 		err = heartbeatErr
@@ -120,6 +145,16 @@ func (finalizer *Finalizer) Process(ctx context.Context, job queue.Job, result w
 		}
 		return err
 	}
+	var admission *admissionError
+	if errors.As(err, &admission) {
+		return publicError(admission.cause)
+	}
+	if isAmbiguousDispatch(err) {
+		if transitionErr := finalizer.fail(job, saferr.CategoryProvider, uncertainDispatchDiagnostic); transitionErr != nil {
+			return transitionError(transitionErr)
+		}
+		return saferr.New(saferr.CategoryProvider, uncertainDispatchDiagnostic)
+	}
 	if transitionErr := finalizer.retry(job); transitionErr != nil {
 		return transitionError(transitionErr)
 	}
@@ -127,21 +162,22 @@ func (finalizer *Finalizer) Process(ctx context.Context, job queue.Job, result w
 }
 
 // FailOCR applies the terminal failure tag before failing the queue job.
-func (finalizer *Finalizer) FailOCR(ctx context.Context, job queue.Job, category saferr.Category) error {
+func (finalizer *Finalizer) FailOCR(ctx context.Context, job queue.Job) error {
 	if !finalizer.admit() {
 		return saferr.New(saferr.CategoryValidation, "finalizer is already processing a job")
 	}
 	defer finalizer.active.Store(false)
-	if err := validateJob(ctx, job); err != nil || !validFailureCategory(category) {
-		if err != nil {
-			return err
-		}
-		return saferr.New(saferr.CategoryValidation, "invalid OCR failure input")
+	if err := validateJob(ctx, job); err != nil {
+		return err
+	}
+	token, err := finalizer.options.Token()
+	if err != nil || strings.TrimSpace(token) == "" {
+		return saferr.New(saferr.CategoryInternal, "cannot create finalization admission")
 	}
 	processCtx, cancel := context.WithCancel(ctx)
 	heartbeatDone := make(chan error, 1)
-	go finalizer.heartbeat(processCtx, job, cancel, heartbeatDone)
-	err := finalizer.failOCR(processCtx, job, category)
+	go finalizer.heartbeat(processCtx, job, token, cancel, heartbeatDone)
+	err = finalizer.failOCR(processCtx, job, token)
 	cancel()
 	if heartbeatErr := <-heartbeatDone; heartbeatErr != nil {
 		err = heartbeatErr
@@ -153,6 +189,10 @@ func (finalizer *Finalizer) FailOCR(ctx context.Context, job queue.Job, category
 	if errors.As(err, &lostLease) {
 		return saferr.New(saferr.CategoryValidation, "active job lease was lost")
 	}
+	var admission *admissionError
+	if errors.As(err, &admission) {
+		return publicError(admission.cause)
+	}
 	if transitionErr := finalizer.retry(job); transitionErr != nil {
 		return transitionError(transitionErr)
 	}
@@ -163,7 +203,7 @@ func (finalizer *Finalizer) admit() bool {
 	return finalizer.active.CompareAndSwap(false, true)
 }
 
-func (finalizer *Finalizer) heartbeat(ctx context.Context, job queue.Job, cancel context.CancelFunc, done chan<- error) {
+func (finalizer *Finalizer) heartbeat(ctx context.Context, job queue.Job, token string, cancel context.CancelFunc, done chan<- error) {
 	interval := finalizer.options.LeaseDuration / 3
 	if interval <= 0 {
 		interval = time.Nanosecond
@@ -176,7 +216,7 @@ func (finalizer *Finalizer) heartbeat(ctx context.Context, job queue.Job, cancel
 			done <- nil
 			return
 		case <-ticker.C:
-			if err := finalizer.options.Store.RenewLeaseContext(ctx, job.ID, job.Attempts, job.LeaseOwner, finalizer.options.LeaseDuration); err != nil {
+			if err := finalizer.renew(ctx, job, token); err != nil {
 				if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 					done <- nil
 					return
@@ -189,67 +229,87 @@ func (finalizer *Finalizer) heartbeat(ctx context.Context, job queue.Job, cancel
 	}
 }
 
-func (finalizer *Finalizer) process(ctx context.Context, job queue.Job, result worker.Result) error {
-	if err := finalizer.renew(ctx, job); err != nil {
+func (finalizer *Finalizer) process(ctx context.Context, job queue.Job, result worker.Result, token string) error {
+	if err := finalizer.renewLease(ctx, job); err != nil {
 		return err
 	}
-	stage, err := finalizer.options.Store.FinalizationStageContext(ctx, job.ID, job.Attempts, job.LeaseOwner)
+	state, err := finalizer.options.Store.AcquireFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, finalizer.options.LeaseDuration)
 	if err != nil {
-		return err
+		return &admissionError{cause: err}
 	}
+	stage := state.Stage
 	documentID, err := safeDocumentID(job.DocumentID)
 	if err != nil {
 		return err
 	}
+	if err := finalizer.renew(ctx, job, token); err != nil {
+		return err
+	}
+	document, err := finalizer.options.Paperless.GetDocument(ctx, documentID)
+	if err != nil {
+		return err
+	}
+	if document.ID != documentID || document.Checksum != result.SourceChecksum {
+		return saferr.Wrap(saferr.CategoryValidation, "source document changed before finalization", errSourceChanged)
+	}
 
 	if stage == queue.FinalizationPending {
-		if err := finalizer.renew(ctx, job); err != nil {
-			return err
+		if document.Content != result.Content {
+			if err := finalizer.renew(ctx, job, token); err != nil {
+				return err
+			}
+			if err := finalizer.options.Paperless.UpdateContent(ctx, documentID, result.Content); err != nil {
+				return err
+			}
 		}
-		document, err := finalizer.options.Paperless.GetDocument(ctx, documentID)
-		if err != nil {
-			return err
-		}
-		if document.ID != documentID || document.Checksum != result.SourceChecksum {
-			return saferr.Wrap(saferr.CategoryValidation, "source document changed before finalization", errSourceChanged)
-		}
-		if err := finalizer.renew(ctx, job); err != nil {
-			return err
-		}
-		if err := finalizer.options.Paperless.UpdateContent(ctx, documentID, result.Content); err != nil {
-			return err
-		}
-		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, stage, queue.FinalizationContentUpdated); err != nil {
+		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, stage, queue.FinalizationContentUpdated); err != nil {
 			return err
 		}
 		stage = queue.FinalizationContentUpdated
 	}
 	if stage == queue.FinalizationContentUpdated {
-		if err := finalizer.mutateTag(ctx, job, documentID, completeTagName, true); err != nil {
+		if err := finalizer.mutateTag(ctx, job, token, documentID, completeTagName, true); err != nil {
 			return err
 		}
-		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, stage, queue.FinalizationCompleteTagAdded); err != nil {
+		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, stage, queue.FinalizationCompleteTagAdded); err != nil {
 			return err
 		}
 		stage = queue.FinalizationCompleteTagAdded
 	}
 	if stage == queue.FinalizationCompleteTagAdded {
-		if err := finalizer.mutateTag(ctx, job, documentID, failedTagName, false); err != nil {
+		if err := finalizer.mutateTag(ctx, job, token, documentID, failedTagName, false); err != nil {
 			return err
 		}
-		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, stage, queue.FinalizationFailedTagRemoved); err != nil {
+		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, stage, queue.FinalizationFailedTagRemoved); err != nil {
 			return err
 		}
 		stage = queue.FinalizationFailedTagRemoved
 	}
 	if stage == queue.FinalizationFailedTagRemoved {
-		if err := finalizer.renew(ctx, job); err != nil {
-			return err
+		if state.Dispatch == queue.DispatchReserved {
+			return &ambiguousDispatchError{}
 		}
-		if err := finalizer.options.Dispatcher.Dispatch(ctx, documentID); err != nil {
-			return err
+		if state.Dispatch == queue.DispatchNone {
+			if err := finalizer.options.Store.SetDispatchStateContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, queue.DispatchNone, queue.DispatchReserved); err != nil {
+				return err
+			}
+			if err := finalizer.renew(ctx, job, token); err != nil {
+				return err
+			}
+			if err := finalizer.options.Dispatcher.Dispatch(ctx, documentID); err != nil {
+				if retrySafe(err) {
+					if resetErr := finalizer.options.Store.SetDispatchStateContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, queue.DispatchReserved, queue.DispatchNone); resetErr != nil {
+						return resetErr
+					}
+					return err
+				}
+				return &ambiguousDispatchError{cause: err}
+			}
+			if err := finalizer.options.Store.SetDispatchStateContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, queue.DispatchReserved, queue.DispatchConfirmed); err != nil {
+				return err
+			}
 		}
-		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, stage, queue.FinalizationMetadataDispatched); err != nil {
+		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, stage, queue.FinalizationMetadataDispatched); err != nil {
 			return err
 		}
 		stage = queue.FinalizationMetadataDispatched
@@ -257,35 +317,39 @@ func (finalizer *Finalizer) process(ctx context.Context, job queue.Job, result w
 	if stage != queue.FinalizationMetadataDispatched {
 		return saferr.New(saferr.CategoryValidation, "invalid success finalization checkpoint")
 	}
-	if err := finalizer.renew(ctx, job); err != nil {
+	if err := finalizer.renew(ctx, job, token); err != nil {
 		return err
 	}
 	return finalizer.options.Store.CompleteContext(ctx, job.ID, job.Attempts, job.LeaseOwner)
 }
 
-func (finalizer *Finalizer) failOCR(ctx context.Context, job queue.Job, category saferr.Category) error {
-	if err := finalizer.renew(ctx, job); err != nil {
+func (finalizer *Finalizer) failOCR(ctx context.Context, job queue.Job, token string) error {
+	if err := finalizer.renewLease(ctx, job); err != nil {
 		return err
 	}
-	stage, err := finalizer.options.Store.FinalizationStageContext(ctx, job.ID, job.Attempts, job.LeaseOwner)
+	state, err := finalizer.options.Store.AcquireFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, finalizer.options.LeaseDuration)
 	if err != nil {
-		return err
+		return &admissionError{cause: err}
+	}
+	stage := state.Stage
+	if !validFailureCategory(state.FailureCategory) || strings.TrimSpace(state.FailureMessage) == "" {
+		return saferr.New(saferr.CategoryValidation, "terminal OCR failure intent is missing")
 	}
 	documentID, err := safeDocumentID(job.DocumentID)
 	if err != nil {
 		return err
 	}
 	if stage == queue.FinalizationPending {
-		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, stage, queue.FinalizationFailurePending); err != nil {
+		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, stage, queue.FinalizationFailurePending); err != nil {
 			return err
 		}
 		stage = queue.FinalizationFailurePending
 	}
 	if stage == queue.FinalizationFailurePending {
-		if err := finalizer.mutateTag(ctx, job, documentID, failedTagName, true); err != nil {
+		if err := finalizer.mutateTag(ctx, job, token, documentID, failedTagName, true); err != nil {
 			return err
 		}
-		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, stage, queue.FinalizationFailureTagAdded); err != nil {
+		if err := finalizer.options.Store.AdvanceFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, stage, queue.FinalizationFailureTagAdded); err != nil {
 			return err
 		}
 		stage = queue.FinalizationFailureTagAdded
@@ -293,22 +357,22 @@ func (finalizer *Finalizer) failOCR(ctx context.Context, job queue.Job, category
 	if stage != queue.FinalizationFailureTagAdded {
 		return saferr.New(saferr.CategoryValidation, "invalid failure finalization checkpoint")
 	}
-	if err := finalizer.renew(ctx, job); err != nil {
+	if err := finalizer.renew(ctx, job, token); err != nil {
 		return err
 	}
 	return finalizer.options.Store.FailContext(ctx, job.ID, job.Attempts, job.LeaseOwner,
-		queue.SafeDiagnostic{Category: category, Message: failedDiagnostic})
+		queue.SafeDiagnostic{Category: state.FailureCategory, Message: state.FailureMessage})
 }
 
-func (finalizer *Finalizer) mutateTag(ctx context.Context, job queue.Job, documentID int, name string, add bool) error {
-	if err := finalizer.renew(ctx, job); err != nil {
+func (finalizer *Finalizer) mutateTag(ctx context.Context, job queue.Job, token string, documentID int, name string, add bool) error {
+	if err := finalizer.renew(ctx, job, token); err != nil {
 		return err
 	}
 	tag, err := finalizer.options.Paperless.EnsureTag(ctx, name)
 	if err != nil {
 		return err
 	}
-	if err := finalizer.renew(ctx, job); err != nil {
+	if err := finalizer.renew(ctx, job, token); err != nil {
 		return err
 	}
 	document, err := finalizer.options.Paperless.GetDocument(ctx, documentID)
@@ -318,20 +382,39 @@ func (finalizer *Finalizer) mutateTag(ctx context.Context, job queue.Job, docume
 	if document.ID != documentID {
 		return saferr.New(saferr.CategoryValidation, "Paperless returned an unexpected document")
 	}
-	if err := finalizer.renew(ctx, job); err != nil {
-		return err
-	}
 	if add {
+		if slices.Contains(document.Tags, tag.ID) {
+			return nil
+		}
+		if err := finalizer.renew(ctx, job, token); err != nil {
+			return err
+		}
 		return finalizer.options.Paperless.UpdateTags(ctx, documentID, document.Tags, []int{tag.ID}, nil)
+	}
+	if !slices.Contains(document.Tags, tag.ID) {
+		return nil
+	}
+	if err := finalizer.renew(ctx, job, token); err != nil {
+		return err
 	}
 	return finalizer.options.Paperless.UpdateTags(ctx, documentID, document.Tags, nil, []int{tag.ID})
 }
 
-func (finalizer *Finalizer) renew(ctx context.Context, job queue.Job) error {
+func (finalizer *Finalizer) renewLease(ctx context.Context, job queue.Job) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := finalizer.options.Store.RenewLeaseContext(ctx, job.ID, job.Attempts, job.LeaseOwner, finalizer.options.LeaseDuration); err != nil {
+		return &lostLeaseError{}
+	}
+	return nil
+}
+
+func (finalizer *Finalizer) renew(ctx context.Context, job queue.Job, token string) error {
+	if err := finalizer.renewLease(ctx, job); err != nil {
+		return err
+	}
+	if err := finalizer.options.Store.RenewFinalizationContext(ctx, job.ID, job.Attempts, job.LeaseOwner, token, finalizer.options.LeaseDuration); err != nil {
 		return &lostLeaseError{}
 	}
 	return nil
@@ -344,11 +427,15 @@ func (finalizer *Finalizer) retry(job queue.Job) error {
 		finalizer.options.Now().Add(finalizer.options.RetryDelay), queue.SafeDiagnostic{Category: saferr.CategoryInternal, Message: retryDiagnostic})
 }
 
-func (finalizer *Finalizer) fail(job queue.Job, category saferr.Category) error {
+func (finalizer *Finalizer) fail(job queue.Job, category saferr.Category, message ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), transitionTimeout)
 	defer cancel()
+	diagnostic := failedDiagnostic
+	if len(message) != 0 {
+		diagnostic = message[0]
+	}
 	return finalizer.options.Store.FailContext(ctx, job.ID, job.Attempts, job.LeaseOwner,
-		queue.SafeDiagnostic{Category: category, Message: failedDiagnostic})
+		queue.SafeDiagnostic{Category: category, Message: diagnostic})
 }
 
 func validateSuccessInput(ctx context.Context, job queue.Job, result worker.Result) error {
@@ -405,4 +492,22 @@ func transitionError(err error) error {
 		return saferr.New(safeErr.Category(), "job state transition failed")
 	}
 	return saferr.New(saferr.CategoryInternal, "job state transition failed")
+}
+
+func retrySafe(err error) bool {
+	var classified interface{ RetrySafe() bool }
+	return errors.As(err, &classified) && classified.RetrySafe()
+}
+
+func isAmbiguousDispatch(err error) bool {
+	var ambiguous *ambiguousDispatchError
+	return errors.As(err, &ambiguous)
+}
+
+func randomToken() (string, error) {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes[:]), nil
 }

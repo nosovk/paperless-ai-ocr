@@ -30,6 +30,23 @@ const (
 	FinalizationFailureTagAdded    FinalizationStage = "failure_tag_added"
 )
 
+// DispatchState records downstream dispatch admission and confirmation.
+type DispatchState string
+
+const (
+	DispatchNone      DispatchState = "none"
+	DispatchReserved  DispatchState = "reserved"
+	DispatchConfirmed DispatchState = "confirmed"
+)
+
+// FinalizationState is durable orchestration state under one admission token.
+type FinalizationState struct {
+	Stage           FinalizationStage
+	Dispatch        DispatchState
+	FailureCategory saferr.Category
+	FailureMessage  string
+}
+
 // Priority controls claim order. Higher values are claimed first.
 type Priority int
 

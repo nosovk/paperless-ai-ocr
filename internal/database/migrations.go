@@ -20,6 +20,9 @@ var candidateGenerationMigration string
 //go:embed migrations/004_finalizations.sql
 var finalizationsMigration string
 
+//go:embed migrations/005_finalization_controls.sql
+var finalizationControlsMigration string
+
 type migration struct {
 	version int
 	sql     string
@@ -30,6 +33,7 @@ var migrations = []migration{
 	{version: 2, sql: candidatesMigration},
 	{version: 3, sql: candidateGenerationMigration},
 	{version: 4, sql: finalizationsMigration},
+	{version: 5, sql: finalizationControlsMigration},
 }
 
 func applyMigrations(db *sql.DB, available []migration) error {

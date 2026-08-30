@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-const supportedSchemaVersion = 4
+const supportedSchemaVersion = 5
 
 func TestOpenCreatesAndConfiguresDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "queue.db")
@@ -22,7 +22,7 @@ func TestOpenCreatesAndConfiguresDatabase(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	for _, table := range []string{"jobs", "batches", "settings", "candidates", "finalizations"} {
+	for _, table := range []string{"jobs", "batches", "settings", "candidates", "finalizations", "finalization_controls"} {
 		var count int
 		if err := db.QueryRow(
 			"SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -42,6 +42,42 @@ func TestOpenCreatesAndConfiguresDatabase(t *testing.T) {
 
 	if got := db.Stats().MaxOpenConnections; got != 1 {
 		t.Errorf("MaxOpenConnections = %d, want 1", got)
+	}
+}
+
+func TestOpenUpgradesVersionFourDatabaseAndPreservesFinalizations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	db, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatalf("sql.Open(): %v", err)
+	}
+	if err := applyMigrations(db, migrations[:4]); err != nil {
+		t.Fatalf("apply version 4 migrations: %v", err)
+	}
+	jobID := insertJob(t, db, 42, "preserved-v4", "pending")
+	if _, err := db.Exec(`INSERT INTO finalizations (job_id, stage, created_at, updated_at)
+		VALUES (?, 'content_updated', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, jobID); err != nil {
+		t.Fatalf("insert version 4 finalization: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version 4 database: %v", err)
+	}
+
+	db = openTestDatabase(t, path)
+	assertPragmaValue(t, db, "user_version", fmt.Sprint(supportedSchemaVersion))
+	var stage string
+	if err := db.QueryRow("SELECT stage FROM finalizations WHERE job_id = ?", jobID).Scan(&stage); err != nil {
+		t.Fatalf("load preserved finalization: %v", err)
+	}
+	if stage != "content_updated" {
+		t.Errorf("preserved stage = %q, want content_updated", stage)
+	}
+	var controls int
+	if err := db.QueryRow("SELECT count(*) FROM finalization_controls WHERE job_id = ?", jobID).Scan(&controls); err != nil {
+		t.Fatalf("count finalization controls: %v", err)
+	}
+	if controls != 0 {
+		t.Errorf("control rows = %d, want lazy creation", controls)
 	}
 }
 

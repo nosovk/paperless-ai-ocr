@@ -82,6 +82,23 @@ func TestProcessFallsBackOnlyForUnsupportedDirectAttachment(t *testing.T) {
 	if _, err := fixture.worker.Process(context.Background(), fixture.job); err == nil || fixture.renderer.calls != 0 || fixture.store.failed {
 		t.Fatalf("permanent direct failure = err %v render %d failed %t, want claimed job retained for finalizer", err, fixture.renderer.calls, fixture.store.failed)
 	}
+	if !fixture.store.terminal || fixture.store.diagnostic.Category != saferr.CategoryProvider || fixture.store.diagnostic.Message != "OCR processing failed" {
+		t.Fatalf("terminal intent = %t %+v, want provider failure", fixture.store.terminal, fixture.store.diagnostic)
+	}
+}
+
+func TestProcessSkipsOCRWhenTerminalFailureIntentAlreadyExists(t *testing.T) {
+	fixture := newFixture(t, 1, aigate.PageImages)
+	fixture.store.terminal = true
+	fixture.store.diagnostic = queue.SafeDiagnostic{Category: saferr.CategoryRendering, Message: "OCR processing failed"}
+
+	_, err := fixture.worker.Process(context.Background(), fixture.job)
+	if errorCategory(err) != saferr.CategoryRendering {
+		t.Fatalf("Process() error = %v, want rendering category", err)
+	}
+	if fixture.paperless.getCalls != 0 || fixture.renderer.calls != 0 || fixture.transcriber.callCount() != 0 {
+		t.Fatalf("terminal resume did Paperless/render/model work = %d/%d/%d", fixture.paperless.getCalls, fixture.renderer.calls, fixture.transcriber.callCount())
+	}
 }
 
 func TestProcessRestartRevalidatesCanonicalCheckpointAndSkipsWork(t *testing.T) {
@@ -610,6 +627,17 @@ type fakeStore struct {
 	failErr      error
 	retryErr     error
 	renewErr     error
+	terminal     bool
+}
+
+func (store *fakeStore) TerminalFailureContext(context.Context, int64, int, string) (queue.SafeDiagnostic, bool, error) {
+	return store.diagnostic, store.terminal, nil
+}
+
+func (store *fakeStore) RecordTerminalFailureContext(_ context.Context, _ int64, _ int, _ string, diagnostic queue.SafeDiagnostic) error {
+	store.terminal = true
+	store.diagnostic = diagnostic
+	return nil
 }
 
 func (store *fakeStore) RenewLeaseContext(ctx context.Context, _ int64, _ int, _ string, _ time.Duration) error {
@@ -692,9 +720,11 @@ type fakePaperless struct {
 	document paperless.Document
 	pdf      []byte
 	updated  bool
+	getCalls int
 }
 
 func (client *fakePaperless) GetDocument(context.Context, int) (paperless.Document, error) {
+	client.getCalls++
 	return client.document, nil
 }
 func (client *fakePaperless) DownloadOriginal(_ context.Context, _ int, destination io.Writer) error {

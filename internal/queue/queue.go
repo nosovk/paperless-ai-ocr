@@ -388,44 +388,109 @@ func (q *Queue) CheckpointBatchContext(ctx context.Context, id int64, attempt in
 	})
 }
 
-// FinalizationStageContext loads or creates the durable finalization checkpoint.
-func (q *Queue) FinalizationStageContext(ctx context.Context, id int64, attempt int, owner string) (FinalizationStage, error) {
-	if id <= 0 || attempt <= 0 || blank(owner) {
-		return "", validationError("invalid finalization checkpoint input")
+// AcquireFinalizationContext atomically admits one finalizer under the active job lease.
+func (q *Queue) AcquireFinalizationContext(ctx context.Context, id int64, attempt int, owner, token string, duration time.Duration) (FinalizationState, error) {
+	if id <= 0 || attempt <= 0 || blank(owner) || blank(token) || duration <= 0 {
+		return FinalizationState{}, validationError("invalid finalization admission input")
 	}
-	var stage FinalizationStage
+	var state FinalizationState
 	err := q.writeContext(ctx, func(conn *sql.Conn) error {
 		now := q.now().UTC()
 		if err := requireActiveLease(ctx, conn, now, id, attempt, owner); err != nil {
 			return err
 		}
-		err := conn.QueryRowContext(ctx, "SELECT stage FROM finalizations WHERE job_id = ?", id).Scan(&stage)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return internalError("cannot load finalization checkpoint", err)
-		}
 		timestamp := formatTime(now)
 		if _, err := conn.ExecContext(ctx, `INSERT INTO finalizations (
 			job_id, stage, created_at, updated_at
-		) VALUES (?, 'pending', ?, ?)`, id, timestamp, timestamp); err != nil {
+		) VALUES (?, 'pending', ?, ?) ON CONFLICT(job_id) DO NOTHING`, id, timestamp, timestamp); err != nil {
 			return internalError("cannot create finalization checkpoint", err)
 		}
-		stage = FinalizationPending
+		if _, err := conn.ExecContext(ctx, `INSERT INTO finalization_controls (
+			job_id, dispatch_state, created_at, updated_at
+		) VALUES (?, 'none', ?, ?) ON CONFLICT(job_id) DO NOTHING`, id, timestamp, timestamp); err != nil {
+			return internalError("cannot create finalization control", err)
+		}
+		result, err := conn.ExecContext(ctx, `UPDATE finalization_controls SET
+			admission_token = ?, admission_attempt = ?, admission_owner = ?,
+			admission_expires_at = ?, updated_at = ? WHERE job_id = ? AND (
+				admission_token IS NULL OR admission_expires_at <= ? OR admission_attempt != ?
+				OR admission_owner != ? OR admission_token = ?
+			)`, token, attempt, owner, formatTime(now.Add(duration)), timestamp, id,
+			timestamp, attempt, owner, token)
+		if err != nil {
+			return internalError("cannot acquire finalization admission", err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return internalError("cannot confirm finalization admission", err)
+		}
+		if changed != 1 {
+			return validationError("finalizer is already active for this job")
+		}
+		var failureCategory, failureMessage sql.NullString
+		if err := conn.QueryRowContext(ctx, `SELECT f.stage, c.dispatch_state,
+			c.failure_category, c.failure_message FROM finalizations AS f
+			JOIN finalization_controls AS c ON c.job_id = f.job_id
+			WHERE f.job_id = ?`, id).Scan(&state.Stage, &state.Dispatch, &failureCategory, &failureMessage); err != nil {
+			return internalError("cannot load finalization state", err)
+		}
+		state.FailureCategory = saferr.Category(failureCategory.String)
+		state.FailureMessage = failureMessage.String
 		return nil
 	})
-	return stage, err
+	return state, err
 }
 
-// AdvanceFinalizationContext records one confirmed side effect under the active lease.
-func (q *Queue) AdvanceFinalizationContext(ctx context.Context, id int64, attempt int, owner string, from, to FinalizationStage) error {
-	if id <= 0 || attempt <= 0 || blank(owner) || !validFinalizationTransition(from, to) {
+// FinalizationStateContext loads durable state under an active finalizer admission.
+func (q *Queue) FinalizationStateContext(ctx context.Context, id int64, attempt int, owner, token string) (FinalizationState, error) {
+	if id <= 0 || attempt <= 0 || blank(owner) || blank(token) {
+		return FinalizationState{}, validationError("invalid finalization state input")
+	}
+	var state FinalizationState
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
+		now := q.now().UTC()
+		if err := requireFinalizationAdmission(ctx, conn, now, id, attempt, owner, token); err != nil {
+			return err
+		}
+		var failureCategory, failureMessage sql.NullString
+		if err := conn.QueryRowContext(ctx, `SELECT f.stage, c.dispatch_state,
+			c.failure_category, c.failure_message FROM finalizations AS f
+			JOIN finalization_controls AS c ON c.job_id = f.job_id WHERE f.job_id = ?`, id).Scan(
+			&state.Stage, &state.Dispatch, &failureCategory, &failureMessage); err != nil {
+			return internalError("cannot load finalization state", err)
+		}
+		state.FailureCategory = saferr.Category(failureCategory.String)
+		state.FailureMessage = failureMessage.String
+		return nil
+	})
+	return state, err
+}
+
+// RenewFinalizationContext extends one active finalizer admission.
+func (q *Queue) RenewFinalizationContext(ctx context.Context, id int64, attempt int, owner, token string, duration time.Duration) error {
+	if id <= 0 || attempt <= 0 || blank(owner) || blank(token) || duration <= 0 {
+		return validationError("invalid finalization admission renewal input")
+	}
+	return q.writeContext(ctx, func(conn *sql.Conn) error {
+		now := q.now().UTC()
+		if err := requireFinalizationAdmission(ctx, conn, now, id, attempt, owner, token); err != nil {
+			return err
+		}
+		return updateOneContext(ctx, conn, `UPDATE finalization_controls SET
+			admission_expires_at = ?, updated_at = ? WHERE job_id = ? AND admission_attempt = ?
+			AND admission_owner = ? AND admission_token = ? AND admission_expires_at > ?`,
+			formatTime(now.Add(duration)), formatTime(now), id, attempt, owner, token, formatTime(now))
+	})
+}
+
+// AdvanceFinalizationContext records one confirmed side effect under finalizer admission.
+func (q *Queue) AdvanceFinalizationContext(ctx context.Context, id int64, attempt int, owner, token string, from, to FinalizationStage) error {
+	if id <= 0 || attempt <= 0 || blank(owner) || blank(token) || !validFinalizationTransition(from, to) {
 		return validationError("invalid finalization checkpoint transition")
 	}
 	return q.writeContext(ctx, func(conn *sql.Conn) error {
 		now := q.now().UTC()
-		if err := requireActiveLease(ctx, conn, now, id, attempt, owner); err != nil {
+		if err := requireFinalizationAdmission(ctx, conn, now, id, attempt, owner, token); err != nil {
 			return err
 		}
 		var current FinalizationStage
@@ -441,6 +506,81 @@ func (q *Queue) AdvanceFinalizationContext(ctx context.Context, id int64, attemp
 		return updateOneContext(ctx, conn, `UPDATE finalizations SET stage = ?, updated_at = ?
 			WHERE job_id = ? AND stage = ?`, to, formatTime(now), id, from)
 	})
+}
+
+// SetDispatchStateContext records downstream dispatch reservation or confirmation.
+func (q *Queue) SetDispatchStateContext(ctx context.Context, id int64, attempt int, owner, token string, from, to DispatchState) error {
+	validTransition := from == DispatchNone && to == DispatchReserved ||
+		from == DispatchReserved && (to == DispatchNone || to == DispatchConfirmed)
+	if id <= 0 || attempt <= 0 || blank(owner) || blank(token) || !validTransition {
+		return validationError("invalid dispatch state transition")
+	}
+	return q.writeContext(ctx, func(conn *sql.Conn) error {
+		now := q.now().UTC()
+		if err := requireFinalizationAdmission(ctx, conn, now, id, attempt, owner, token); err != nil {
+			return err
+		}
+		return updateOneContext(ctx, conn, `UPDATE finalization_controls SET dispatch_state = ?, updated_at = ?
+			WHERE job_id = ? AND dispatch_state = ?`, to, formatTime(now), id, from)
+	})
+}
+
+// RecordTerminalFailureContext persists terminal OCR intent while retaining the lease.
+func (q *Queue) RecordTerminalFailureContext(ctx context.Context, id int64, attempt int, owner string, diagnostic SafeDiagnostic) error {
+	if id <= 0 || attempt <= 0 || blank(owner) || !diagnostic.valid() {
+		return validationError("invalid terminal OCR failure input")
+	}
+	return q.writeContext(ctx, func(conn *sql.Conn) error {
+		now := q.now().UTC()
+		if err := requireActiveLease(ctx, conn, now, id, attempt, owner); err != nil {
+			return err
+		}
+		timestamp := formatTime(now)
+		if _, err := conn.ExecContext(ctx, `INSERT INTO finalizations (
+			job_id, stage, created_at, updated_at
+		) VALUES (?, 'failure_pending', ?, ?)
+		ON CONFLICT(job_id) DO UPDATE SET stage = 'failure_pending', updated_at = excluded.updated_at
+		WHERE finalizations.stage IN ('pending', 'failure_pending')`, id, timestamp, timestamp); err != nil {
+			return internalError("cannot record terminal OCR failure", err)
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO finalization_controls (
+			job_id, dispatch_state, failure_category, failure_message, created_at, updated_at
+		) VALUES (?, 'none', ?, ?, ?, ?)
+		ON CONFLICT(job_id) DO UPDATE SET failure_category = excluded.failure_category,
+			failure_message = excluded.failure_message, updated_at = excluded.updated_at`, id,
+			diagnostic.Category, diagnostic.Message, timestamp, timestamp); err != nil {
+			return internalError("cannot record terminal OCR failure", err)
+		}
+		return nil
+	})
+}
+
+// TerminalFailureContext loads persisted terminal OCR intent under the active lease.
+func (q *Queue) TerminalFailureContext(ctx context.Context, id int64, attempt int, owner string) (SafeDiagnostic, bool, error) {
+	if id <= 0 || attempt <= 0 || blank(owner) {
+		return SafeDiagnostic{}, false, validationError("invalid terminal OCR failure lookup")
+	}
+	var diagnostic SafeDiagnostic
+	found := false
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
+		if err := requireActiveLease(ctx, conn, q.now().UTC(), id, attempt, owner); err != nil {
+			return err
+		}
+		var category, message sql.NullString
+		if err := conn.QueryRowContext(ctx, `SELECT failure_category, failure_message
+			FROM finalization_controls WHERE job_id = ?`, id).Scan(&category, &message); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return internalError("cannot load terminal OCR failure", err)
+		}
+		if category.Valid && message.Valid {
+			diagnostic = SafeDiagnostic{Category: saferr.Category(category.String), Message: message.String}
+			found = true
+		}
+		return nil
+	})
+	return diagnostic, found, err
 }
 
 // ScheduleRetry releases the active claim generation until a future time.
@@ -614,6 +754,23 @@ func requireActiveLease(ctx context.Context, conn *sql.Conn, now time.Time, id i
 	}
 	if active != 1 {
 		return validationError("illegal job transition or stale lease owner")
+	}
+	return nil
+}
+
+func requireFinalizationAdmission(ctx context.Context, conn *sql.Conn, now time.Time, id int64, attempt int, owner, token string) error {
+	if err := requireActiveLease(ctx, conn, now, id, attempt, owner); err != nil {
+		return err
+	}
+	var active int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM finalization_controls
+		WHERE job_id = ? AND admission_attempt = ? AND admission_owner = ?
+		AND admission_token = ? AND admission_expires_at > ?`, id, attempt, owner,
+		token, formatTime(now)).Scan(&active); err != nil {
+		return internalError("cannot validate finalization admission", err)
+	}
+	if active != 1 {
+		return validationError("illegal finalization transition or stale admission")
 	}
 	return nil
 }

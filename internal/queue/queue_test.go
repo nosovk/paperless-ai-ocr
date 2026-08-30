@@ -1138,20 +1138,20 @@ func TestFinalizationCheckpointIsDurableMonotonicAndLeaseFenced(t *testing.T) {
 	q := openTestQueue(t, path, now)
 	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
 
-	stage, err := q.FinalizationStageContext(context.Background(), job.ID, job.Attempts, "owner")
-	if err != nil || stage != FinalizationPending {
-		t.Fatalf("FinalizationStageContext() = (%q, %v), want pending", stage, err)
+	state, err := q.AcquireFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", time.Minute)
+	if err != nil || state.Stage != FinalizationPending {
+		t.Fatalf("AcquireFinalizationContext() = (%+v, %v), want pending", state, err)
 	}
-	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", FinalizationPending, FinalizationContentUpdated); err != nil {
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", FinalizationPending, FinalizationContentUpdated); err != nil {
 		t.Fatalf("AdvanceFinalizationContext() error = %v", err)
 	}
-	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", FinalizationPending, FinalizationContentUpdated); err != nil {
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", FinalizationPending, FinalizationContentUpdated); err != nil {
 		t.Fatalf("idempotent AdvanceFinalizationContext() error = %v", err)
 	}
-	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", FinalizationPending, FinalizationCompleteTagAdded); errorCategory(err) != saferr.CategoryValidation {
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", FinalizationPending, FinalizationCompleteTagAdded); errorCategory(err) != saferr.CategoryValidation {
 		t.Fatalf("skipped AdvanceFinalizationContext() error = %v, want validation", err)
 	}
-	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "stale", FinalizationContentUpdated, FinalizationCompleteTagAdded); errorCategory(err) != saferr.CategoryValidation {
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "stale", "token", FinalizationContentUpdated, FinalizationCompleteTagAdded); errorCategory(err) != saferr.CategoryValidation {
 		t.Fatalf("stale owner checkpoint error = %v, want validation", err)
 	}
 
@@ -1165,13 +1165,13 @@ func TestFinalizationCheckpointIsDurableMonotonicAndLeaseFenced(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	q = New(db)
 	q.now = func() time.Time { return now }
-	stage, err = q.FinalizationStageContext(context.Background(), job.ID, job.Attempts, "owner")
-	if err != nil || stage != FinalizationContentUpdated {
-		t.Fatalf("durable FinalizationStageContext() = (%q, %v), want content updated", stage, err)
+	state, err = q.FinalizationStateContext(context.Background(), job.ID, job.Attempts, "owner", "token")
+	if err != nil || state.Stage != FinalizationContentUpdated {
+		t.Fatalf("durable FinalizationStateContext() = (%+v, %v), want content updated", state, err)
 	}
 
 	now = job.LeaseExpiresAt
-	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", FinalizationContentUpdated, FinalizationCompleteTagAdded); errorCategory(err) != saferr.CategoryValidation {
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", FinalizationContentUpdated, FinalizationCompleteTagAdded); errorCategory(err) != saferr.CategoryValidation {
 		t.Fatalf("expired checkpoint error = %v, want validation", err)
 	}
 }
@@ -1180,7 +1180,7 @@ func TestFinalizationCheckpointFencesAttemptAndValidatesTransitions(t *testing.T
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
 
-	if _, err := q.FinalizationStageContext(context.Background(), job.ID, job.Attempts+1, "owner"); errorCategory(err) != saferr.CategoryValidation {
+	if _, err := q.AcquireFinalizationContext(context.Background(), job.ID, job.Attempts+1, "owner", "token", time.Minute); errorCategory(err) != saferr.CategoryValidation {
 		t.Fatalf("stale attempt stage error = %v, want validation", err)
 	}
 	for _, transition := range []struct {
@@ -1191,7 +1191,7 @@ func TestFinalizationCheckpointFencesAttemptAndValidatesTransitions(t *testing.T
 		{from: FinalizationContentUpdated, to: FinalizationPending},
 		{from: FinalizationMetadataDispatched, to: FinalizationFailureTagAdded},
 	} {
-		if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", transition.from, transition.to); errorCategory(err) != saferr.CategoryValidation {
+		if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", transition.from, transition.to); errorCategory(err) != saferr.CategoryValidation {
 			t.Errorf("AdvanceFinalizationContext(%q, %q) error = %v, want validation", transition.from, transition.to, err)
 		}
 	}
@@ -1202,8 +1202,8 @@ func TestFinalizationCheckpointAdvanceIsIdempotentAcrossDatabaseHandles(t *testi
 	q1 := openTestQueue(t, path, testNow)
 	q2 := openTestQueue(t, path, testNow)
 	job := enqueueAndClaim(t, q1, 1, "checksum", PriorityBackfill, "owner")
-	if _, err := q1.FinalizationStageContext(context.Background(), job.ID, job.Attempts, "owner"); err != nil {
-		t.Fatalf("FinalizationStageContext() error = %v", err)
+	if _, err := q1.AcquireFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", time.Minute); err != nil {
+		t.Fatalf("AcquireFinalizationContext() error = %v", err)
 	}
 
 	start := make(chan struct{})
@@ -1211,7 +1211,7 @@ func TestFinalizationCheckpointAdvanceIsIdempotentAcrossDatabaseHandles(t *testi
 	for _, q := range []*Queue{q1, q2} {
 		go func() {
 			<-start
-			errs <- q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", FinalizationPending, FinalizationContentUpdated)
+			errs <- q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", FinalizationPending, FinalizationContentUpdated)
 		}()
 	}
 	close(start)
@@ -1220,9 +1220,105 @@ func TestFinalizationCheckpointAdvanceIsIdempotentAcrossDatabaseHandles(t *testi
 			t.Errorf("concurrent AdvanceFinalizationContext() error = %v", err)
 		}
 	}
-	stage, err := q1.FinalizationStageContext(context.Background(), job.ID, job.Attempts, "owner")
-	if err != nil || stage != FinalizationContentUpdated {
-		t.Fatalf("final stage = (%q, %v), want content updated", stage, err)
+	state, err := q1.FinalizationStateContext(context.Background(), job.ID, job.Attempts, "owner", "token")
+	if err != nil || state.Stage != FinalizationContentUpdated {
+		t.Fatalf("final state = (%+v, %v), want content updated", state, err)
+	}
+}
+
+func TestFinalizationAdmissionFencesConcurrentInstancesAndAllowsTakeover(t *testing.T) {
+	now := testNow
+	path := filepath.Join(t.TempDir(), "queue.db")
+	q1 := openTestQueue(t, path, now)
+	q2 := openTestQueue(t, path, now)
+	job := enqueueAndClaim(t, q1, 1, "checksum", PriorityBackfill, "owner")
+
+	state, err := q1.AcquireFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token-a", time.Minute)
+	if err != nil || state.Stage != FinalizationPending || state.Dispatch != DispatchNone {
+		t.Fatalf("first AcquireFinalizationContext() = (%+v, %v)", state, err)
+	}
+	if _, err := q2.AcquireFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token-b", time.Minute); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("duplicate AcquireFinalizationContext() error = %v, want validation", err)
+	}
+	if err := q2.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token-b", FinalizationPending, FinalizationContentUpdated); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("unadmitted checkpoint error = %v, want validation", err)
+	}
+	if err := q1.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token-a", FinalizationPending, FinalizationContentUpdated); err != nil {
+		t.Fatalf("admitted checkpoint error = %v", err)
+	}
+
+	now = now.Add(time.Minute)
+	q1.now = func() time.Time { return now }
+	q2.now = func() time.Time { return now }
+	if recovered, err := q1.RecoverExpiredLeases(); err != nil || recovered != 1 {
+		t.Fatalf("RecoverExpiredLeases() = (%d, %v)", recovered, err)
+	}
+	job, ok, err := q1.Claim("owner-2", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("reclaim = (%+v, %t, %v)", job, ok, err)
+	}
+	state, err = q2.AcquireFinalizationContext(context.Background(), job.ID, job.Attempts, "owner-2", "token-b", time.Minute)
+	if err != nil || state.Stage != FinalizationContentUpdated {
+		t.Fatalf("takeover AcquireFinalizationContext() = (%+v, %v)", state, err)
+	}
+}
+
+func TestFinalizationDispatchReservationAndTerminalFailureAreDurableAndFenced(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+	if err := q.RecordTerminalFailureContext(context.Background(), job.ID, job.Attempts, "owner",
+		SafeDiagnostic{Category: saferr.CategoryProvider, Message: "OCR processing failed"}); err != nil {
+		t.Fatalf("RecordTerminalFailureContext() error = %v", err)
+	}
+	state, err := q.AcquireFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireFinalizationContext() error = %v", err)
+	}
+	if state.Stage != FinalizationFailurePending || state.FailureCategory != saferr.CategoryProvider || state.FailureMessage != "OCR processing failed" {
+		t.Fatalf("terminal failure state = %+v", state)
+	}
+	if err := q.SetDispatchStateContext(context.Background(), job.ID, job.Attempts, "owner", "stale", DispatchNone, DispatchReserved); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("stale dispatch reservation error = %v, want validation", err)
+	}
+	if err := q.SetDispatchStateContext(context.Background(), job.ID, job.Attempts, "owner", "token", DispatchNone, DispatchReserved); err != nil {
+		t.Fatalf("SetDispatchStateContext() error = %v", err)
+	}
+	for _, transition := range []struct{ from, to DispatchState }{
+		{from: DispatchNone, to: DispatchNone},
+		{from: DispatchNone, to: DispatchConfirmed},
+		{from: DispatchReserved, to: DispatchReserved},
+		{from: DispatchConfirmed, to: DispatchNone},
+	} {
+		if err := q.SetDispatchStateContext(context.Background(), job.ID, job.Attempts, "owner", "token", transition.from, transition.to); errorCategory(err) != saferr.CategoryValidation {
+			t.Errorf("SetDispatchStateContext(%q, %q) error = %v, want validation", transition.from, transition.to, err)
+		}
+	}
+	state, err = q.FinalizationStateContext(context.Background(), job.ID, job.Attempts, "owner", "token")
+	if err != nil || state.Dispatch != DispatchReserved {
+		t.Fatalf("FinalizationStateContext() = (%+v, %v)", state, err)
+	}
+}
+
+func TestTerminalFailureIntentLoadsUnderReclaimedLease(t *testing.T) {
+	now := testNow
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)
+	first := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner-1")
+	diagnostic := SafeDiagnostic{Category: saferr.CategoryRendering, Message: "OCR processing failed"}
+	if err := q.RecordTerminalFailureContext(context.Background(), first.ID, first.Attempts, "owner-1", diagnostic); err != nil {
+		t.Fatalf("RecordTerminalFailureContext() error = %v", err)
+	}
+	now = first.LeaseExpiresAt
+	q.now = func() time.Time { return now }
+	if _, err := q.RecoverExpiredLeases(); err != nil {
+		t.Fatalf("RecoverExpiredLeases() error = %v", err)
+	}
+	second, ok, err := q.Claim("owner-2", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim() = (%+v, %t, %v)", second, ok, err)
+	}
+	got, found, err := q.TerminalFailureContext(context.Background(), second.ID, second.Attempts, "owner-2")
+	if err != nil || !found || got != diagnostic {
+		t.Fatalf("TerminalFailureContext() = (%+v, %t, %v), want (%+v, true, nil)", got, found, err, diagnostic)
 	}
 }
 

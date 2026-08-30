@@ -43,6 +43,8 @@ type Store interface {
 	EnsureBatchesContext(context.Context, int64, int, string, []queue.BatchRange, int, string) ([]queue.Batch, error)
 	ListBatchesContext(context.Context, int64, int, string) ([]queue.Batch, error)
 	CheckpointBatchContext(context.Context, int64, int, string, queue.BatchRange, int, string, string) error
+	TerminalFailureContext(context.Context, int64, int, string) (queue.SafeDiagnostic, bool, error)
+	RecordTerminalFailureContext(context.Context, int64, int, string, queue.SafeDiagnostic) error
 	ScheduleRetryContext(context.Context, int64, int, string, time.Time, queue.SafeDiagnostic) error
 }
 
@@ -183,7 +185,11 @@ func (worker *Worker) Process(ctx context.Context, job queue.Job) (Result, error
 	if errors.As(err, &lostLease) {
 		return Result{}, saferr.New(saferr.CategoryValidation, "active job lease was lost")
 	}
-	return Result{}, publicError(err)
+	safeErr := publicError(err)
+	if transitionErr := worker.recordTerminalFailure(job, category(safeErr)); transitionErr != nil {
+		return Result{}, transitionError(transitionErr)
+	}
+	return Result{}, safeErr
 }
 
 func (worker *Worker) heartbeat(ctx context.Context, job queue.Job, cancel context.CancelFunc, done chan<- error) {
@@ -218,6 +224,11 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 	}
 	if job.Model != worker.options.Model || job.PromptVersion != ocr.Version {
 		return Result{}, saferr.New(saferr.CategoryValidation, "job processing contract does not match worker")
+	}
+	if diagnostic, found, err := worker.options.Store.TerminalFailureContext(ctx, job.ID, job.Attempts, job.LeaseOwner); err != nil {
+		return Result{}, err
+	} else if found {
+		return Result{}, saferr.New(diagnostic.Category, diagnostic.Message)
 	}
 	documentID, err := safeDocumentID(job.DocumentID)
 	if err != nil {
@@ -456,6 +467,13 @@ func (worker *Worker) scheduleRetry(job queue.Job) error {
 		worker.options.Now().Add(worker.options.RetryDelay), queue.SafeDiagnostic{Category: saferr.CategoryInternal, Message: retryDiagnostic})
 }
 
+func (worker *Worker) recordTerminalFailure(job queue.Job, errorCategory saferr.Category) error {
+	ctx, cancel := context.WithTimeout(context.Background(), transitionTimeout)
+	defer cancel()
+	return worker.options.Store.RecordTerminalFailureContext(ctx, job.ID, job.Attempts, job.LeaseOwner,
+		queue.SafeDiagnostic{Category: errorCategory, Message: "OCR processing failed"})
+}
+
 func planRanges(pages, batchSize int, capability aigate.Capability) ([]queue.BatchRange, error) {
 	if pages <= 0 || pages > maxDocumentPages {
 		return nil, saferr.New(saferr.CategoryRendering, "PDF page count exceeded supported limit")
@@ -497,6 +515,14 @@ func publicError(err error) error {
 		return err
 	}
 	return saferr.New(saferr.CategoryInternal, "OCR processing failed")
+}
+
+func category(err error) saferr.Category {
+	var safeError *saferr.Error
+	if errors.As(err, &safeError) {
+		return safeError.Category()
+	}
+	return saferr.CategoryInternal
 }
 
 func transitionError(err error) error {

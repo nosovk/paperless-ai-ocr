@@ -107,6 +107,56 @@ func TestDispatchHonorsTimeoutAndBoundsResponseDrain(t *testing.T) {
 	})
 }
 
+func TestDispatchTransportErrorDoesNotExposePrivateCause(t *testing.T) {
+	const (
+		endpointCanary = "https://webhook.example/secret-endpoint"
+		documentCanary = "https://paperless.example/private/documents/987654/"
+		bodyCanary     = "canary request body"
+		credential     = "canary custom credential"
+	)
+	privateCause := fmt.Errorf("transport failed endpoint=%s document=%s body=%s credential=%s", endpointCanary, documentCanary, bodyCanary, credential)
+	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, privateCause
+	})}
+	client := newTestClientWithOptions(t, endpointCanary, "https://paperless.example/private/", Options{HTTPClient: httpClient})
+
+	err := client.Dispatch(context.Background(), 987654)
+	assertProviderError(t, err)
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		t.Errorf("errors.Unwrap(error) = %T %v, want nil", unwrapped, unwrapped)
+	}
+	if errors.Is(err, privateCause) {
+		t.Error("errors.Is(error, private cause) = true")
+	}
+	var recovered interface{ Error() string }
+	if errors.As(err, &recovered) && recovered == privateCause {
+		t.Error("errors.As recovered private cause")
+	}
+	assertRedacted(t, err, endpointCanary, documentCanary, "987654", bodyCanary, credential)
+}
+
+func TestDispatchStatusErrorRetainsOnlySafeStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(writer, "canary private response body")
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL+"/secret-endpoint", "https://paperless.example/private/")
+
+	err := client.Dispatch(context.Background(), 987654)
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("errors.As(*StatusError) = false: %v", err)
+	}
+	if !statusErr.RetrySafe() {
+		t.Error("StatusError.RetrySafe() = false, want true")
+	}
+	if unwrapped := errors.Unwrap(statusErr); unwrapped != nil {
+		t.Errorf("errors.Unwrap(StatusError) = %v, want nil", unwrapped)
+	}
+	assertRedacted(t, err, server.URL, "secret-endpoint", "paperless.example", "987654", "canary private response body")
+}
+
 func TestNewRejectsMalformedConfiguration(t *testing.T) {
 	tests := []struct {
 		webhook   string

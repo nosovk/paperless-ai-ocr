@@ -60,6 +60,9 @@ func (err *StatusError) Format(state fmt.State, verb rune) {
 	}
 }
 
+// RetrySafe reports that the server confirmed rejection before accepting work.
+func (*StatusError) RetrySafe() bool { return true }
+
 // New creates a bounded client using separate Paperless and webhook origins.
 func New(webhookURL, paperlessURL *url.URL, webhookKey string, options Options) (*Client, error) {
 	if !validURL(webhookURL) || !validURL(paperlessURL) || strings.TrimSpace(webhookKey) == "" ||
@@ -95,32 +98,32 @@ func New(webhookURL, paperlessURL *url.URL, webhookKey string, options Options) 
 // Dispatch invokes the configured webhook for one Paperless document.
 func (client *Client) Dispatch(ctx context.Context, documentID int) error {
 	if documentID <= 0 {
-		return providerError(errors.New("invalid document ID"))
+		return providerError()
 	}
 	documentURL := client.paperlessURL.ResolveReference(&url.URL{Path: fmt.Sprintf("documents/%d/", documentID)})
 	body, err := json.Marshal(struct {
 		URL string `json:"url"`
 	}{URL: documentURL.String()})
 	if err != nil {
-		return providerError(err)
+		return providerError()
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, client.requestTimeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, client.webhookURL.String(), bytes.NewReader(body))
 	if err != nil {
-		return providerError(err)
+		return providerError()
 	}
 	request.Header.Set("x-api-key", client.webhookKey)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return providerError(err)
+		return providerError()
 	}
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, client.maxResponseDrainBytes))
 	if response.StatusCode != http.StatusAccepted {
-		return providerError(&StatusError{StatusCode: response.StatusCode})
+		return statusError(response.StatusCode)
 	}
 	return nil
 }
@@ -158,8 +161,12 @@ func boundedTransport() *http.Transport {
 	}
 }
 
-func providerError(cause error) error {
-	return saferr.Wrap(saferr.CategoryProvider, "Paperless AI dispatch failed", cause)
+func providerError() error {
+	return saferr.New(saferr.CategoryProvider, "Paperless AI dispatch failed")
+}
+
+func statusError(statusCode int) error {
+	return saferr.Wrap(saferr.CategoryProvider, "Paperless AI dispatch failed", &StatusError{StatusCode: statusCode})
 }
 
 func defaultValue[T time.Duration | int64](value, fallback T) T {
