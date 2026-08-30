@@ -125,7 +125,7 @@ gateway.
 - Credentials, PDFs, OCR text, transcriptions, images, and provider response
   bodies are excluded from logs.
 
-## Planned Deployment
+## Container Deployment
 
 The first release will publish multi-architecture images for `linux/amd64` and
 `linux/arm64`:
@@ -134,49 +134,31 @@ The first release will publish multi-architecture images for `linux/amd64` and
 ghcr.io/nosovk/paperless-ai-ocr:<version>
 ```
 
-The intended deployment is on the same private container network as
-Paperless-ngx. The service does not need public ingress: Paperless calls its
-authenticated webhook directly over the private network.
+The image is built for `linux/amd64` and `linux/arm64`. It runs as UID/GID
+`65532`, includes Poppler and CA certificates, and stores its SQLite database at
+`/app/data/paperless-ai-ocr.db`. The root filesystem can remain read-only when
+`/app/data` and `/tmp` are writable.
 
-An illustrative Compose service will look like this after the first image is
-published:
+Use `compose.example.yaml` as the hardened deployment baseline. It attaches to
+an existing private network shared with Paperless-ngx and `paperless-ai`; set
+`PAPERLESS_PRIVATE_NETWORK` to that network's name. Do not publish the service
+port to the host or internet. Docker's `internal: true` network mode is not used
+because this service must make outbound HTTPS requests to the configured AI
+gateway; network-level egress policy should be applied by the operator when
+required.
 
-```yaml
-services:
-  paperless-ai-ocr:
-    image: ghcr.io/nosovk/paperless-ai-ocr:<version>
-    restart: unless-stopped
-    environment:
-      PAPERLESS_URL: http://paperless-webserver:8000
-      PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN}
-      AI_BASE_URL: ${AI_BASE_URL}
-      AI_API_KEY: ${AI_API_KEY}
-      AI_MODEL: ${AI_MODEL}
-      WEBHOOK_TOKEN: ${WEBHOOK_TOKEN}
-      PAPERLESS_AI_WEBHOOK_URL: http://paperless-ai:3000/api/webhook/manual
-      PAPERLESS_AI_WEBHOOK_KEY: ${PAPERLESS_AI_WEBHOOK_KEY}
-    volumes:
-      - paperless-ai-ocr-data:/app/data
-    tmpfs:
-      - /tmp:size=1G,mode=0700
-    networks:
-      - paperless
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
+The example requires all runtime configuration to be supplied at deployment
+time and applies a read-only root filesystem, all-capability drop,
+`no-new-privileges`, a persistent data volume, and a bounded mode-0700 `/tmp`:
 
-volumes:
-  paperless-ai-ocr-data:
-
-networks:
-  paperless:
-    external: true
+```sh
+docker compose -f compose.example.yaml up -d
 ```
 
-Exact image tags, configuration options, health checks, and migration guidance
-will be documented with the first release.
+No Linux capabilities are required. The image healthcheck makes an exec-form
+request to `GET /health` using Alpine's runtime-native `wget`; it does not expose
+dependency readiness. Monitor `GET /ready` separately when dependency-aware
+status is needed.
 
 ## Paperless Workflow
 
@@ -246,7 +228,7 @@ This service sends document content to the configured AI endpoint. Operators
 are responsible for choosing a provider and deployment model appropriate for
 their documents, jurisdiction, retention requirements, and threat model.
 
-Planned security defaults include:
+Security defaults include:
 
 - dedicated bearer authentication for the Paperless webhook;
 - secrets supplied through environment variables or secret files;

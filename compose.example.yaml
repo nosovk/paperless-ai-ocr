@@ -1,0 +1,32 @@
+services:
+  paperless-ai-ocr:
+    image: ghcr.io/nosovk/paperless-ai-ocr:${PAPERLESS_AI_OCR_VERSION:?set PAPERLESS_AI_OCR_VERSION}
+    restart: unless-stopped
+    environment:
+      PAPERLESS_URL: http://paperless-webserver:8000
+      PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN:?set PAPERLESS_API_TOKEN}
+      AI_BASE_URL: ${AI_BASE_URL:?set AI_BASE_URL}
+      AI_API_KEY: ${AI_API_KEY:?set AI_API_KEY}
+      AI_MODEL: ${AI_MODEL:?set AI_MODEL}
+      WEBHOOK_TOKEN: ${WEBHOOK_TOKEN:?set WEBHOOK_TOKEN}
+      PAPERLESS_AI_WEBHOOK_URL: http://paperless-ai:3000/api/webhook/manual
+      PAPERLESS_AI_WEBHOOK_KEY: ${PAPERLESS_AI_WEBHOOK_KEY:?set PAPERLESS_AI_WEBHOOK_KEY}
+    volumes:
+      - paperless-ai-ocr-data:/app/data
+    tmpfs:
+      - /tmp:size=1G,mode=0700,uid=65532,gid=65532
+    networks:
+      - paperless-private
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  paperless-ai-ocr-data:
+
+networks:
+  paperless-private:
+    external: true
+    name: ${PAPERLESS_PRIVATE_NETWORK:?set PAPERLESS_PRIVATE_NETWORK}

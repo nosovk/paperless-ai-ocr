@@ -1,0 +1,13 @@
+.git
+.github
+.code-review-graph
+.worktrees
+docs
+scripts
+Dockerfile
+compose.example.yaml
+README.md
+LICENSE
+*.db
+*.db-shm
+*.db-wal
