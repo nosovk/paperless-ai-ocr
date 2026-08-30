@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GOVULNCHECK_VERSION: v1.7.0
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -27,7 +30,9 @@ jobs:
       - name: Install Poppler and process utilities
         run: sudo apt-get update && sudo apt-get install --yes poppler-utils util-linux
       - name: Validate workflow policy
-        run: python3 scripts/workflow-policy-test.py
+        run: |
+          python3 scripts/workflow-policy-test.py
+          python3 scripts/workflow-policy-regression-test.py
       - name: Check formatting
         shell: bash
         run: |
@@ -82,12 +87,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Run govulncheck
-        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          repo-checkout: false
           go-version-file: go.mod
-          go-package: ./...
+      - name: Install pinned govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
+      - name: Run govulncheck
+        run: govulncheck ./...
 
   docker-build:
     name: Docker build

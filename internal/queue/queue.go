@@ -835,16 +835,6 @@ func (q *Queue) ClaimStateContext(ctx context.Context, id int64, attempt int, ow
 	return state, true, nil
 }
 
-func (q *Queue) updateOne(statement string, args ...any) error {
-	return q.write(func(conn *sql.Conn) error {
-		return updateOne(conn, statement, args...)
-	})
-}
-
-func (q *Queue) transitionProcessing(fn func(*sql.Conn, time.Time) error) error {
-	return q.transitionProcessingContext(context.Background(), fn)
-}
-
 func (q *Queue) transitionProcessingContext(ctx context.Context, fn func(*sql.Conn, time.Time) error) error {
 	return q.writeContext(ctx, func(conn *sql.Conn) error {
 		return fn(conn, q.now().UTC())
