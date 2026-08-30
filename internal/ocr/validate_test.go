@@ -30,6 +30,33 @@ func TestBoundDraft(t *testing.T) {
 	}
 }
 
+func TestBoundDraftSanitizesInvalidUTF8BeforeBounding(t *testing.T) {
+	tests := []struct {
+		name  string
+		draft string
+		want  string
+	}{
+		{name: "invalid below limit", draft: string([]byte{'a', 0xff, 'b'}), want: "a\uFFFDb"},
+		{name: "exact ASCII boundary", draft: strings.Repeat("x", MaxDraftBytes), want: strings.Repeat("x", MaxDraftBytes)},
+		{name: "invalid above limit", draft: strings.Repeat("x", MaxDraftBytes) + string([]byte{0xff})},
+		{name: "multibyte boundary", draft: strings.Repeat("x", MaxDraftBytes-len(draftTruncationMarker)-1) + "€tail"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := BoundDraft(test.draft)
+			if !utf8.ValidString(got) || len(got) > MaxDraftBytes {
+				t.Fatalf("BoundDraft() valid/length = %t/%d", utf8.ValidString(got), len(got))
+			}
+			if test.want != "" && got != test.want {
+				t.Fatalf("BoundDraft() = %q, want %q", got, test.want)
+			}
+			if repeated := BoundDraft(test.draft); repeated != got {
+				t.Fatalf("BoundDraft() is nondeterministic")
+			}
+		})
+	}
+}
+
 func TestCanonicalValidate(t *testing.T) {
 	raw := []byte(" { \n \"pages\" : [ { \"refused\" : false, \"text\" : \"one\", \"page\" : 1 } ] } \n")
 	batch, canonical, err := ValidateCanonical(raw, 1, 1)

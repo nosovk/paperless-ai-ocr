@@ -155,6 +155,9 @@ func ValidateCanonical(raw []byte, firstPage, lastPage int) (Batch, json.RawMess
 
 // BoundDraft returns deterministic, UTF-8-safe untrusted OCR evidence.
 func BoundDraft(draft string) string {
+	if !utf8.ValidString(draft) {
+		draft = strings.ToValidUTF8(draft, "\uFFFD")
+	}
 	if len(draft) <= MaxDraftBytes {
 		return draft
 	}

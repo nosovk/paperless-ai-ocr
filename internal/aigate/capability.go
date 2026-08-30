@@ -193,17 +193,28 @@ func (client *Client) probeRequest(capability Capability) probeRequest {
 }
 
 func classifyUnsupported(capability Capability, statusCode int, data []byte) (bool, error) {
+	unsupported, valid := unsupportedAttachment(capability, statusCode, data)
+	if unsupported {
+		return true, nil
+	}
+	if !valid {
+		return false, providerError("capability probe error response was invalid")
+	}
+	return false, providerError("capability probe request was rejected")
+}
+
+func unsupportedAttachment(capability Capability, statusCode int, data []byte) (unsupported, valid bool) {
 	if statusCode != http.StatusBadRequest && statusCode != http.StatusUnprocessableEntity {
-		return false, providerError("capability probe request was rejected")
+		return false, true
 	}
 	var response providerErrorResponse
 	if err := decodeSingleJSON(data, &response); err != nil || response.Error.Param == nil {
-		return false, providerError("capability probe error response was invalid")
+		return false, false
 	}
 	if response.Error.Type != "invalid_request_error" || !unsupportedCode(response.Error.Code) || !attachmentParam(capability, *response.Error.Param) {
-		return false, providerError("capability probe request was rejected")
+		return false, true
 	}
-	return true, nil
+	return true, true
 }
 
 func unsupportedCode(code string) bool {

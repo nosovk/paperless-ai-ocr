@@ -31,6 +31,7 @@ const (
 	defaultBackoff          = time.Second
 	maximumBackoff          = 30 * time.Second
 	transitionTimeout       = 5 * time.Second
+	maxDocumentPages        = 10_000
 	failedDiagnostic        = "OCR processing failed"
 	retryDiagnostic         = "OCR processing interrupted"
 )
@@ -169,7 +170,9 @@ func (worker *Worker) Process(ctx context.Context, job queue.Job) (Result, error
 		return result, nil
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		worker.scheduleRetry(job)
+		if transitionErr := worker.scheduleRetry(job); transitionErr != nil {
+			return Result{}, transitionError(transitionErr)
+		}
 		return Result{}, err
 	}
 	var lostLease *lostLeaseError
@@ -177,7 +180,9 @@ func (worker *Worker) Process(ctx context.Context, job queue.Job) (Result, error
 		return Result{}, err
 	}
 	safeErr := publicError(err)
-	worker.fail(job, category(safeErr))
+	if transitionErr := worker.fail(job, category(safeErr)); transitionErr != nil {
+		return Result{}, transitionError(transitionErr)
+	}
 	return Result{}, safeErr
 }
 
@@ -195,6 +200,10 @@ func (worker *Worker) heartbeat(ctx context.Context, job queue.Job, cancel conte
 			return
 		case <-ticker.C:
 			if err := worker.options.Store.RenewLeaseContext(ctx, job.ID, job.Attempts, job.LeaseOwner, worker.options.LeaseDuration); err != nil {
+				if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+					done <- nil
+					return
+				}
 				cancel()
 				done <- &lostLeaseError{err: err}
 				return
@@ -264,9 +273,6 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 	if err != nil {
 		return Result{}, err
 	}
-	if info.Pages <= 0 {
-		return Result{}, saferr.New(saferr.CategoryRendering, "PDF inspection returned invalid page count")
-	}
 	if err := worker.renew(ctx, job); err != nil {
 		return Result{}, err
 	}
@@ -285,7 +291,10 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 	} else if capability == aigate.DirectPDF {
 		capability = aigate.PageImages
 	}
-	ranges := planRanges(info.Pages, worker.options.BatchSize, capability)
+	ranges, err := planRanges(info.Pages, worker.options.BatchSize, capability)
+	if err != nil {
+		return Result{}, err
+	}
 	checkpoints, err := worker.options.Store.EnsureBatchesContext(ctx, job.ID, job.Attempts, job.LeaseOwner, ranges, worker.options.RenderDPI, renderFormat)
 	if err != nil {
 		return Result{}, err
@@ -414,28 +423,31 @@ func (worker *Worker) renew(ctx context.Context, job queue.Job) error {
 	return nil
 }
 
-func (worker *Worker) fail(job queue.Job, errorCategory saferr.Category) {
+func (worker *Worker) fail(job queue.Job, errorCategory saferr.Category) error {
 	ctx, cancel := context.WithTimeout(context.Background(), transitionTimeout)
 	defer cancel()
-	_ = worker.options.Store.FailContext(ctx, job.ID, job.Attempts, job.LeaseOwner, queue.SafeDiagnostic{Category: errorCategory, Message: failedDiagnostic})
+	return worker.options.Store.FailContext(ctx, job.ID, job.Attempts, job.LeaseOwner, queue.SafeDiagnostic{Category: errorCategory, Message: failedDiagnostic})
 }
 
-func (worker *Worker) scheduleRetry(job queue.Job) {
+func (worker *Worker) scheduleRetry(job queue.Job) error {
 	ctx, cancel := context.WithTimeout(context.Background(), transitionTimeout)
 	defer cancel()
-	_ = worker.options.Store.ScheduleRetryContext(ctx, job.ID, job.Attempts, job.LeaseOwner,
+	return worker.options.Store.ScheduleRetryContext(ctx, job.ID, job.Attempts, job.LeaseOwner,
 		worker.options.Now().Add(worker.options.RetryDelay), queue.SafeDiagnostic{Category: saferr.CategoryInternal, Message: retryDiagnostic})
 }
 
-func planRanges(pages, batchSize int, capability aigate.Capability) []queue.BatchRange {
-	if capability == aigate.DirectPDF {
-		return []queue.BatchRange{{FirstPage: 1, LastPage: pages}}
+func planRanges(pages, batchSize int, capability aigate.Capability) ([]queue.BatchRange, error) {
+	if pages <= 0 || pages > maxDocumentPages {
+		return nil, saferr.New(saferr.CategoryRendering, "PDF page count exceeded supported limit")
 	}
-	ranges := make([]queue.BatchRange, 0, (pages+batchSize-1)/batchSize)
+	if capability == aigate.DirectPDF {
+		return []queue.BatchRange{{FirstPage: 1, LastPage: pages}}, nil
+	}
+	ranges := make([]queue.BatchRange, 0, pages/batchSize+1)
 	for firstPage := 1; firstPage <= pages; firstPage += batchSize {
 		ranges = append(ranges, queue.BatchRange{FirstPage: firstPage, LastPage: min(firstPage+batchSize-1, pages)})
 	}
-	return ranges
+	return ranges, nil
 }
 
 func readDirectPDF(path string) ([]byte, error) {
@@ -473,6 +485,14 @@ func publicError(err error) error {
 		return err
 	}
 	return saferr.New(saferr.CategoryInternal, "OCR processing failed")
+}
+
+func transitionError(err error) error {
+	var safeError *saferr.Error
+	if errors.As(err, &safeError) {
+		return saferr.New(safeError.Category(), "job state transition failed")
+	}
+	return saferr.New(saferr.CategoryInternal, "job state transition failed")
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {

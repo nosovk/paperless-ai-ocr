@@ -183,19 +183,55 @@ func TestDirectPDFEligible(t *testing.T) {
 	}
 }
 
-func TestTranscribeClassifiesUnsupportedAttachmentWithoutDisclosure(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		writer.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(writer, `{"error":{"type":"invalid_request_error","code":"unsupported_file","param":"input","message":"CANARY-provider-secret"}}`)
-	}))
-	defer server.Close()
-	client := newTestClient(t, server.URL+"/v1", "key", "model", ClientOptions{})
-	_, err := client.Transcribe(context.Background(), Transcription{Capability: DirectPDF, FirstPage: 1, LastPage: 1, PDF: []byte{1}})
-	if !UnsupportedAttachment(err) {
-		t.Fatalf("UnsupportedAttachment(%v) = false, want true", err)
+func TestTranscribeClassifiesOnlyStructuredDirectPDFAttachmentRejections(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		body       string
+		capability Capability
+		want       bool
+	}{
+		{name: "400 file data", status: http.StatusBadRequest, body: `{"error":{"type":"invalid_request_error","code":"unsupported_file","param":"input[0].content[1].file_data","message":"CANARY"}}`, capability: DirectPDF, want: true},
+		{name: "422 attachment", status: http.StatusUnprocessableEntity, body: `{"error":{"type":"invalid_request_error","code":"unsupported_document","param":"input[0].content[1]"}}`, capability: DirectPDF, want: true},
+		{name: "wrong status", status: http.StatusConflict, body: `{"error":{"type":"invalid_request_error","code":"unsupported_file","param":"input[0].content[1].file_data"}}`},
+		{name: "wrong type", status: http.StatusBadRequest, body: `{"error":{"type":"unsupported_file","code":"unsupported_file","param":"input[0].content[1].file_data"}}`},
+		{name: "wrong code", status: http.StatusBadRequest, body: `{"error":{"type":"invalid_request_error","code":"attachment_too_large","param":"input[0].content[1].file_data"}}`},
+		{name: "unrelated file", status: http.StatusBadRequest, body: `{"error":{"type":"invalid_request_error","code":"unsupported_file","param":"metadata.file"}}`},
+		{name: "image parameter", status: http.StatusBadRequest, body: `{"error":{"type":"invalid_request_error","code":"unsupported_file","param":"input[0].content[1].image_url"}}`},
+		{name: "image request direct PDF parameter", status: http.StatusBadRequest, body: `{"error":{"type":"invalid_request_error","code":"unsupported_file","param":"input[0].content[1].file_data"}}`, capability: PageImages},
+		{name: "auth", status: http.StatusUnauthorized, body: `{"error":{"type":"invalid_request_error","code":"unsupported_file","param":"input[0].content[1].file_data"}}`},
+		{name: "rate limit", status: http.StatusTooManyRequests, body: `{"error":{"type":"invalid_request_error","code":"unsupported_file","param":"input[0].content[1].file_data"}}`},
+		{name: "server", status: http.StatusBadGateway, body: `{"error":{"type":"invalid_request_error","code":"unsupported_file","param":"input[0].content[1].file_data"}}`},
+		{name: "malformed", status: http.StatusBadRequest, body: `{`},
 	}
-	if strings.Contains(fmt.Sprintf("%v|%+v|%#v", err, err, err), "CANARY") {
-		t.Fatalf("unsupported error disclosed provider body: %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			capability := test.capability
+			if capability == "" {
+				capability = DirectPDF
+			}
+			if got, valid := unsupportedAttachment(capability, test.status, []byte(test.body)); got != test.want {
+				t.Fatalf("unsupportedAttachment() = %t, valid %t, want %t", got, valid, test.want)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(test.status)
+				_, _ = io.WriteString(writer, test.body)
+			}))
+			defer server.Close()
+			client := newTestClient(t, server.URL+"/v1", "key", "model", ClientOptions{})
+			input := Transcription{Capability: capability, FirstPage: 1, LastPage: 1, PDF: []byte{1}}
+			if capability == PageImages {
+				input.PDF = nil
+				input.Images = [][]byte{{1}}
+			}
+			_, err := client.Transcribe(context.Background(), input)
+			if got := UnsupportedAttachment(err); got != test.want {
+				t.Fatalf("UnsupportedAttachment(%v) = %t, want %t", err, got, test.want)
+			}
+			if strings.Contains(fmt.Sprintf("%v|%+v|%#v", err, err, err), "CANARY") {
+				t.Fatalf("error disclosed provider body: %v", err)
+			}
+		})
 	}
 }
 

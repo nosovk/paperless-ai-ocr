@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -182,6 +183,69 @@ func TestProcessRenewsLeaseDuringLongModelRequest(t *testing.T) {
 	}
 }
 
+func TestHeartbeatShutdownIgnoresInFlightRenewalCancellation(t *testing.T) {
+	fixture := newFixture(t, 1, aigate.PageImages)
+	fixture.worker.options.LeaseDuration = 3 * time.Millisecond
+	fixture.store.blockRenewAt = 1
+	fixture.store.renewStarted = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go fixture.worker.heartbeat(ctx, fixture.job, cancel, done)
+	<-fixture.store.renewStarted
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("heartbeat shutdown error = %v, want nil", err)
+	}
+}
+
+func TestHeartbeatGenuineRenewalFailureCancelsProcessing(t *testing.T) {
+	fixture := newFixture(t, 1, aigate.PageImages)
+	fixture.worker.options.LeaseDuration = 3 * time.Millisecond
+	fixture.store.renewErrAt = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go fixture.worker.heartbeat(ctx, fixture.job, cancel, done)
+	err := <-done
+	var lostLease *lostLeaseError
+	if !errors.As(err, &lostLease) || !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("heartbeat = %v, context = %v, want lost lease and canceled processing", err, ctx.Err())
+	}
+}
+
+func TestProcessShutdownPreservesSuccessCancellationAndDeadline(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*fixture) context.Context
+		want  error
+	}{
+		{name: "success", setup: func(*fixture) context.Context { return context.Background() }},
+		{name: "caller cancel", setup: func(fixture *fixture) context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			fixture.transcriber.after = cancel
+			return ctx
+		}, want: context.Canceled},
+		{name: "deadline", setup: func(fixture *fixture) context.Context {
+			fixture.worker.options.DocumentDeadline = time.Nanosecond
+			return context.Background()
+		}, want: context.DeadlineExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFixture(t, 1, aigate.PageImages)
+			fixture.worker.options.LeaseDuration = time.Nanosecond
+			result, err := fixture.worker.Process(test.setup(fixture), fixture.job)
+			if test.want == nil && (err != nil || result.Content == "") {
+				t.Fatalf("Process() = (%+v, %v), want success", result, err)
+			}
+			if test.want != nil && !errors.Is(err, test.want) {
+				t.Fatalf("Process() error = %v, want %v", err, test.want)
+			}
+			if errors.As(err, new(*lostLeaseError)) {
+				t.Fatalf("shutdown replaced process outcome: %v", err)
+			}
+		})
+	}
+}
+
 func TestProcessCleansWorkspaceAndRenderedImagesOnFailure(t *testing.T) {
 	fixture := newFixture(t, 1, aigate.PageImages)
 	fixture.transcriber.errors = []error{saferr.New(saferr.CategoryProvider, "permanent")}
@@ -214,6 +278,73 @@ func TestProcessDoesNotDiscloseDependencyErrors(t *testing.T) {
 	formatted := fmt.Sprintf("%s|%q|%v|%+v|%#v", err, err, err, err, err)
 	if strings.Contains(formatted, "CANARY") || strings.Contains(formatted, "document bytes") {
 		t.Fatalf("Process() error disclosed dependency data: %s", formatted)
+	}
+}
+
+func TestProcessReturnsTerminalTransitionFailure(t *testing.T) {
+	for _, transitionErr := range []error{
+		saferr.New(saferr.CategoryValidation, "stale lease"),
+		errors.New("CANARY database path secret"),
+	} {
+		fixture := newFixture(t, 1, aigate.PageImages)
+		fixture.transcriber.errors = []error{saferr.New(saferr.CategoryProvider, "provider rejected request")}
+		fixture.store.failErr = transitionErr
+		_, err := fixture.worker.Process(context.Background(), fixture.job)
+		if err == nil || fixture.store.failed {
+			t.Fatalf("Process() = %v, failed=%t, want transition failure", err, fixture.store.failed)
+		}
+		if err.Error() == "provider: provider rejected request" {
+			t.Fatalf("Process() returned processing error instead of transition failure: %v", err)
+		}
+		if strings.Contains(fmt.Sprintf("%v|%+v|%#v", err, err, err), "CANARY") {
+			t.Fatalf("transition error disclosed database details: %v", err)
+		}
+	}
+}
+
+func TestProcessReturnsRetryTransitionFailureWithoutContextSentinel(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "stale", err: saferr.New(saferr.CategoryValidation, "stale lease")},
+		{name: "database", err: errors.New("CANARY sqlite database secret")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFixture(t, 1, aigate.PageImages)
+			fixture.store.retryErr = test.err
+			ctx, cancel := context.WithCancel(context.Background())
+			fixture.transcriber.after = cancel
+			_, err := fixture.worker.Process(ctx, fixture.job)
+			if err == nil || fixture.store.retried || errors.Is(err, context.Canceled) {
+				t.Fatalf("Process() = %v, retried=%t, want transition failure without context sentinel", err, fixture.store.retried)
+			}
+			if strings.Contains(fmt.Sprintf("%v|%+v|%#v", err, err, err), "CANARY") {
+				t.Fatalf("transition error disclosed database details: %v", err)
+			}
+		})
+	}
+}
+
+func TestPlanRangesBoundsPageCountWithoutOverflow(t *testing.T) {
+	ranges, err := planRanges(maxDocumentPages, 5, aigate.PageImages)
+	if err != nil || len(ranges) != maxDocumentPages/5 || ranges[len(ranges)-1].LastPage != maxDocumentPages {
+		t.Fatalf("planRanges(max) = (%d ranges, %v)", len(ranges), err)
+	}
+	for _, pages := range []int{0, -1, maxDocumentPages + 1, math.MaxInt} {
+		if _, err := planRanges(pages, 5, aigate.PageImages); errorCategory(err) != saferr.CategoryRendering {
+			t.Fatalf("planRanges(%d) error = %v, want rendering", pages, err)
+		}
+	}
+}
+
+func TestProcessRejectsExcessiveInspectorPageCountBeforeBatchesOrModel(t *testing.T) {
+	for _, pages := range []int{maxDocumentPages + 1, math.MaxInt} {
+		fixture := newFixture(t, pages, aigate.PageImages)
+		_, err := fixture.worker.Process(context.Background(), fixture.job)
+		if errorCategory(err) != saferr.CategoryRendering || fixture.transcriber.calls != 0 || fixture.renderer.calls != 0 || len(fixture.store.batches) != 0 {
+			t.Fatalf("Process(%d pages) = err %v, model/render/batches %d/%d/%d", pages, err, fixture.transcriber.calls, fixture.renderer.calls, len(fixture.store.batches))
+		}
 	}
 }
 
@@ -275,22 +406,40 @@ func newFixture(t *testing.T, pages int, capability aigate.Capability) *fixture 
 }
 
 type fakeStore struct {
-	mu         sync.Mutex
-	job        queue.Job
-	batches    []queue.Batch
-	renews     int
-	renewErrAt int
-	failed     bool
-	completed  bool
-	retried    bool
-	diagnostic queue.SafeDiagnostic
+	mu           sync.Mutex
+	job          queue.Job
+	batches      []queue.Batch
+	renews       int
+	renewErrAt   int
+	failed       bool
+	completed    bool
+	retried      bool
+	diagnostic   queue.SafeDiagnostic
+	blockRenewAt int
+	renewStarted chan struct{}
+	failErr      error
+	retryErr     error
 }
 
-func (store *fakeStore) RenewLeaseContext(context.Context, int64, int, string, time.Duration) error {
+func (store *fakeStore) RenewLeaseContext(ctx context.Context, _ int64, _ int, _ string, _ time.Duration) error {
 	store.mu.Lock()
-	defer store.mu.Unlock()
 	store.renews++
-	if store.renewErrAt != 0 && store.renews >= store.renewErrAt {
+	if store.renewStarted != nil {
+		select {
+		case <-store.renewStarted:
+		default:
+			close(store.renewStarted)
+		}
+	}
+	block := store.blockRenewAt != 0 && store.renews == store.blockRenewAt
+	renewErrAt := store.renewErrAt
+	renames := store.renews
+	store.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if renewErrAt != 0 && renames >= renewErrAt {
 		return saferr.New(saferr.CategoryValidation, "stale lease")
 	}
 	return nil
@@ -331,10 +480,16 @@ func (store *fakeStore) CheckpointBatchContext(_ context.Context, _ int64, _ int
 	return errors.New("missing batch")
 }
 func (store *fakeStore) FailContext(_ context.Context, _ int64, _ int, _ string, diagnostic queue.SafeDiagnostic) error {
+	if store.failErr != nil {
+		return store.failErr
+	}
 	store.failed, store.diagnostic = true, diagnostic
 	return nil
 }
 func (store *fakeStore) ScheduleRetryContext(context.Context, int64, int, string, time.Time, queue.SafeDiagnostic) error {
+	if store.retryErr != nil {
+		return store.retryErr
+	}
 	store.retried = true
 	return nil
 }
@@ -391,9 +546,10 @@ type fakeTranscriber struct {
 	errors                   []error
 	after                    func()
 	wait                     <-chan struct{}
+	waitContext              bool
 }
 
-func (transcriber *fakeTranscriber) Transcribe(_ context.Context, input aigate.Transcription) (json.RawMessage, error) {
+func (transcriber *fakeTranscriber) Transcribe(ctx context.Context, input aigate.Transcription) (json.RawMessage, error) {
 	transcriber.mu.Lock()
 	transcriber.calls++
 	transcriber.active++
@@ -408,6 +564,10 @@ func (transcriber *fakeTranscriber) Transcribe(_ context.Context, input aigate.T
 	if transcriber.wait != nil {
 		<-transcriber.wait
 	}
+	if transcriber.waitContext {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if call <= len(transcriber.errors) && transcriber.errors[call-1] != nil {
 		return nil, transcriber.errors[call-1]
 	}
@@ -421,6 +581,14 @@ func rawPages(firstPage, lastPage int) string {
 	}
 	raw, _ := json.Marshal(map[string]any{"pages": pages})
 	return string(raw)
+}
+
+func errorCategory(err error) saferr.Category {
+	var safeError *saferr.Error
+	if errors.As(err, &safeError) {
+		return safeError.Category()
+	}
+	return ""
 }
 
 type retryableError struct{ delay time.Duration }

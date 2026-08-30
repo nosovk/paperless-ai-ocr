@@ -218,7 +218,7 @@ func (client *Client) transcribe(ctx context.Context, input Transcription, encod
 	defer response.Body.Close()
 	data, err := readLimited(response.Body, client.maxResponseBytes)
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, client.transcriptionStatusError(response.StatusCode, response.Header.Get("Retry-After"), data)
+		return nil, client.transcriptionStatusError(input.Capability, response.StatusCode, response.Header.Get("Retry-After"), data)
 	}
 	if err != nil {
 		return nil, providerError("transcription response was invalid")
@@ -398,7 +398,7 @@ func transcriptionOutput(data []byte) (json.RawMessage, error) {
 	return bytes.Clone(raw), nil
 }
 
-func (client *Client) transcriptionStatusError(statusCode int, retryAfter string, data []byte) error {
+func (client *Client) transcriptionStatusError(capability Capability, statusCode int, retryAfter string, data []byte) error {
 	var class RetryClass
 	switch {
 	case statusCode == http.StatusTooManyRequests:
@@ -408,20 +408,12 @@ func (client *Client) transcriptionStatusError(statusCode int, retryAfter string
 	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
 		return providerError("transcription authentication failed")
 	default:
-		if statusCode == http.StatusBadRequest && unsupportedAttachmentResponse(data) {
+		if unsupported, _ := unsupportedAttachment(capability, statusCode, data); unsupported {
 			return &unsupportedAttachmentError{err: providerError("transcription attachment is unsupported")}
 		}
 		return providerError("transcription request was rejected")
 	}
 	return newRetryError(class, parseRetryAfter(retryAfter, time.Now()))
-}
-
-func unsupportedAttachmentResponse(data []byte) bool {
-	var response providerErrorResponse
-	if decodeSingleJSON(data, &response) != nil {
-		return false
-	}
-	return response.Error.Code == "unsupported_file" || response.Error.Code == "unsupported_attachment" || response.Error.Type == "unsupported_file"
 }
 
 func newRetryError(class RetryClass, delay time.Duration) error {
