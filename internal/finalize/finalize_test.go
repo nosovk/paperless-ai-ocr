@@ -2,16 +2,23 @@ package finalize
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/nosovk/paperless-ai-ocr/internal/aigate"
+	"github.com/nosovk/paperless-ai-ocr/internal/database"
+	"github.com/nosovk/paperless-ai-ocr/internal/ocr"
 	"github.com/nosovk/paperless-ai-ocr/internal/paperless"
 	"github.com/nosovk/paperless-ai-ocr/internal/paperlessai"
+	"github.com/nosovk/paperless-ai-ocr/internal/pdf"
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
 	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
 	"github.com/nosovk/paperless-ai-ocr/internal/worker"
@@ -33,6 +40,97 @@ func TestProcessOrdersAndCheckpointsEverySuccessEffect(t *testing.T) {
 	}
 	if !slices.Equal(fixture.trace.snapshot(), want) {
 		t.Errorf("trace =\n%q\nwant\n%q", fixture.trace.snapshot(), want)
+	}
+}
+
+func TestProcessAcceptsReconstructedResultWithoutDownloadHash(t *testing.T) {
+	fixture := newFixture(t, queue.FinalizationContentUpdated)
+	fixture.result.DownloadSHA256 = ""
+
+	if err := fixture.finalizer.Process(context.Background(), fixture.job, fixture.result); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if !slices.Contains(fixture.trace.snapshot(), "complete") {
+		t.Errorf("trace = %q, want completed finalization", fixture.trace.snapshot())
+	}
+}
+
+func TestDurableRestartReconstructsAndCompletesFinalization(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	store := queue.New(db)
+	_, created, err := store.Enqueue(queue.EnqueueInput{DocumentID: 42, SourceChecksum: "source-checksum",
+		Priority: queue.PriorityWebhook, Model: "model", PromptVersion: ocr.Version})
+	if err != nil || !created {
+		t.Fatalf("Enqueue() = (%t, %v)", created, err)
+	}
+	job, ok, err := store.Claim("owner-1", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim() = (%+v, %t, %v)", job, ok, err)
+	}
+	ranges := []queue.BatchRange{{FirstPage: 1, LastPage: 2}}
+	if _, err := store.EnsureBatchesContext(context.Background(), job.ID, job.Attempts, job.LeaseOwner, ranges, 200, "png"); err != nil {
+		t.Fatal(err)
+	}
+	canonical := `{"pages":[{"page":1,"text":"one","refused":false},{"page":2,"text":"two","refused":false}]}`
+	if err := store.CheckpointBatchContext(context.Background(), job.ID, job.Attempts, job.LeaseOwner, ranges[0], 200, "png", canonical); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireFinalizationContext(context.Background(), job.ID, job.Attempts, job.LeaseOwner, "initial", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, job.LeaseOwner, "initial",
+		queue.FinalizationPending, queue.FinalizationContentUpdated); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE jobs SET state = 'retry', available_at = '2000-01-01T00:00:00.000000000Z',
+		lease_owner = NULL, lease_expires_at = NULL WHERE id = ?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, ok, err = store.Claim("owner-2", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("reclaim = (%+v, %t, %v)", job, ok, err)
+	}
+
+	external := &restartPaperless{document: paperless.Document{ID: 42, Checksum: "source-checksum", Content: "already updated", Tags: []int{12}}}
+	ocrWorker, err := worker.New(worker.Options{Store: store, Paperless: external, Capability: aigate.PageImages,
+		Transcriber: restartTranscriber{}, Inspector: restartInspector{}, Renderer: restartRenderer{}, Model: "model",
+		BatchSize: 5, RenderDPI: 200, LeaseDuration: time.Minute, WorkspaceOptions: pdf.WorkspaceOptions{TemporaryByteBudget: 1 << 20}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := ocrWorker.Process(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Worker.Process() error = %v", err)
+	}
+	if result.DownloadSHA256 != "" || !strings.Contains(result.Content, "one") || !strings.Contains(result.Content, "two") {
+		t.Fatalf("reconstructed result = %+v", result)
+	}
+	if external.workerCalls != 0 {
+		t.Fatalf("worker external calls = %d, want 0", external.workerCalls)
+	}
+
+	dispatcher := &restartDispatcher{}
+	finalizer, err := New(Options{Store: store, Paperless: external, Dispatcher: dispatcher,
+		LeaseDuration: time.Minute, RetryDelay: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizer.Process(context.Background(), job, result); err != nil {
+		t.Fatalf("Finalizer.Process() error = %v", err)
+	}
+	if dispatcher.calls != 1 || external.contentUpdates != 0 {
+		t.Fatalf("dispatch/content updates = %d/%d, want 1/0", dispatcher.calls, external.contentUpdates)
+	}
+	var state string
+	if err := db.QueryRow("SELECT state FROM jobs WHERE id = ?", job.ID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(queue.StateCompleted) {
+		t.Errorf("job state = %q, want completed", state)
 	}
 }
 
@@ -650,6 +748,72 @@ type retrySafeError struct{}
 
 func (retrySafeError) Error() string   { return "confirmed rejection" }
 func (retrySafeError) RetrySafe() bool { return true }
+
+type restartPaperless struct {
+	document       paperless.Document
+	workerCalls    int
+	contentUpdates int
+}
+
+func (client *restartPaperless) GetDocument(_ context.Context, _ int) (paperless.Document, error) {
+	return client.document, nil
+}
+
+func (client *restartPaperless) DownloadOriginal(context.Context, int, io.Writer) error {
+	client.workerCalls++
+	return errors.New("unexpected download")
+}
+
+func (client *restartPaperless) UpdateContent(context.Context, int, string) error {
+	client.contentUpdates++
+	return nil
+}
+
+func (*restartPaperless) EnsureTag(_ context.Context, name string) (paperless.Tag, error) {
+	if name == completeTagName {
+		return paperless.Tag{ID: 11, Name: name}, nil
+	}
+	return paperless.Tag{ID: 12, Name: name}, nil
+}
+
+func (client *restartPaperless) UpdateTags(_ context.Context, _ int, current, add, remove []int) error {
+	tags := slices.Clone(current)
+	for _, id := range remove {
+		tags = slices.DeleteFunc(tags, func(current int) bool { return current == id })
+	}
+	for _, id := range add {
+		if !slices.Contains(tags, id) {
+			tags = append(tags, id)
+		}
+	}
+	client.document.Tags = tags
+	return nil
+}
+
+type restartTranscriber struct{}
+
+func (restartTranscriber) Transcribe(context.Context, aigate.Transcription) (json.RawMessage, error) {
+	return nil, errors.New("unexpected transcription")
+}
+
+type restartInspector struct{}
+
+func (restartInspector) Inspect(context.Context, *pdf.Workspace, string) (pdf.Info, error) {
+	return pdf.Info{}, errors.New("unexpected inspection")
+}
+
+type restartRenderer struct{}
+
+func (restartRenderer) Render(context.Context, *pdf.Workspace, string, int, int, func([]pdf.Page) error) error {
+	return errors.New("unexpected rendering")
+}
+
+type restartDispatcher struct{ calls int }
+
+func (dispatcher *restartDispatcher) Dispatch(context.Context, int) error {
+	dispatcher.calls++
+	return nil
+}
 
 func assertSafeError(t *testing.T, err error, category saferr.Category) {
 	t.Helper()

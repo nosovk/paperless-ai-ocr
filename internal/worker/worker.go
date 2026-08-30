@@ -108,9 +108,9 @@ type lostLeaseError struct{}
 
 func (*lostLeaseError) Error() string { return "active job lease was lost" }
 
-type successFinalizationStartedError struct{}
+type reconstructionError struct{ cause error }
 
-func (*successFinalizationStartedError) Error() string { return "success finalization already started" }
+func (err *reconstructionError) Error() string { return err.cause.Error() }
 
 // New validates deterministic worker dependencies.
 func New(options Options) (*Worker, error) {
@@ -190,9 +190,9 @@ func (worker *Worker) Process(ctx context.Context, job queue.Job) (Result, error
 	if errors.As(err, &lostLease) {
 		return Result{}, saferr.New(saferr.CategoryValidation, "active job lease was lost")
 	}
-	var finalizationStarted *successFinalizationStartedError
-	if errors.As(err, &finalizationStarted) {
-		return Result{}, saferr.New(saferr.CategoryValidation, "success finalization already started")
+	var reconstruction *reconstructionError
+	if errors.As(err, &reconstruction) {
+		return Result{}, publicError(reconstruction.cause)
 	}
 	safeErr := publicError(err)
 	if transitionErr := worker.recordTerminalFailure(job, category(safeErr)); transitionErr != nil {
@@ -242,7 +242,7 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 	if started, err := worker.options.Store.SuccessFinalizationStartedContext(ctx, job.ID, job.Attempts, job.LeaseOwner); err != nil {
 		return Result{}, err
 	} else if started {
-		return Result{}, &successFinalizationStartedError{}
+		return worker.reconstructResult(ctx, job)
 	}
 	documentID, err := safeDocumentID(job.DocumentID)
 	if err != nil {
@@ -361,6 +361,41 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 	}
 	return Result{JobID: job.ID, DocumentID: job.DocumentID, SourceChecksum: job.SourceChecksum,
 		DownloadSHA256: hex.EncodeToString(hash.Sum(nil)), Content: content}, nil
+}
+
+func (worker *Worker) reconstructResult(ctx context.Context, job queue.Job) (Result, error) {
+	checkpoints, err := worker.options.Store.ListBatchesContext(ctx, job.ID, job.Attempts, job.LeaseOwner)
+	if err != nil {
+		return Result{}, &reconstructionError{cause: err}
+	}
+	if len(checkpoints) == 0 {
+		return Result{}, invalidReconstruction()
+	}
+	validated := make([]ocr.Batch, len(checkpoints))
+	for index, checkpoint := range checkpoints {
+		if checkpoint.JobID != job.ID || checkpoint.State != queue.StateCompleted || strings.TrimSpace(checkpoint.ResultText) == "" {
+			return Result{}, invalidReconstruction()
+		}
+		batch, _, err := ocr.ValidateCanonical([]byte(checkpoint.ResultText), checkpoint.FirstPage, checkpoint.LastPage)
+		if err != nil {
+			return Result{}, invalidReconstruction()
+		}
+		validated[index] = batch
+	}
+	content, err := ocr.Join(validated)
+	if err != nil {
+		return Result{}, invalidReconstruction()
+	}
+	return Result{
+		JobID:          job.ID,
+		DocumentID:     job.DocumentID,
+		SourceChecksum: job.SourceChecksum,
+		Content:        content,
+	}, nil
+}
+
+func invalidReconstruction() error {
+	return &reconstructionError{cause: saferr.New(saferr.CategoryValidation, "durable OCR checkpoints are incomplete")}
 }
 
 func (worker *Worker) renderTranscribeAndCheckpoint(ctx context.Context, job queue.Job, workspace *pdf.Workspace, pageRange queue.BatchRange, draft string) (ocr.Batch, error) {

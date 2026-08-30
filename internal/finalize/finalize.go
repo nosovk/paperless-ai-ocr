@@ -462,7 +462,7 @@ func validateSuccessInput(ctx context.Context, job queue.Job, result worker.Resu
 		return err
 	}
 	if result.JobID != job.ID || result.DocumentID != job.DocumentID || result.SourceChecksum != job.SourceChecksum ||
-		strings.TrimSpace(result.SourceChecksum) == "" || strings.TrimSpace(result.DownloadSHA256) == "" || strings.TrimSpace(result.Content) == "" {
+		strings.TrimSpace(result.SourceChecksum) == "" || strings.TrimSpace(result.Content) == "" {
 		return saferr.New(saferr.CategoryValidation, "OCR result does not match claimed job")
 	}
 	return nil

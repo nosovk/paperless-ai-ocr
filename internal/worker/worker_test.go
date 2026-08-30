@@ -90,6 +90,7 @@ func TestProcessFallsBackOnlyForUnsupportedDirectAttachment(t *testing.T) {
 func TestProcessSkipsOCRWhenTerminalFailureIntentAlreadyExists(t *testing.T) {
 	fixture := newFixture(t, 1, aigate.PageImages)
 	fixture.store.terminal = true
+	fixture.store.finalizationStarted = true
 	fixture.store.diagnostic = queue.SafeDiagnostic{Category: saferr.CategoryRendering, Message: "OCR processing failed"}
 
 	_, err := fixture.worker.Process(context.Background(), fixture.job)
@@ -99,19 +100,81 @@ func TestProcessSkipsOCRWhenTerminalFailureIntentAlreadyExists(t *testing.T) {
 	if fixture.paperless.getCalls != 0 || fixture.renderer.calls != 0 || fixture.transcriber.callCount() != 0 {
 		t.Fatalf("terminal resume did Paperless/render/model work = %d/%d/%d", fixture.paperless.getCalls, fixture.renderer.calls, fixture.transcriber.callCount())
 	}
+	if fixture.store.listJobID != 0 {
+		t.Fatal("terminal failure intent did not take precedence over success reconstruction")
+	}
 }
 
-func TestProcessSkipsOCRWhenSuccessFinalizationAlreadyStarted(t *testing.T) {
-	fixture := newFixture(t, 1, aigate.PageImages)
-	fixture.store.finalizationStarted = true
+func TestProcessReconstructsResultWhenSuccessFinalizationAlreadyStarted(t *testing.T) {
+	for _, stage := range []queue.FinalizationStage{
+		queue.FinalizationContentUpdated,
+		queue.FinalizationCompleteTagAdded,
+		queue.FinalizationFailedTagRemoved,
+		queue.FinalizationMetadataDispatched,
+	} {
+		t.Run(string(stage), func(t *testing.T) {
+			fixture := newFixture(t, 6, aigate.PageImages)
+			fixture.store.finalizationStarted = true
+			fixture.store.batches = []queue.Batch{
+				{JobID: fixture.job.ID, FirstPage: 1, LastPage: 5, RenderDPI: 200, RenderFormat: "png", State: queue.StateCompleted, ResultText: rawPages(1, 5)},
+				{JobID: fixture.job.ID, FirstPage: 6, LastPage: 6, RenderDPI: 200, RenderFormat: "png", State: queue.StateCompleted, ResultText: rawPages(6, 6)},
+			}
 
-	_, err := fixture.worker.Process(context.Background(), fixture.job)
-	if errorCategory(err) != saferr.CategoryValidation {
-		t.Fatalf("Process() error = %v, want validation category", err)
+			result, err := fixture.worker.Process(context.Background(), fixture.job)
+			if err != nil {
+				t.Fatalf("Process() error = %v", err)
+			}
+			if result.JobID != fixture.job.ID || result.DocumentID != fixture.job.DocumentID ||
+				result.SourceChecksum != fixture.job.SourceChecksum || result.DownloadSHA256 != "" ||
+				!strings.Contains(result.Content, "PAGE 1") || !strings.Contains(result.Content, "PAGE 6") {
+				t.Errorf("reconstructed result = %+v", result)
+			}
+			if fixture.store.terminal || fixture.paperless.getCalls != 0 || fixture.renderer.calls != 0 || fixture.transcriber.callCount() != 0 {
+				t.Fatalf("reconstruction mutated terminal/Paperless/render/model = %t/%d/%d/%d",
+					fixture.store.terminal, fixture.paperless.getCalls, fixture.renderer.calls, fixture.transcriber.callCount())
+			}
+		})
 	}
-	if fixture.store.terminal || fixture.paperless.getCalls != 0 || fixture.renderer.calls != 0 || fixture.transcriber.callCount() != 0 {
-		t.Fatalf("finalization resume mutated terminal/Paperless/render/model = %t/%d/%d/%d",
-			fixture.store.terminal, fixture.paperless.getCalls, fixture.renderer.calls, fixture.transcriber.callCount())
+}
+
+func TestProcessRejectsInvalidFinalizationReconstructionWithoutOCR(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		batches []queue.Batch
+	}{
+		{name: "no batches"},
+		{name: "pending batch", batches: []queue.Batch{
+			{FirstPage: 1, LastPage: 5, State: queue.StateCompleted, ResultText: rawPages(1, 5)},
+			{FirstPage: 6, LastPage: 6, State: queue.StatePending},
+		}},
+		{name: "malformed completed batch", batches: []queue.Batch{
+			{FirstPage: 1, LastPage: 1, State: queue.StateCompleted, ResultText: `{"pages":[]}`},
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFixture(t, 6, aigate.PageImages)
+			fixture.store.finalizationStarted = true
+			fixture.store.batches = test.batches
+			for index := range fixture.store.batches {
+				fixture.store.batches[index].JobID = fixture.job.ID
+			}
+
+			_, err := fixture.worker.Process(context.Background(), fixture.job)
+			if errorCategory(err) != saferr.CategoryValidation {
+				t.Fatalf("Process() error = %v, want validation category", err)
+			}
+			if fixture.store.terminal {
+				t.Fatal("invalid reconstruction recorded terminal failure after success finalization started")
+			}
+			if fixture.store.listJobID != fixture.job.ID || fixture.store.listAttempt != fixture.job.Attempts || fixture.store.listOwner != fixture.job.LeaseOwner {
+				t.Errorf("ListBatchesContext() lease identity = %d/%d/%q, want %d/%d/%q", fixture.store.listJobID,
+					fixture.store.listAttempt, fixture.store.listOwner, fixture.job.ID, fixture.job.Attempts, fixture.job.LeaseOwner)
+			}
+			if fixture.paperless.getCalls != 0 || fixture.renderer.calls != 0 || fixture.transcriber.callCount() != 0 {
+				t.Fatalf("invalid reconstruction performed Paperless/render/model work = %d/%d/%d",
+					fixture.paperless.getCalls, fixture.renderer.calls, fixture.transcriber.callCount())
+			}
+		})
 	}
 }
 
@@ -643,6 +706,9 @@ type fakeStore struct {
 	renewErr            error
 	terminal            bool
 	finalizationStarted bool
+	listJobID           int64
+	listAttempt         int
+	listOwner           string
 }
 
 func (store *fakeStore) TerminalFailureContext(context.Context, int64, int, string) (queue.SafeDiagnostic, bool, error) {
@@ -707,7 +773,10 @@ func (store *fakeStore) EnsureBatchesContext(_ context.Context, jobID int64, _ i
 	}
 	return append([]queue.Batch(nil), store.batches...), nil
 }
-func (store *fakeStore) ListBatchesContext(context.Context, int64, int, string) ([]queue.Batch, error) {
+func (store *fakeStore) ListBatchesContext(_ context.Context, jobID int64, attempt int, owner string) ([]queue.Batch, error) {
+	store.listJobID = jobID
+	store.listAttempt = attempt
+	store.listOwner = owner
 	return append([]queue.Batch(nil), store.batches...), nil
 }
 func (store *fakeStore) CheckpointBatchContext(_ context.Context, _ int64, _ int, _ string, pageRange queue.BatchRange, _ int, _ string, result string) error {
