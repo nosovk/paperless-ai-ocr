@@ -34,7 +34,6 @@ const (
 	maximumBackoff          = 30 * time.Second
 	transitionTimeout       = 5 * time.Second
 	maxDocumentPages        = 10_000
-	failedDiagnostic        = "OCR processing failed"
 	retryDiagnostic         = "OCR processing interrupted"
 )
 
@@ -44,7 +43,6 @@ type Store interface {
 	EnsureBatchesContext(context.Context, int64, int, string, []queue.BatchRange, int, string) ([]queue.Batch, error)
 	ListBatchesContext(context.Context, int64, int, string) ([]queue.Batch, error)
 	CheckpointBatchContext(context.Context, int64, int, string, queue.BatchRange, int, string, string) error
-	FailContext(context.Context, int64, int, string, queue.SafeDiagnostic) error
 	ScheduleRetryContext(context.Context, int64, int, string, time.Time, queue.SafeDiagnostic) error
 }
 
@@ -185,11 +183,7 @@ func (worker *Worker) Process(ctx context.Context, job queue.Job) (Result, error
 	if errors.As(err, &lostLease) {
 		return Result{}, saferr.New(saferr.CategoryValidation, "active job lease was lost")
 	}
-	safeErr := publicError(err)
-	if transitionErr := worker.fail(job, category(safeErr)); transitionErr != nil {
-		return Result{}, transitionError(transitionErr)
-	}
-	return Result{}, safeErr
+	return Result{}, publicError(err)
 }
 
 func (worker *Worker) heartbeat(ctx context.Context, job queue.Job, cancel context.CancelFunc, done chan<- error) {
@@ -455,12 +449,6 @@ func (worker *Worker) renew(ctx context.Context, job queue.Job) error {
 	return nil
 }
 
-func (worker *Worker) fail(job queue.Job, errorCategory saferr.Category) error {
-	ctx, cancel := context.WithTimeout(context.Background(), transitionTimeout)
-	defer cancel()
-	return worker.options.Store.FailContext(ctx, job.ID, job.Attempts, job.LeaseOwner, queue.SafeDiagnostic{Category: errorCategory, Message: failedDiagnostic})
-}
-
 func (worker *Worker) scheduleRetry(job queue.Job) error {
 	ctx, cancel := context.WithTimeout(context.Background(), transitionTimeout)
 	defer cancel()
@@ -501,14 +489,6 @@ func safeDocumentID(id int64) (int, error) {
 		return 0, saferr.New(saferr.CategoryValidation, "document ID is outside supported range")
 	}
 	return converted, nil
-}
-
-func category(err error) saferr.Category {
-	var safeError *saferr.Error
-	if errors.As(err, &safeError) {
-		return safeError.Category()
-	}
-	return saferr.CategoryInternal
 }
 
 func publicError(err error) error {

@@ -17,6 +17,19 @@ const (
 	StateFailed     State = "failed"
 )
 
+// FinalizationStage is the last externally confirmed finalization side effect.
+type FinalizationStage string
+
+const (
+	FinalizationPending            FinalizationStage = "pending"
+	FinalizationContentUpdated     FinalizationStage = "content_updated"
+	FinalizationCompleteTagAdded   FinalizationStage = "complete_tag_added"
+	FinalizationFailedTagRemoved   FinalizationStage = "failed_tag_removed"
+	FinalizationMetadataDispatched FinalizationStage = "metadata_dispatched"
+	FinalizationFailurePending     FinalizationStage = "failure_pending"
+	FinalizationFailureTagAdded    FinalizationStage = "failure_tag_added"
+)
+
 // Priority controls claim order. Higher values are claimed first.
 type Priority int
 

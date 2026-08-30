@@ -79,8 +79,8 @@ func TestProcessFallsBackOnlyForUnsupportedDirectAttachment(t *testing.T) {
 
 	fixture = newFixture(t, 2, aigate.DirectPDF)
 	fixture.transcriber.errors = []error{saferr.New(saferr.CategoryProvider, "transcription authentication failed")}
-	if _, err := fixture.worker.Process(context.Background(), fixture.job); err == nil || fixture.renderer.calls != 0 || !fixture.store.failed {
-		t.Fatalf("permanent direct failure = err %v render %d failed %t", err, fixture.renderer.calls, fixture.store.failed)
+	if _, err := fixture.worker.Process(context.Background(), fixture.job); err == nil || fixture.renderer.calls != 0 || fixture.store.failed {
+		t.Fatalf("permanent direct failure = err %v render %d failed %t, want claimed job retained for finalizer", err, fixture.renderer.calls, fixture.store.failed)
 	}
 }
 
@@ -99,7 +99,7 @@ func TestProcessRestartRevalidatesCanonicalCheckpointAndSkipsWork(t *testing.T) 
 
 	fixture = newFixture(t, 1, aigate.PageImages)
 	fixture.store.batches = []queue.Batch{{JobID: fixture.job.ID, FirstPage: 1, LastPage: 1, RenderDPI: 200, RenderFormat: "png", State: queue.StateCompleted, ResultText: `{"pages":[]}`}}
-	if _, err := fixture.worker.Process(context.Background(), fixture.job); err == nil || fixture.transcriber.calls != 0 || !fixture.store.failed {
+	if _, err := fixture.worker.Process(context.Background(), fixture.job); err == nil || fixture.transcriber.calls != 0 || fixture.store.failed {
 		t.Fatalf("invalid checkpoint = err %v model %d failed %t", err, fixture.transcriber.calls, fixture.store.failed)
 	}
 }
@@ -130,11 +130,8 @@ func TestProcessRetriesModelWithRetryAfterAndExhausts(t *testing.T) {
 
 	fixture = newFixture(t, 1, aigate.PageImages)
 	fixture.transcriber.errors = []error{retryableError{}, retryableError{}, retryableError{}}
-	if _, err := fixture.worker.Process(context.Background(), fixture.job); err == nil || !fixture.store.failed || fixture.transcriber.calls != 3 {
+	if _, err := fixture.worker.Process(context.Background(), fixture.job); err == nil || fixture.store.failed || fixture.transcriber.calls != 3 {
 		t.Fatalf("exhaustion = err %v failed %t calls %d", err, fixture.store.failed, fixture.transcriber.calls)
-	}
-	if fixture.store.diagnostic.Message != "OCR processing failed" {
-		t.Errorf("diagnostic = %+v", fixture.store.diagnostic)
 	}
 }
 
@@ -376,7 +373,7 @@ func TestProcessExhaustsWrappedModelDeadlineAsSafeUnavailable(t *testing.T) {
 	fixture.transcriber.errors = []error{deadlineErr, deadlineErr, deadlineErr}
 
 	_, err := fixture.worker.Process(context.Background(), fixture.job)
-	if fixture.transcriber.callCount() != 3 || fmt.Sprint(fixture.sleeps) != "[1s 2s]" || fixture.store.retried || !fixture.store.failed {
+	if fixture.transcriber.callCount() != 3 || fmt.Sprint(fixture.sleeps) != "[1s 2s]" || fixture.store.retried || fixture.store.failed {
 		t.Fatalf("attempts/sleeps/retry/fail = %d/%v/%t/%t", fixture.transcriber.callCount(), fixture.sleeps, fixture.store.retried, fixture.store.failed)
 	}
 	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(fmt.Sprintf("%s|%q|%v|%+v|%#v", err, err, err, err, err), canary) {
@@ -477,27 +474,6 @@ func TestProcessDoesNotDiscloseDependencyErrors(t *testing.T) {
 	}
 }
 
-func TestProcessReturnsTerminalTransitionFailure(t *testing.T) {
-	for _, transitionErr := range []error{
-		saferr.New(saferr.CategoryValidation, "stale lease"),
-		errors.New("CANARY database path secret"),
-	} {
-		fixture := newFixture(t, 1, aigate.PageImages)
-		fixture.transcriber.errors = []error{saferr.New(saferr.CategoryProvider, "provider rejected request")}
-		fixture.store.failErr = transitionErr
-		_, err := fixture.worker.Process(context.Background(), fixture.job)
-		if err == nil || fixture.store.failed {
-			t.Fatalf("Process() = %v, failed=%t, want transition failure", err, fixture.store.failed)
-		}
-		if err.Error() == "provider: provider rejected request" {
-			t.Fatalf("Process() returned processing error instead of transition failure: %v", err)
-		}
-		if strings.Contains(fmt.Sprintf("%v|%+v|%#v", err, err, err), "CANARY") {
-			t.Fatalf("transition error disclosed database details: %v", err)
-		}
-	}
-}
-
 func TestProcessReturnsRetryTransitionFailureWithoutContextSentinel(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -554,7 +530,7 @@ func TestProcessSourceBudgetOverflowStopsBeforeInspectRenderOrModel(t *testing.T
 	})
 
 	_, err := fixture.worker.Process(context.Background(), fixture.job)
-	if errorCategory(err) != saferr.CategoryRendering || inspectorCalls != 0 || fixture.renderer.calls != 0 || fixture.transcriber.callCount() != 0 || !fixture.store.failed {
+	if errorCategory(err) != saferr.CategoryRendering || inspectorCalls != 0 || fixture.renderer.calls != 0 || fixture.transcriber.callCount() != 0 || fixture.store.failed {
 		t.Fatalf("Process() = %v, inspect/render/model/fail=%d/%d/%d/%t", err, inspectorCalls, fixture.renderer.calls, fixture.transcriber.callCount(), fixture.store.failed)
 	}
 	if _, err := os.Stat(fixture.workspacePath); !errors.Is(err, os.ErrNotExist) {

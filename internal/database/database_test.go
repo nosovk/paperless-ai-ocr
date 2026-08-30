@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-const supportedSchemaVersion = 3
+const supportedSchemaVersion = 4
 
 func TestOpenCreatesAndConfiguresDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "queue.db")
@@ -22,7 +22,7 @@ func TestOpenCreatesAndConfiguresDatabase(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	for _, table := range []string{"jobs", "batches", "settings", "candidates"} {
+	for _, table := range []string{"jobs", "batches", "settings", "candidates", "finalizations"} {
 		var count int
 		if err := db.QueryRow(
 			"SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -42,6 +42,40 @@ func TestOpenCreatesAndConfiguresDatabase(t *testing.T) {
 
 	if got := db.Stats().MaxOpenConnections; got != 1 {
 		t.Errorf("MaxOpenConnections = %d, want 1", got)
+	}
+}
+
+func TestOpenUpgradesVersionThreeDatabaseAndPreservesJobs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	db, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatalf("sql.Open(): %v", err)
+	}
+	if err := applyMigrations(db, migrations[:3]); err != nil {
+		t.Fatalf("apply version 3 migrations: %v", err)
+	}
+	jobID := insertJob(t, db, 42, "preserved-v3", "pending")
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version 3 database: %v", err)
+	}
+
+	db = openTestDatabase(t, path)
+	assertPragmaValue(t, db, "user_version", fmt.Sprint(supportedSchemaVersion))
+	var documentID int64
+	if err := db.QueryRow("SELECT document_id FROM jobs WHERE id = ?", jobID).Scan(&documentID); err != nil {
+		t.Fatalf("load preserved job: %v", err)
+	}
+	if documentID != 42 {
+		t.Errorf("preserved document ID = %d, want 42", documentID)
+	}
+	var finalizations int
+	if err := db.QueryRow(
+		"SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'finalizations'",
+	).Scan(&finalizations); err != nil {
+		t.Fatalf("query finalizations table: %v", err)
+	}
+	if finalizations != 1 {
+		t.Errorf("finalizations table count = %d, want 1", finalizations)
 	}
 }
 

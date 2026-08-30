@@ -388,6 +388,61 @@ func (q *Queue) CheckpointBatchContext(ctx context.Context, id int64, attempt in
 	})
 }
 
+// FinalizationStageContext loads or creates the durable finalization checkpoint.
+func (q *Queue) FinalizationStageContext(ctx context.Context, id int64, attempt int, owner string) (FinalizationStage, error) {
+	if id <= 0 || attempt <= 0 || blank(owner) {
+		return "", validationError("invalid finalization checkpoint input")
+	}
+	var stage FinalizationStage
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
+		now := q.now().UTC()
+		if err := requireActiveLease(ctx, conn, now, id, attempt, owner); err != nil {
+			return err
+		}
+		err := conn.QueryRowContext(ctx, "SELECT stage FROM finalizations WHERE job_id = ?", id).Scan(&stage)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return internalError("cannot load finalization checkpoint", err)
+		}
+		timestamp := formatTime(now)
+		if _, err := conn.ExecContext(ctx, `INSERT INTO finalizations (
+			job_id, stage, created_at, updated_at
+		) VALUES (?, 'pending', ?, ?)`, id, timestamp, timestamp); err != nil {
+			return internalError("cannot create finalization checkpoint", err)
+		}
+		stage = FinalizationPending
+		return nil
+	})
+	return stage, err
+}
+
+// AdvanceFinalizationContext records one confirmed side effect under the active lease.
+func (q *Queue) AdvanceFinalizationContext(ctx context.Context, id int64, attempt int, owner string, from, to FinalizationStage) error {
+	if id <= 0 || attempt <= 0 || blank(owner) || !validFinalizationTransition(from, to) {
+		return validationError("invalid finalization checkpoint transition")
+	}
+	return q.writeContext(ctx, func(conn *sql.Conn) error {
+		now := q.now().UTC()
+		if err := requireActiveLease(ctx, conn, now, id, attempt, owner); err != nil {
+			return err
+		}
+		var current FinalizationStage
+		if err := conn.QueryRowContext(ctx, "SELECT stage FROM finalizations WHERE job_id = ?", id).Scan(&current); err != nil {
+			return internalError("cannot load finalization checkpoint", err)
+		}
+		if current == to {
+			return nil
+		}
+		if current != from {
+			return validationError("finalization checkpoint changed")
+		}
+		return updateOneContext(ctx, conn, `UPDATE finalizations SET stage = ?, updated_at = ?
+			WHERE job_id = ? AND stage = ?`, to, formatTime(now), id, from)
+	})
+}
+
 // ScheduleRetry releases the active claim generation until a future time.
 func (q *Queue) ScheduleRetry(id int64, attempt int, owner string, availableAt time.Time, diagnostic SafeDiagnostic) error {
 	return q.ScheduleRetryContext(context.Background(), id, attempt, owner, availableAt, diagnostic)
@@ -413,17 +468,39 @@ func (q *Queue) ScheduleRetryContext(ctx context.Context, id int64, attempt int,
 
 // Complete marks the active claim generation completed.
 func (q *Queue) Complete(id int64, attempt int, owner string) error {
+	return q.CompleteContext(context.Background(), id, attempt, owner)
+}
+
+// CompleteContext marks the active claim generation completed using the caller context.
+func (q *Queue) CompleteContext(ctx context.Context, id int64, attempt int, owner string) error {
 	if id <= 0 || attempt <= 0 || blank(owner) {
 		return validationError("invalid completion input")
 	}
-	return q.transitionProcessing(func(conn *sql.Conn, now time.Time) error {
+	return q.transitionProcessingContext(ctx, func(conn *sql.Conn, now time.Time) error {
 		timestamp := formatTime(now)
-		return updateOne(conn, `UPDATE jobs SET state = 'completed',
+		return updateOneContext(ctx, conn, `UPDATE jobs SET state = 'completed',
 			lease_owner = NULL, lease_expires_at = NULL, error_category = NULL,
 			error_message = NULL, completed_at = ?, updated_at = ?
 			WHERE id = ? AND state = 'processing' AND attempts = ?
 			AND lease_owner = ? AND lease_expires_at > ?`, timestamp, timestamp, id, attempt, owner, timestamp)
 	})
+}
+
+func validFinalizationTransition(from, to FinalizationStage) bool {
+	switch from {
+	case FinalizationPending:
+		return to == FinalizationContentUpdated || to == FinalizationFailurePending
+	case FinalizationContentUpdated:
+		return to == FinalizationCompleteTagAdded
+	case FinalizationCompleteTagAdded:
+		return to == FinalizationFailedTagRemoved
+	case FinalizationFailedTagRemoved:
+		return to == FinalizationMetadataDispatched
+	case FinalizationFailurePending:
+		return to == FinalizationFailureTagAdded
+	default:
+		return false
+	}
 }
 
 // Fail marks the active claim generation terminally failed.

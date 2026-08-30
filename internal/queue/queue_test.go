@@ -1132,6 +1132,113 @@ func TestRenewLeaseContextFencesAttemptOwnerAndExpiry(t *testing.T) {
 	}
 }
 
+func TestFinalizationCheckpointIsDurableMonotonicAndLeaseFenced(t *testing.T) {
+	now := testNow
+	path := filepath.Join(t.TempDir(), "queue.db")
+	q := openTestQueue(t, path, now)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+
+	stage, err := q.FinalizationStageContext(context.Background(), job.ID, job.Attempts, "owner")
+	if err != nil || stage != FinalizationPending {
+		t.Fatalf("FinalizationStageContext() = (%q, %v), want pending", stage, err)
+	}
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", FinalizationPending, FinalizationContentUpdated); err != nil {
+		t.Fatalf("AdvanceFinalizationContext() error = %v", err)
+	}
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", FinalizationPending, FinalizationContentUpdated); err != nil {
+		t.Fatalf("idempotent AdvanceFinalizationContext() error = %v", err)
+	}
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", FinalizationPending, FinalizationCompleteTagAdded); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("skipped AdvanceFinalizationContext() error = %v, want validation", err)
+	}
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "stale", FinalizationContentUpdated, FinalizationCompleteTagAdded); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("stale owner checkpoint error = %v, want validation", err)
+	}
+
+	if err := q.db.Close(); err != nil {
+		t.Fatalf("close checkpoint database: %v", err)
+	}
+	db, err := database.Open(path)
+	if err != nil {
+		t.Fatalf("reopen checkpoint database: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	q = New(db)
+	q.now = func() time.Time { return now }
+	stage, err = q.FinalizationStageContext(context.Background(), job.ID, job.Attempts, "owner")
+	if err != nil || stage != FinalizationContentUpdated {
+		t.Fatalf("durable FinalizationStageContext() = (%q, %v), want content updated", stage, err)
+	}
+
+	now = job.LeaseExpiresAt
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", FinalizationContentUpdated, FinalizationCompleteTagAdded); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("expired checkpoint error = %v, want validation", err)
+	}
+}
+
+func TestFinalizationCheckpointFencesAttemptAndValidatesTransitions(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+
+	if _, err := q.FinalizationStageContext(context.Background(), job.ID, job.Attempts+1, "owner"); errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("stale attempt stage error = %v, want validation", err)
+	}
+	for _, transition := range []struct {
+		from FinalizationStage
+		to   FinalizationStage
+	}{
+		{from: FinalizationPending, to: FinalizationCompleteTagAdded},
+		{from: FinalizationContentUpdated, to: FinalizationPending},
+		{from: FinalizationMetadataDispatched, to: FinalizationFailureTagAdded},
+	} {
+		if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", transition.from, transition.to); errorCategory(err) != saferr.CategoryValidation {
+			t.Errorf("AdvanceFinalizationContext(%q, %q) error = %v, want validation", transition.from, transition.to, err)
+		}
+	}
+}
+
+func TestFinalizationCheckpointAdvanceIsIdempotentAcrossDatabaseHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	q1 := openTestQueue(t, path, testNow)
+	q2 := openTestQueue(t, path, testNow)
+	job := enqueueAndClaim(t, q1, 1, "checksum", PriorityBackfill, "owner")
+	if _, err := q1.FinalizationStageContext(context.Background(), job.ID, job.Attempts, "owner"); err != nil {
+		t.Fatalf("FinalizationStageContext() error = %v", err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, q := range []*Queue{q1, q2} {
+		go func() {
+			<-start
+			errs <- q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", FinalizationPending, FinalizationContentUpdated)
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent AdvanceFinalizationContext() error = %v", err)
+		}
+	}
+	stage, err := q1.FinalizationStageContext(context.Background(), job.ID, job.Attempts, "owner")
+	if err != nil || stage != FinalizationContentUpdated {
+		t.Fatalf("final stage = (%q, %v), want content updated", stage, err)
+	}
+}
+
+func TestCompleteContextHonorsCancellation(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := q.CompleteContext(ctx, job.ID, job.Attempts, "owner")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CompleteContext() error = %v, want context canceled", err)
+	}
+	assertProcessingClaim(t, q, job.ID, job.Attempts, "owner")
+}
+
 func TestPublicDatabaseErrorsDoNotExposeDriverDetails(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	if _, err := q.db.Exec("DROP TABLE jobs"); err != nil {
