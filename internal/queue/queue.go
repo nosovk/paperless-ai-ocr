@@ -815,6 +815,26 @@ func (q *Queue) ActiveContext(ctx context.Context, id int64, attempt int, owner 
 	return active == 1, nil
 }
 
+// ClaimStateContext returns the durable state for one exact claim generation.
+func (q *Queue) ClaimStateContext(ctx context.Context, id int64, attempt int, owner string) (State, bool, error) {
+	if id <= 0 || attempt <= 0 || blank(owner) {
+		return "", false, validationError("invalid claim state lookup")
+	}
+	var state State
+	var leaseOwner sql.NullString
+	err := q.db.QueryRowContext(ctx, "SELECT state, lease_owner FROM jobs WHERE id = ? AND attempts = ?", id, attempt).Scan(&state, &leaseOwner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, internalError("cannot inspect claim state", err)
+	}
+	if state == StateProcessing && leaseOwner.String != owner {
+		return "", false, nil
+	}
+	return state, true, nil
+}
+
 func (q *Queue) updateOne(statement string, args ...any) error {
 	return q.write(func(conn *sql.Conn) error {
 		return updateOne(conn, statement, args...)

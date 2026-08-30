@@ -2,6 +2,7 @@
 package observability
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
 	"github.com/nosovk/paperless-ai-ocr/internal/reconcile"
 )
+
+const collectionTimeout = 2 * time.Second
 
 // JobOutcome is a fixed job completion result label.
 type JobOutcome string
@@ -48,6 +51,14 @@ type Metrics struct {
 	renderedBytes         uint64
 	recoveredLeases       uint64
 	reconciliationResults map[string]uint64
+	queueDepthCollector   func(context.Context) (map[queue.State]int64, error)
+}
+
+// SetQueueDepthCollector configures bounded current queue-depth collection.
+func (metrics *Metrics) SetQueueDepthCollector(collector func(context.Context) (map[queue.State]int64, error)) {
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	metrics.queueDepthCollector = collector
 }
 
 // NewMetrics creates an empty aggregate metrics collector.
@@ -139,6 +150,22 @@ func (metrics *Metrics) ServeHTTP(response http.ResponseWriter, request *http.Re
 	if request.Method != http.MethodGet {
 		http.Error(response, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
+	}
+	metrics.mu.RLock()
+	collector := metrics.queueDepthCollector
+	metrics.mu.RUnlock()
+	if collector != nil {
+		collectionCtx, cancel := context.WithTimeout(request.Context(), collectionTimeout)
+		depth, err := collector(collectionCtx)
+		cancel()
+		if err != nil {
+			response.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			response.Header().Set("X-Content-Type-Options", "nosniff")
+			response.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = response.Write([]byte("metrics unavailable\n"))
+			return
+		}
+		metrics.SetQueueDepth(depth)
 	}
 	metrics.mu.RLock()
 	defer metrics.mu.RUnlock()

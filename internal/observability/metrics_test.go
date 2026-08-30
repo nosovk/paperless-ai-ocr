@@ -1,6 +1,8 @@
 package observability
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -58,5 +60,56 @@ func TestMetricsRestrictMethods(t *testing.T) {
 	NewMetrics().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/metrics", nil))
 	if response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", response.Code)
+	}
+}
+
+func TestMetricsCollectCurrentQueueDepthOnEveryScrape(t *testing.T) {
+	depth := map[queue.State]int64{queue.StatePending: 1}
+	metrics := NewMetrics()
+	metrics.SetQueueDepthCollector(func(context.Context) (map[queue.State]int64, error) {
+		return depth, nil
+	})
+
+	response := httptest.NewRecorder()
+	metrics.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(response.Body.String(), `paperless_ai_ocr_queue_depth{state="pending"} 1`) {
+		t.Fatalf("first scrape = %q", response.Body.String())
+	}
+	depth = map[queue.State]int64{queue.StatePending: 2, queue.StateProcessing: 1}
+	response = httptest.NewRecorder()
+	metrics.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(response.Body.String(), `paperless_ai_ocr_queue_depth{state="pending"} 2`) ||
+		!strings.Contains(response.Body.String(), `paperless_ai_ocr_queue_depth{state="processing"} 1`) {
+		t.Fatalf("second scrape = %q", response.Body.String())
+	}
+}
+
+func TestMetricsQueueCollectionFailureIsSafe(t *testing.T) {
+	metrics := NewMetrics()
+	metrics.SetQueueDepthCollector(func(context.Context) (map[queue.State]int64, error) {
+		return nil, errors.New("CANARY private database URL")
+	})
+	response := httptest.NewRecorder()
+	metrics.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if response.Code != http.StatusServiceUnavailable || response.Body.String() != "metrics unavailable\n" {
+		t.Fatalf("response = (%d, %q)", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "CANARY") {
+		t.Fatal("metrics response exposed collector error")
+	}
+}
+
+func TestMetricsQueueCollectionIsBounded(t *testing.T) {
+	metrics := NewMetrics()
+	metrics.SetQueueDepthCollector(func(ctx context.Context) (map[queue.State]int64, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("collector context has no deadline")
+		}
+		return map[queue.State]int64{}, nil
+	})
+	response := httptest.NewRecorder()
+	metrics.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
 	}
 }

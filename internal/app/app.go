@@ -52,8 +52,8 @@ type Runtime interface {
 	Terminal(context.Context, queue.Job, error) bool
 	FinalizeSuccess(context.Context, queue.Job, worker.Result) error
 	FinalizeFailure(context.Context, queue.Job) error
-	Release(context.Context, queue.Job) error
-	Active(context.Context, queue.Job) (bool, error)
+	Release(context.Context, queue.Job) (bool, error)
+	State(context.Context, queue.Job) (queue.State, bool, error)
 	QueueDepth(context.Context) (map[queue.State]int64, error)
 	Cancel()
 	Close() error
@@ -138,6 +138,7 @@ func NewService(cfg config.Config, readiness *server.Readiness, metrics *observa
 		return nil, err
 	}
 	mux := http.NewServeMux()
+	metrics.SetQueueDepthCollector(q.DepthContext)
 	mux.Handle("/health", server.NewHealthHandler(readiness))
 	mux.Handle("/ready", server.NewHealthHandler(readiness))
 	mux.Handle("/metrics", metrics)
@@ -209,13 +210,12 @@ func (runtime *serviceRuntime) FinalizeFailure(ctx context.Context, job queue.Jo
 	return runtime.finalizer.FailOCR(ctx, job)
 }
 
-func (runtime *serviceRuntime) Release(ctx context.Context, job queue.Job) error {
-	_, err := runtime.queue.ReleaseContext(ctx, job.ID, job.Attempts, job.LeaseOwner)
-	return err
+func (runtime *serviceRuntime) Release(ctx context.Context, job queue.Job) (bool, error) {
+	return runtime.queue.ReleaseContext(ctx, job.ID, job.Attempts, job.LeaseOwner)
 }
 
-func (runtime *serviceRuntime) Active(ctx context.Context, job queue.Job) (bool, error) {
-	return runtime.queue.ActiveContext(ctx, job.ID, job.Attempts, job.LeaseOwner)
+func (runtime *serviceRuntime) State(ctx context.Context, job queue.Job) (queue.State, bool, error) {
+	return runtime.queue.ClaimStateContext(ctx, job.ID, job.Attempts, job.LeaseOwner)
 }
 
 func (runtime *serviceRuntime) QueueDepth(ctx context.Context) (map[queue.State]int64, error) {
@@ -254,6 +254,7 @@ func Run(parent context.Context, options Options) error {
 	if shutdownTimeout < 0 {
 		return saferr.New(saferr.CategoryConfiguration, "invalid application configuration")
 	}
+	options.Metrics.SetQueueDepthCollector(options.Runtime.QueueDepth)
 
 	ctx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
 	defer cancel(context.Canceled)
@@ -327,15 +328,20 @@ func Run(parent context.Context, options Options) error {
 
 	options.Readiness.Set(false)
 	options.Runtime.Cancel()
+	loops.Wait()
 	activeMu.Lock()
 	claimed := active
 	activeMu.Unlock()
+	var releaseErr error
 	if claimed.ID != 0 {
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		_ = options.Runtime.Release(releaseCtx, claimed)
+		var retried bool
+		retried, releaseErr = settleShutdownClaim(releaseCtx, options.Runtime, claimed)
+		if retried {
+			options.Metrics.RecordRetry()
+		}
 		releaseCancel()
 	}
-	loops.Wait()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	shutdownErr := options.HTTPServer.Shutdown(shutdownCtx)
 	shutdownCancel()
@@ -354,10 +360,36 @@ func Run(parent context.Context, options Options) error {
 	if cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
 		return cause
 	}
-	if shutdownErr != nil || closeErr != nil {
+	if releaseErr != nil || shutdownErr != nil || closeErr != nil {
 		return saferr.New(saferr.CategoryInternal, "shutdown failed")
 	}
 	return nil
+}
+
+func settleShutdownClaim(ctx context.Context, runtime Runtime, job queue.Job) (bool, error) {
+	state, found, err := runtime.State(ctx, job)
+	if err != nil || !found {
+		return false, saferr.New(saferr.CategoryInternal, "active job state could not be confirmed")
+	}
+	if state != queue.StateProcessing {
+		if terminalState(state) {
+			return false, nil
+		}
+		return false, saferr.New(saferr.CategoryInternal, "active job state could not be confirmed")
+	}
+	released, releaseErr := runtime.Release(ctx, job)
+	if releaseErr == nil && released {
+		return true, nil
+	}
+	state, found, err = runtime.State(ctx, job)
+	if err == nil && found && terminalState(state) {
+		return state == queue.StateRetry, nil
+	}
+	return false, saferr.New(saferr.CategoryInternal, "active job lease could not be released")
+}
+
+func terminalState(state queue.State) bool {
+	return state == queue.StateRetry || state == queue.StateCompleted || state == queue.StateFailed
 }
 
 func initialize(ctx context.Context, options Options) error {
@@ -422,18 +454,23 @@ func workerLoop(ctx context.Context, options Options, activeMu *sync.Mutex, acti
 			if processErr == nil {
 				options.Metrics.RecordJobOutcome(observability.OutcomeFailure)
 			}
-		} else if !errors.Is(processErr, context.Canceled) && !errors.Is(processErr, context.DeadlineExceeded) {
-			options.Metrics.RecordRetry()
 		}
-		activeMu.Lock()
-		*active = queue.Job{}
-		activeMu.Unlock()
-		if processErr != nil && ctx.Err() == nil {
-			stillActive, err := options.Runtime.Active(ctx, job)
-			if err != nil || stillActive {
+		settled := processErr == nil
+		if processErr != nil {
+			state, found, err := options.Runtime.State(context.WithoutCancel(ctx), job)
+			settled = err == nil && found && terminalState(state)
+			if settled && state == queue.StateRetry {
+				options.Metrics.RecordRetry()
+			}
+			if ctx.Err() == nil && !settled {
 				background(processErr)
 				return
 			}
+		}
+		if settled {
+			activeMu.Lock()
+			*active = queue.Job{}
+			activeMu.Unlock()
 		}
 		if depth, err := options.Runtime.QueueDepth(ctx); err == nil {
 			options.Metrics.SetQueueDepth(depth)

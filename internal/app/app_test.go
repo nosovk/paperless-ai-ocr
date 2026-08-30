@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -75,8 +76,12 @@ func TestRunReleasesActiveLeaseOnShutdown(t *testing.T) {
 	started := make(chan struct{})
 	readiness := server.NewReadiness()
 	runtime := &fakeRuntime{
-		events:       make(chan string, 16),
-		claimResults: []claimResult{{job: queue.Job{ID: 7, Attempts: 2, LeaseOwner: "worker", State: queue.StateProcessing}, ok: true}},
+		events:            make(chan string, 16),
+		claimResults:      []claimResult{{job: queue.Job{ID: 7, Attempts: 2, LeaseOwner: "worker", State: queue.StateProcessing}, ok: true}},
+		state:             queue.StateProcessing,
+		stateFound:        true,
+		releaseOK:         true,
+		stateAfterRelease: queue.StateRetry,
 		process: func(ctx context.Context, _ queue.Job) (worker.Result, error) {
 			close(started)
 			<-ctx.Done()
@@ -104,6 +109,67 @@ func TestRunReleasesActiveLeaseOnShutdown(t *testing.T) {
 	runtime.assertOrder(t, "cancel", "release", "close")
 }
 
+func TestRunFailsWhenActiveLeaseReleaseFails(t *testing.T) {
+	started := make(chan struct{})
+	runtime := &fakeRuntime{
+		events:       make(chan string, 16),
+		claimResults: []claimResult{{job: queue.Job{ID: 7, Attempts: 2, LeaseOwner: "worker", State: queue.StateProcessing}, ok: true}},
+		process: func(ctx context.Context, _ queue.Job) (worker.Result, error) {
+			close(started)
+			<-ctx.Done()
+			return worker.Result{}, ctx.Err()
+		},
+		state:      queue.StateProcessing,
+		stateFound: true,
+		releaseErr: errors.New("CANARY private database failure"),
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, testOptions(t, runtime)) }()
+	<-started
+	cancel(context.Canceled)
+	if err := <-done; err == nil || err.Error() != "internal: shutdown failed" {
+		t.Fatalf("Run() error = %v, want safe shutdown failure", err)
+	}
+	runtime.assertOrder(t, "cancel", "release", "close")
+}
+
+func TestRunAcceptsStaleReleaseAfterConfirmedRetry(t *testing.T) {
+	started := make(chan struct{})
+	metrics := observability.NewMetrics()
+	runtime := &fakeRuntime{
+		events:       make(chan string, 16),
+		claimResults: []claimResult{{job: queue.Job{ID: 7, Attempts: 2, LeaseOwner: "worker", State: queue.StateProcessing}, ok: true}},
+		process: func(ctx context.Context, _ queue.Job) (worker.Result, error) {
+			close(started)
+			<-ctx.Done()
+			return worker.Result{}, ctx.Err()
+		},
+		state:      queue.StateRetry,
+		stateFound: true,
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		options := testOptions(t, runtime)
+		options.Metrics = metrics
+		done <- Run(ctx, options)
+	}()
+	<-started
+	cancel(context.Canceled)
+	if err := <-done; err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if runtime.released.ID != 0 {
+		t.Errorf("Release() called for durably retried job: %+v", runtime.released)
+	}
+	response := httptest.NewRecorder()
+	metrics.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(response.Body.String(), "paperless_ai_ocr_retries_total 1\n") {
+		t.Fatalf("metrics = %q", response.Body.String())
+	}
+}
+
 func TestRunContinuesAfterWorkerRetryTransition(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	var calls int
@@ -114,6 +180,8 @@ func TestRunContinuesAfterWorkerRetryTransition(t *testing.T) {
 			{job: queue.Job{ID: 2, Attempts: 1, LeaseOwner: "worker", State: queue.StateProcessing}, ok: true},
 		},
 	}
+	runtime.state = queue.StateRetry
+	runtime.stateFound = true
 	runtime.process = func(context.Context, queue.Job) (worker.Result, error) {
 		calls++
 		if calls == 1 {
@@ -130,6 +198,68 @@ func TestRunContinuesAfterWorkerRetryTransition(t *testing.T) {
 	}
 }
 
+func TestRunRecordsConfirmedDeadlineRetry(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	metrics := observability.NewMetrics()
+	runtime := &fakeRuntime{
+		events:       make(chan string, 16),
+		claimResults: []claimResult{{job: queue.Job{ID: 1, Attempts: 1, LeaseOwner: "worker", State: queue.StateProcessing}, ok: true}},
+		state:        queue.StateRetry,
+		stateFound:   true,
+	}
+	runtime.process = func(context.Context, queue.Job) (worker.Result, error) {
+		defer cancel(context.Canceled)
+		return worker.Result{}, context.DeadlineExceeded
+	}
+	options := testOptions(t, runtime)
+	options.Metrics = metrics
+	if err := Run(ctx, options); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	response := httptest.NewRecorder()
+	metrics.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(response.Body.String(), "paperless_ai_ocr_retries_total 1\n") {
+		t.Fatalf("metrics = %q", response.Body.String())
+	}
+}
+
+func TestRunMetricsScrapeCurrentQueueDepth(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	metrics := observability.NewMetrics()
+	runtime := &fakeRuntime{
+		events:       make(chan string, 16),
+		claimResults: []claimResult{{}},
+		depth:        map[queue.State]int64{queue.StatePending: 1},
+	}
+	done := make(chan error, 1)
+	go func() {
+		options := testOptions(t, runtime)
+		options.Metrics = metrics
+		options.IdleInterval = time.Hour
+		done <- Run(ctx, options)
+	}()
+	for range 6 {
+		<-runtime.events
+	}
+	response := httptest.NewRecorder()
+	metrics.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(response.Body.String(), `paperless_ai_ocr_queue_depth{state="pending"} 1`) {
+		t.Fatalf("startup metrics = %q", response.Body.String())
+	}
+	runtime.mu.Lock()
+	runtime.depth = map[queue.State]int64{queue.StatePending: 2}
+	runtime.mu.Unlock()
+	response = httptest.NewRecorder()
+	metrics.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(response.Body.String(), `paperless_ai_ocr_queue_depth{state="pending"} 2`) {
+		t.Fatalf("updated metrics = %q", response.Body.String())
+	}
+	cancel(context.Canceled)
+	if err := <-done; err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
 func TestRunStopsWhenWorkerErrorLeavesLeaseActive(t *testing.T) {
 	runtime := &fakeRuntime{
 		events:       make(chan string, 16),
@@ -137,7 +267,7 @@ func TestRunStopsWhenWorkerErrorLeavesLeaseActive(t *testing.T) {
 		process: func(context.Context, queue.Job) (worker.Result, error) {
 			return worker.Result{}, errors.New("CANARY private worker failure")
 		},
-		active: true,
+		state: queue.StateProcessing, stateFound: true,
 	}
 	err := Run(context.Background(), testOptions(t, runtime))
 	if err == nil || err.Error() != "internal: background operation failed" {
@@ -153,16 +283,18 @@ func TestRunFinalizationPaths(t *testing.T) {
 		processErr   error
 		terminal     bool
 		wantFinalize string
+		state        queue.State
 	}{
 		{name: "success", result: worker.Result{JobID: 1}, wantFinalize: "success"},
 		{name: "terminal", processErr: terminal, terminal: true, wantFinalize: "failure"},
-		{name: "retry", processErr: errors.New("retry transitioned")},
+		{name: "retry", processErr: errors.New("retry transitioned"), state: queue.StateRetry},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancelCause(context.Background())
 			runtime := &fakeRuntime{
 				events: make(chan string, 16), terminalErr: terminal,
 				claimResults: []claimResult{{job: queue.Job{ID: 1, Attempts: 1, LeaseOwner: "worker", State: queue.StateProcessing}, ok: true}, {}},
+				state:        test.state, stateFound: test.state != "",
 			}
 			runtime.process = func(context.Context, queue.Job) (worker.Result, error) {
 				defer cancel(context.Canceled)
@@ -193,17 +325,22 @@ type claimResult struct {
 }
 
 type fakeRuntime struct {
-	mu           sync.Mutex
-	events       chan string
-	ordered      []string
-	claimResults []claimResult
-	process      func(context.Context, queue.Job) (worker.Result, error)
-	terminalErr  error
-	reconcileErr error
-	initialize   <-chan struct{}
-	active       bool
-	released     queue.Job
-	finalized    string
+	mu                sync.Mutex
+	events            chan string
+	ordered           []string
+	claimResults      []claimResult
+	process           func(context.Context, queue.Job) (worker.Result, error)
+	terminalErr       error
+	reconcileErr      error
+	initialize        <-chan struct{}
+	state             queue.State
+	stateFound        bool
+	stateAfterRelease queue.State
+	releaseOK         bool
+	releaseErr        error
+	released          queue.Job
+	finalized         string
+	depth             map[queue.State]int64
 }
 
 func (runtime *fakeRuntime) event(value string) {
@@ -263,16 +400,21 @@ func (runtime *fakeRuntime) FinalizeFailure(context.Context, queue.Job) error {
 	runtime.finalized = "failure"
 	return nil
 }
-func (runtime *fakeRuntime) Release(_ context.Context, job queue.Job) error {
+func (runtime *fakeRuntime) Release(_ context.Context, job queue.Job) (bool, error) {
 	runtime.event("release")
 	runtime.released = job
-	return nil
+	if runtime.stateAfterRelease != "" {
+		runtime.state = runtime.stateAfterRelease
+	}
+	return runtime.releaseOK, runtime.releaseErr
 }
 func (runtime *fakeRuntime) QueueDepth(context.Context) (map[queue.State]int64, error) {
-	return map[queue.State]int64{}, nil
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.depth, nil
 }
-func (runtime *fakeRuntime) Active(context.Context, queue.Job) (bool, error) {
-	return runtime.active, nil
+func (runtime *fakeRuntime) State(context.Context, queue.Job) (queue.State, bool, error) {
+	return runtime.state, runtime.stateFound, nil
 }
 func (runtime *fakeRuntime) Cancel()      { runtime.event("cancel") }
 func (runtime *fakeRuntime) Close() error { runtime.event("close"); return nil }

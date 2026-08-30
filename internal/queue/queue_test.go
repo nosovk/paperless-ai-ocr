@@ -1155,6 +1155,26 @@ func TestActiveContextIsLeaseFenced(t *testing.T) {
 	}
 }
 
+func TestClaimStateContextTracksExactGeneration(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+	state, found, err := q.ClaimStateContext(context.Background(), job.ID, job.Attempts, "owner")
+	if err != nil || !found || state != StateProcessing {
+		t.Fatalf("ClaimStateContext(processing) = (%q, %t, %v)", state, found, err)
+	}
+	if err := q.ScheduleRetry(job.ID, job.Attempts, "owner", testNow.Add(time.Minute),
+		SafeDiagnostic{Category: saferr.CategoryInternal, Message: "retry"}); err != nil {
+		t.Fatalf("ScheduleRetry() error = %v", err)
+	}
+	state, found, err = q.ClaimStateContext(context.Background(), job.ID, job.Attempts, "owner")
+	if err != nil || !found || state != StateRetry {
+		t.Fatalf("ClaimStateContext(retry) = (%q, %t, %v)", state, found, err)
+	}
+	if state, found, err = q.ClaimStateContext(context.Background(), job.ID, job.Attempts+1, "owner"); err != nil || found || state != "" {
+		t.Fatalf("ClaimStateContext(stale generation) = (%q, %t, %v)", state, found, err)
+	}
+}
+
 func TestBatchCheckpointsAreFencedByParentLease(t *testing.T) {
 	now := testNow
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)
