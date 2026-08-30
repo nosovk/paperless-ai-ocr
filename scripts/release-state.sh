@@ -19,7 +19,7 @@ inspect() {
 }
 
 validate_image() {
-  python3 - "$1" "$VERSION" "$REVISION" "$2" <<'PY'
+  python3 - "$1" "$version" "$REVISION" "$2" <<'PY'
 import json
 import re
 import sys

@@ -53,7 +53,7 @@ readonly revision=0123456789abcdef0123456789abcdef01234567
 
 image_json() {
   local digest=$1
-  local version=${2:-v1.2.3}
+  local version=${2:-1.2.3}
   local image_revision=${3:-$revision}
   local platforms=${4:-both}
   local amd64=''
@@ -110,19 +110,19 @@ if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
 fi
 grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "ambiguous inspection error is not actionable"
 
-make_inspector "printf '%s\\n' '$(image_json "$digest_a" v1.2.3 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef)'"
+make_inspector "printf '%s\\n' '$(image_json "$digest_a" 1.2.3 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef)'"
 if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
   fail "accepted an existing image built from a different revision"
 fi
 grep -F 'does not match the tagged commit' "$work_dir/stderr" >/dev/null || fail "revision mismatch error is not actionable"
 
-make_inspector "printf '%s\\n' '$(image_json "$digest_a" v9.9.9)'"
+make_inspector "printf '%s\\n' '$(image_json "$digest_a" 9.9.9)'"
 if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
   fail "accepted an existing image with a different version"
 fi
 grep -F 'does not match release version' "$work_dir/stderr" >/dev/null || fail "version mismatch error is not actionable"
 
-make_inspector "printf '%s\\n' '$(image_json "$digest_a" v1.2.3 "$revision" amd64)'"
+make_inspector "printf '%s\\n' '$(image_json "$digest_a" 1.2.3 "$revision" amd64)'"
 if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
   fail "accepted an existing image without both release platforms"
 fi

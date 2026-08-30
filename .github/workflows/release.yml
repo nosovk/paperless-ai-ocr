@@ -161,6 +161,13 @@ jobs:
           provenance: mode=max
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Verify final release state
+        id: final-state
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ steps.release-metadata.outputs.version }}
+          REVISION: ${{ github.sha }}
+        run: bash scripts/release-state.sh
       - name: Resolve final digest
         id: final-digest
         shell: bash
@@ -168,14 +175,25 @@ jobs:
           PUBLISH: ${{ steps.release-state.outputs.publish }}
           EXISTING_DIGEST: ${{ steps.release-state.outputs.digest }}
           BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+          REGISTRY_DIGEST: ${{ steps.final-state.outputs.digest }}
+          FINAL_PUBLISH: ${{ steps.final-state.outputs.publish }}
         run: |
+          if [[ $FINAL_PUBLISH != false ]]; then
+            printf 'final registry state is not fully published\n' >&2
+            exit 1
+          fi
+          digest=$REGISTRY_DIGEST
           if [[ $PUBLISH == true ]]; then
-            digest=$BUILT_DIGEST
+            expected=$BUILT_DIGEST
           else
-            digest=$EXISTING_DIGEST
+            expected=$EXISTING_DIGEST
           fi
           if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
             printf 'invalid final image digest: %s\n' "$digest" >&2
+            exit 1
+          fi
+          if [[ $digest != "$expected" ]]; then
+            printf 'final registry digest %s does not match expected digest %s\n' "$digest" "$expected" >&2
             exit 1
           fi
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"

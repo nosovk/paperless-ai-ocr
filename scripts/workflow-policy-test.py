@@ -328,6 +328,19 @@ def assert_release(workflow: Workflow) -> None:
     build = build_step.text
     for value in ("platforms: linux/amd64,linux/arm64", "push: true", "VERSION=${{ steps.release-metadata.outputs.version }}", "REVISION=${{ github.sha }}", "CREATED=${{ steps.release-metadata.outputs.created }}", "sbom: true", "provenance: mode=max"):
         require(value in build, f"publish build missing: {value}")
+    final_state_name = "Verify final release state"
+    final_state = publish_steps[final_state_name]
+    assert_required_step(final_state, "bash scripts/release-state.sh", "publish must re-inspect the final registry state")
+    require(final_state.values().get("id") == "final-state", "final registry state step must expose outputs")
+    require(
+        final_state.child("env").values()
+        == {
+            "IMAGE": "ghcr.io/${{ github.repository }}",
+            "VERSION": "${{ steps.release-metadata.outputs.version }}",
+            "REVISION": "${{ github.sha }}",
+        },
+        "final registry state inputs are invalid",
+    )
     final_digest = publish_steps["Resolve final digest"]
     require("if" not in final_digest.values(), "final digest resolution must always run after release state succeeds")
     require(final_digest.values().get("id") == "final-digest", "final digest step must expose its verified digest")
@@ -335,11 +348,14 @@ def assert_release(workflow: Workflow) -> None:
         "PUBLISH: ${{ steps.release-state.outputs.publish }}",
         "EXISTING_DIGEST: ${{ steps.release-state.outputs.digest }}",
         "BUILT_DIGEST: ${{ steps.build.outputs.digest }}",
+        "REGISTRY_DIGEST: ${{ steps.final-state.outputs.digest }}",
+        "FINAL_PUBLISH: ${{ steps.final-state.outputs.publish }}",
+        "digest=$REGISTRY_DIGEST",
         "printf 'digest=%s\\n' \"$digest\" >> \"$GITHUB_OUTPUT\"",
         "^sha256:[0-9a-f]{64}$",
     ):
         require(value in final_digest.text, f"final digest resolution missing: {value}")
-    require(names.index("Build and push image") < names.index("Resolve final digest") < names.index("Attest image provenance"), "final digest must be resolved after the optional build and before attestation")
+    require(names.index("Build and push image") < names.index(final_state_name) < names.index("Resolve final digest") < names.index("Attest image provenance"), "final registry state and digest must be verified after the optional build and before attestation")
     require(publish.child("outputs").values() == {"digest": "${{ steps.final-digest.outputs.digest }}"}, "publish output must use the verified final digest")
     attest = publish_steps["Attest image provenance"].text
     for value in ("subject-name: ghcr.io/${{ github.repository }}", "subject-digest: ${{ steps.final-digest.outputs.digest }}", "push-to-registry: true", "create-storage-record: false"):

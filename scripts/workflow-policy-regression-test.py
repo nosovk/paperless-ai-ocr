@@ -233,6 +233,22 @@ def mutate_unconditional_build(text: str) -> str:
     )
 
 
+def final_state_step() -> str:
+    return (
+        "      - name: Verify final release state\n"
+        "        id: final-state\n"
+        "        env:\n"
+        "          IMAGE: ghcr.io/${{ github.repository }}\n"
+        "          VERSION: ${{ steps.release-metadata.outputs.version }}\n"
+        "          REVISION: ${{ github.sha }}\n"
+        "        run: bash scripts/release-state.sh\n"
+    )
+
+
+def mutate_remove_final_state(text: str) -> str:
+    return text.replace(final_state_step(), "", 1)
+
+
 def mutate_publish_output_to_build(text: str) -> str:
     return text.replace(
         "      digest: ${{ steps.final-digest.outputs.digest }}",
@@ -359,6 +375,7 @@ def main() -> None:
             run_mutant("release state check disabled", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Determine release state", "if: false"), ref),
             run_mutant("release state check allowed to fail", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Determine release state", "continue-on-error: true"), ref),
             run_mutant("unconditional release build", ".github/workflows/release.yml", mutate_unconditional_build, ref),
+            run_mutant("missing final registry verification", ".github/workflows/release.yml", mutate_remove_final_state, ref),
             run_mutant("conditional final digest", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Resolve final digest", "if: steps.release-state.outputs.publish == 'true'"), ref),
             run_mutant("publish output bypasses final digest", ".github/workflows/release.yml", mutate_publish_output_to_build, ref),
             run_mutant("attestation bypasses final digest", ".github/workflows/release.yml", mutate_attestation_to_build, ref),
