@@ -19,10 +19,10 @@ func TestProductionHTTPServerBounds(t *testing.T) {
 	}
 }
 
-func TestStopSignalNotificationAfterCancellation(t *testing.T) {
+func TestNormalizeSignalCancellationStopsNotifications(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var calls atomic.Int64
-	done := stopSignalNotificationAfterCancellation(ctx, func() { calls.Add(1) })
+	_, done := normalizeSignalCancellation(ctx, func() { calls.Add(1) })
 	cancel()
 	select {
 	case <-done:
@@ -31,6 +31,25 @@ func TestStopSignalNotificationAfterCancellation(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("stop calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestNormalizeSignalCancellation(t *testing.T) {
+	signalCtx, cancelSignal := context.WithCancelCause(context.Background())
+	var stopCalls atomic.Int64
+	ctx, done := normalizeSignalCancellation(signalCtx, func() { stopCalls.Add(1) })
+
+	cancelSignal(errors.New("platform signal cancellation cause"))
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("signal cancellation was not normalized")
+	}
+	if cause := context.Cause(ctx); cause != context.Canceled {
+		t.Fatalf("normalized cause = %v, want context.Canceled", cause)
+	}
+	if stopCalls.Load() != 1 {
+		t.Fatalf("stop calls = %d, want 1", stopCalls.Load())
 	}
 }
 

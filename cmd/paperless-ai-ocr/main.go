@@ -76,8 +76,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		_ = logger.BackgroundFailure(saferr.CategoryInternal)
 		return 1
 	}
-	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	signalStopped := stopSignalNotificationAfterCancellation(signalCtx, stop)
+	rawSignalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signalCtx, signalStopped := normalizeSignalCancellation(rawSignalCtx, stop)
 	err = app.Run(signalCtx, app.Options{
 		Runtime: service.Runtime, Readiness: readiness, Metrics: metrics, Listener: listener,
 		HTTPServer: productionHTTPServer(service.Handler), Handler: service.Handler,
@@ -102,12 +102,14 @@ func productionHTTPServer(handler http.Handler) *http.Server {
 	}
 }
 
-func stopSignalNotificationAfterCancellation(ctx context.Context, stop func()) <-chan struct{} {
+func normalizeSignalCancellation(signalCtx context.Context, stop func()) (context.Context, <-chan struct{}) {
+	ctx, cancel := context.WithCancelCause(context.WithoutCancel(signalCtx))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		<-ctx.Done()
+		<-signalCtx.Done()
 		stop()
+		cancel(context.Canceled)
 	}()
-	return done
+	return ctx, done
 }

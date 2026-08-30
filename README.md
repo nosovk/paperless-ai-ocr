@@ -231,7 +231,8 @@ their documents, jurisdiction, retention requirements, and threat model.
 Security defaults include:
 
 - dedicated bearer authentication for the Paperless webhook;
-- secrets supplied through environment variables or secret files;
+- configuration read from environment variables, with secrets injected by the
+  operator's secret manager or Compose interpolation;
 - an unprivileged container with all Linux capabilities dropped;
 - a read-only root filesystem;
 - private-network deployment without public ingress;

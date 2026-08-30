@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly image="${CONTAINER_TEST_IMAGE:-paperless-ai-ocr:container-test}"
+readonly image="${CONTAINER_TEST_IMAGE:-paperless-ai-ocr:container-test-$$-$RANDOM}"
 readonly platform="linux/amd64"
+readonly test_support_image="python:3.14.2-alpine3.23@sha256:31da4cb527055e4e3d7e9e006dffe9329f84ebea79eaca0a1f1c27ce61e40ca5"
 
 work_dir=""
-data_dir=""
 fake_container_id=""
 container_id=""
 builder_name=""
 network_name=""
+data_volume=""
+image_owned=false
 
 fail() {
   printf 'container-test: %s\n' "$*" >&2
@@ -31,22 +33,42 @@ cleanup() {
   if [[ -n "$network_name" ]]; then
     docker network rm "$network_name" >/dev/null 2>&1 || true
   fi
+  if [[ -n "$data_volume" ]]; then
+    docker volume rm -f "$data_volume" >/dev/null 2>&1 || true
+  fi
   if [[ -n "$work_dir" ]]; then
     rm -rf "$work_dir"
   fi
-  docker image rm -f "$image" >/dev/null 2>&1 || true
+  if [[ "$image_owned" == true ]]; then
+    docker image rm -f "$image" >/dev/null 2>&1 || true
+  fi
   exit "$status"
 }
-trap cleanup EXIT INT TERM
+
+handle_signal() {
+  trap - INT TERM
+  exit "$1"
+}
+
+trap cleanup EXIT
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+
+if [[ -n "${CONTAINER_TEST_SELF_TEST_SIGNAL:-}" ]]; then
+  kill -s "$CONTAINER_TEST_SELF_TEST_SIGNAL" "$$"
+  fail "signal self-test did not terminate"
+fi
 
 command -v docker >/dev/null || fail "docker is required"
 docker info >/dev/null || fail "docker daemon is unavailable"
 docker buildx version >/dev/null || fail "docker buildx is required"
 [[ -f Dockerfile ]] || fail "Dockerfile is missing"
+if docker image inspect "$image" >/dev/null 2>&1; then
+  fail "container test image already exists: $image"
+fi
+image_owned=true
 
 work_dir=$(mktemp -d)
-data_dir="$work_dir/data"
-mkdir -m 0777 "$data_dir"
 
 cat >"$work_dir/fake-services.py" <<'PY'
 import http.server
@@ -97,22 +119,48 @@ PY
 readonly fake_port=8081
 network_name="paperless-ai-ocr-test-$RANDOM-$$"
 docker network create "$network_name" >/dev/null
+data_volume="paperless-ai-ocr-data-test-$RANDOM-$$"
+docker volume create "$data_volume" >/dev/null
+docker run --rm \
+  --mount type=volume,src="$data_volume",dst=/data \
+  alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659 \
+  sh -ec 'chown 65532:65532 /data; chmod 0700 /data'
 fake_container_id=$(docker run -d \
   --network "$network_name" \
   --network-alias fake-services \
   --read-only \
   --tmpfs /tmp:size=16m,mode=0700 \
   --mount type=bind,src="$work_dir/fake-services.py",dst=/fake-services.py,readonly \
-  python:3.14.2-alpine3.23@sha256:31da4cb527055e4e3d7e9e006dffe9329f84ebea79eaca0a1f1c27ce61e40ca5 \
+  "$test_support_image" \
   python /fake-services.py "$fake_port")
 
-for _ in {1..50}; do
-  if [[ $(docker inspect --format '{{.State.Running}}' "$fake_container_id") == true ]]; then
+fake_deadline=$((SECONDS + 30))
+while ((SECONDS < fake_deadline)); do
+  if docker run --rm \
+    --network "$network_name" \
+    -e NO_PROXY=fake-services \
+    -e no_proxy=fake-services \
+    "$test_support_image" \
+    python -c "import urllib.request; urllib.request.urlopen('http://fake-services:$fake_port/api/', timeout=2).read()" \
+    >/dev/null 2>&1; then
     break
   fi
-  sleep 0.1
+  if [[ $(docker inspect --format '{{.State.Running}}' "$fake_container_id") != true ]]; then
+    docker logs "$fake_container_id" >&2
+    fail "fake dependency server exited before becoming ready"
+  fi
+  sleep 1
 done
-[[ $(docker inspect --format '{{.State.Running}}' "$fake_container_id") == true ]] || fail "fake dependency server did not start"
+if ! docker run --rm \
+  --network "$network_name" \
+  -e NO_PROXY=fake-services \
+  -e no_proxy=fake-services \
+  "$test_support_image" \
+  python -c "import urllib.request; urllib.request.urlopen('http://fake-services:$fake_port/api/', timeout=2).read()" \
+  >/dev/null 2>&1; then
+  docker logs "$fake_container_id" >&2
+  fail "fake dependency server did not become HTTP-ready within 30 seconds"
+fi
 
 docker buildx build \
   --platform "$platform" \
@@ -162,11 +210,12 @@ PY
 
 docker history --no-trunc "$image" >"$work_dir/history.txt"
 if grep -Eiq '(PAPERLESS_API_TOKEN|AI_API_KEY|WEBHOOK_TOKEN|PAPERLESS_AI_WEBHOOK_KEY)=' "$work_dir/history.txt"; then
-  fail "image history contains credential configuration"
+  fail "image history contains known runtime credential configuration"
 fi
 
 uid=$(docker run --rm --entrypoint /usr/bin/id "$image" -u)
-[[ "$uid" =~ ^[0-9]+$ && "$uid" -ne 0 ]] || fail "container runs as root"
+gid=$(docker run --rm --entrypoint /usr/bin/id "$image" -g)
+[[ "$uid" == 65532 && "$gid" == 65532 ]] || fail "container identity is $uid:$gid, want 65532:65532"
 
 docker run --rm --entrypoint /bin/sh "$image" -ec \
   'command -v pdfinfo >/dev/null; command -v pdftoppm >/dev/null; test -s /etc/ssl/certs/ca-certificates.crt'
@@ -180,7 +229,7 @@ container_id=$(docker run -d \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
   --tmpfs /tmp:size=64m,mode=0700,uid="$uid",gid="$uid" \
-  --mount type=bind,src="$data_dir",dst=/app/data \
+  --mount type=volume,src="$data_volume",dst=/app/data \
   -e NO_PROXY=fake-services \
   -e no_proxy=fake-services \
   -e PAPERLESS_URL="http://fake-services:$fake_port/" \
@@ -194,7 +243,8 @@ container_id=$(docker run -d \
   -e HTTP_PORT=18080 \
   "$image")
 
-for _ in {1..100}; do
+health_deadline=$((SECONDS + 90))
+while ((SECONDS < health_deadline)); do
   status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$container_id")
   case "$status" in
     healthy) break ;;
@@ -211,20 +261,28 @@ for _ in {1..100}; do
     docker logs "$fake_container_id" >&2
     fail "container exited before becoming healthy"
   fi
-  sleep 0.2
+  sleep 1
 done
-[[ $(docker inspect --format '{{.State.Health.Status}}' "$container_id") == healthy ]] || fail "healthcheck did not become healthy"
+[[ $(docker inspect --format '{{.State.Health.Status}}' "$container_id") == healthy ]] || {
+  docker logs "$container_id" >&2
+  fail "healthcheck did not become healthy within 90 seconds"
+}
 
-docker exec "$container_id" /bin/sh -ec 'test -w /app/data; test -w /tmp; touch /app/data/container-test; touch /tmp/container-test'
-[[ -f "$data_dir/container-test" ]] || fail "persistent data mount was not writable"
+docker exec "$container_id" /bin/sh -ec '
+  test "$(id -u):$(id -g)" = 65532:65532
+  test "$(stat -c %a:%u:%g /app/data)" = 700:65532:65532
+  test "$(stat -c %a:%u:%g /tmp)" = 700:65532:65532
+  touch /app/data/container-test
+  touch /tmp/container-test
+'
 
 docker stop --time 15 "$container_id" >/dev/null
 exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container_id")
 oom_killed=$(docker inspect --format '{{.State.OOMKilled}}' "$container_id")
 runtime_error=$(docker inspect --format '{{.State.Error}}' "$container_id")
-[[ "$exit_code" =~ ^[0-9]+$ && "$exit_code" -lt 128 && "$oom_killed" == false && -z "$runtime_error" ]] || {
+[[ "$exit_code" == 0 && "$oom_killed" == false && -z "$runtime_error" ]] || {
   docker logs "$container_id" >&2
-  fail "SIGTERM did not produce an application-controlled exit (status $exit_code, OOM=$oom_killed, runtime error=$runtime_error)"
+  fail "SIGTERM did not produce a clean exit (status $exit_code, OOM=$oom_killed, runtime error=$runtime_error)"
 }
 docker rm "$container_id" >/dev/null
 container_id=""
@@ -250,7 +308,20 @@ import sys
 
 root = pathlib.Path(sys.argv[1])
 index = json.loads((root / "index.json").read_text())
-descriptor = index["manifests"][0]
+descriptor = next(
+    (
+        item for item in index["manifests"]
+        if item.get("mediaType") in {
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        }
+        and item.get("platform", {}).get("os") == "linux"
+        and item.get("platform", {}).get("architecture") == "arm64"
+    ),
+    None,
+)
+if descriptor is None:
+    raise SystemExit("OCI index contains no runnable linux/arm64 image manifest")
 manifest = json.loads((root / "blobs" / "sha256" / descriptor["digest"].split(":", 1)[1]).read_text())
 config_desc = manifest["config"]
 config = json.loads((root / "blobs" / "sha256" / config_desc["digest"].split(":", 1)[1]).read_text())

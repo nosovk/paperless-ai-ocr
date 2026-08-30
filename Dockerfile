@@ -36,8 +36,8 @@ LABEL org.opencontainers.image.source="https://github.com/nosovk/paperless-ai-oc
       org.opencontainers.image.created="${CREATED}"
 
 RUN apk add --no-cache \
-        ca-certificates=20260611-r0 \
-        poppler-utils=25.12.0-r0 \
+        ca-certificates \
+        poppler-utils \
     && addgroup -S -g 65532 paperless-ai-ocr \
     && adduser -S -D -H -u 65532 -G paperless-ai-ocr paperless-ai-ocr \
     && install -d -o paperless-ai-ocr -g paperless-ai-ocr -m 0700 /app/data \
