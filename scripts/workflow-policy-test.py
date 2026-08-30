@@ -142,6 +142,13 @@ def assert_run_command(step: Block, command: str, message: str) -> None:
     require(values.get("run") == command, message)
 
 
+def assert_required_step(step: Block, command: str, message: str) -> None:
+    assert_run_command(step, command, message)
+    values = step.values()
+    require("if" not in values, f"{step.header} must not be conditional")
+    require("continue-on-error" not in values, f"{step.header} must fail closed")
+
+
 def assert_pinned_actions(workflow: Workflow) -> None:
     uses = re.findall(r"(?m)^\s+uses:\s*([^\s#]+)\s+#\s+(v[^\s]+)\s*$", workflow.text)
     require(uses, f"{workflow.path.name} has no actions")
@@ -170,6 +177,9 @@ def assert_release_metadata_script() -> None:
     require(path.is_file(), "missing release metadata script")
     lines = path.read_text(encoding="utf-8").splitlines()
     require(lines.count(RELEASE_TAG_PATTERN) == 1, "release tag regex must be exact stable semver")
+    require(lines.count('readonly head=$(git rev-parse HEAD)') == 1, "release metadata must resolve the checked-out HEAD")
+    require(lines.count('if [[ ${GITHUB_SHA:-} != "$head" ]]; then') == 1, "release metadata must bind HEAD to GITHUB_SHA")
+    require(lines.count('  exit 1') >= 2, "release metadata validation must fail on a checkout mismatch")
     require(
         lines.count('readonly committed_at=$(git show -s --format=%cI HEAD)') == 1,
         "release CREATED must come from the tagged commit timestamp",
@@ -197,6 +207,8 @@ def assert_ci(workflow: Workflow) -> None:
     policy = test_steps["Validate workflow policy"].text
     require("python3 scripts/workflow-policy-test.py" in policy, "CI must run workflow policy validation")
     require("python3 scripts/workflow-policy-regression-test.py" in policy, "CI must run policy mutation tests")
+    require("bash scripts/release-metadata-test.sh" in policy, "CI must test release metadata validation")
+    require("bash scripts/check-release-tags-test.sh" in policy, "CI must test immutable release tags")
     require("gofmt -l" in test_steps["Check formatting"].text, "CI formatting step must run gofmt")
     require("go vet ./..." in test_steps["Vet"].text, "CI vet step missing")
     require("go test ./..." in test_steps["Unit tests"].text, "CI unit test step missing")
@@ -244,13 +256,13 @@ def assert_release(workflow: Workflow) -> None:
     require("timeout-minutes:" in verify.text and "timeout-minutes:" in publish.text, "release jobs must have timeouts")
 
     verify_steps = named_steps(verify)
-    assert_run_command(
+    assert_required_step(
         verify_steps["Validate release tag and metadata"],
         "bash scripts/release-metadata.sh",
         "verify must validate the release tag",
     )
     policy = verify_steps["Validate workflow policy"].text
-    for command in ("actionlint .github/workflows/ci.yml .github/workflows/release.yml", "python3 scripts/workflow-policy-test.py", "python3 scripts/workflow-policy-regression-test.py", "bash scripts/release-metadata-test.sh"):
+    for command in ("actionlint .github/workflows/ci.yml .github/workflows/release.yml", "python3 scripts/workflow-policy-test.py", "python3 scripts/workflow-policy-regression-test.py", "bash scripts/release-metadata-test.sh", "bash scripts/check-release-tags-test.sh"):
         require(command in policy, f"verify policy step missing: {command}")
     required_steps = {
         "Check formatting": "gofmt -l",
@@ -275,7 +287,7 @@ def assert_release(workflow: Workflow) -> None:
     publish_steps = named_steps(publish)
     names = [step.header for step in step_blocks(publish)]
     validation_name = "Validate release tag and metadata before publication"
-    assert_run_command(
+    assert_required_step(
         publish_steps[validation_name],
         "bash scripts/release-metadata.sh",
         "publish must execute tag validation",
@@ -287,6 +299,22 @@ def assert_release(workflow: Workflow) -> None:
     require("flavor: latest=false" in metadata and "value=latest" not in metadata.lower(), "release must not publish latest")
     for tag in ("type=raw,value=${{ steps.release-metadata.outputs.version }}", "type=semver,pattern={{version}},value=${{ steps.release-metadata.outputs.version }}", "type=semver,pattern={{major}}.{{minor}},value=${{ steps.release-metadata.outputs.version }}"):
         require(tag in metadata, f"release metadata missing tag rule: {tag}")
+    created = "org.opencontainers.image.created=${{ steps.release-metadata.outputs.created }}"
+    require(metadata.count(created) == 2, "deterministic created metadata must override both labels and annotations")
+    require(f"          labels: |\n            {created}" in metadata, "created label override is misplaced")
+    require(f"          annotations: |\n            {created}" in metadata, "created annotation override is misplaced")
+    immutable_name = "Reject existing immutable release tags"
+    immutable = publish_steps[immutable_name]
+    assert_required_step(immutable, "bash scripts/check-release-tags.sh", "publish must reject existing immutable tags")
+    require(
+        immutable.child("env").values()
+        == {
+            "IMAGE": "ghcr.io/${{ github.repository }}",
+            "VERSION": "${{ steps.release-metadata.outputs.version }}",
+        },
+        "immutable tag check inputs are invalid",
+    )
+    require(names.index("Generate image metadata") < names.index(immutable_name) < names.index("Build and push image"), "immutable tag check must run after metadata and before push")
     build = publish_steps["Build and push image"].text
     for value in ("platforms: linux/amd64,linux/arm64", "push: true", "VERSION=${{ steps.release-metadata.outputs.version }}", "REVISION=${{ github.sha }}", "CREATED=${{ steps.release-metadata.outputs.created }}", "sbom: true", "provenance: mode=max"):
         require(value in build, f"publish build missing: {value}")

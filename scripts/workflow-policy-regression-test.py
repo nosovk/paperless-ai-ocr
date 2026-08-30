@@ -16,6 +16,7 @@ POLICY_INPUTS = (
     ".github/workflows/ci.yml",
     ".github/workflows/release.yml",
     "scripts/release-metadata.sh",
+    "scripts/check-release-tags.sh",
 )
 
 
@@ -161,6 +162,80 @@ def mutate_qemu_image(text: str) -> str:
     )
 
 
+def mutate_remove_head_check(text: str) -> str:
+    return text.replace(
+        'readonly head=$(git rev-parse HEAD)\n'
+        'if [[ ${GITHUB_SHA:-} != "$head" ]]; then\n'
+        "  printf 'tagged checkout mismatch: HEAD=%s GITHUB_SHA=%s\\n' \"$head\" \"${GITHUB_SHA:-}\" >&2\n"
+        "  exit 1\n"
+        "fi\n\n",
+        "",
+        1,
+    )
+
+
+def mutate_bypass_head_check(text: str) -> str:
+    return text.replace(
+        'if [[ ${GITHUB_SHA:-} != "$head" ]]; then',
+        'if false && [[ ${GITHUB_SHA:-} != "$head" ]]; then',
+        1,
+    )
+
+
+def immutable_step() -> str:
+    return (
+        "      - name: Reject existing immutable release tags\n"
+        "        env:\n"
+        "          IMAGE: ghcr.io/${{ github.repository }}\n"
+        "          VERSION: ${{ steps.release-metadata.outputs.version }}\n"
+        "        run: bash scripts/check-release-tags.sh\n"
+    )
+
+
+def mutate_remove_immutable_check(text: str) -> str:
+    return text.replace(immutable_step(), "", 1)
+
+
+def mutate_relocate_immutable_check(text: str) -> str:
+    step = immutable_step()
+    return text.replace(step, "", 1).replace("      - name: Attest image provenance\n", step + "      - name: Attest image provenance\n", 1)
+
+
+def mutate_comment_immutable_check(text: str) -> str:
+    return text.replace(
+        immutable_step(),
+        "      # Reject existing immutable release tags\n"
+        "      # run: bash scripts/check-release-tags.sh\n",
+        1,
+    )
+
+
+def mutate_step_attribute(text: str, step_name: str, attribute: str) -> str:
+    return text.replace(
+        f"      - name: {step_name}\n",
+        f"      - name: {step_name}\n        {attribute}\n",
+        1,
+    )
+
+
+def mutate_remove_created_label(text: str) -> str:
+    return text.replace(
+        "          labels: |\n"
+        "            org.opencontainers.image.created=${{ steps.release-metadata.outputs.created }}\n",
+        "",
+        1,
+    )
+
+
+def mutate_remove_created_annotation(text: str) -> str:
+    return text.replace(
+        "          annotations: |\n"
+        "            org.opencontainers.image.created=${{ steps.release-metadata.outputs.created }}\n",
+        "",
+        1,
+    )
+
+
 def run_mutant(
     name: str,
     relative_path: str,
@@ -225,6 +300,17 @@ def main() -> None:
             run_mutant("unpinned release actionlint", ".github/workflows/release.yml", mutate_actionlint_version, ref),
             run_mutant("unpinned release golangci", ".github/workflows/release.yml", mutate_golangci_version, ref),
             run_mutant("unpinned QEMU image", ".github/workflows/release.yml", mutate_qemu_image, ref),
+            run_mutant("missing checkout binding", "scripts/release-metadata.sh", mutate_remove_head_check, ref),
+            run_mutant("bypassed checkout binding", "scripts/release-metadata.sh", mutate_bypass_head_check, ref),
+            run_mutant("missing immutable tag check", ".github/workflows/release.yml", mutate_remove_immutable_check, ref),
+            run_mutant("immutable tag check after push", ".github/workflows/release.yml", mutate_relocate_immutable_check, ref),
+            run_mutant("immutable tag check only in comment", ".github/workflows/release.yml", mutate_comment_immutable_check, ref),
+            run_mutant("publish validation disabled", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Validate release tag and metadata before publication", "if: false"), ref),
+            run_mutant("publish validation allowed to fail", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Validate release tag and metadata before publication", "continue-on-error: true"), ref),
+            run_mutant("immutable tag check disabled", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Reject existing immutable release tags", "if: false"), ref),
+            run_mutant("immutable tag check allowed to fail", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Reject existing immutable release tags", "continue-on-error: true"), ref),
+            run_mutant("missing deterministic created label", ".github/workflows/release.yml", mutate_remove_created_label, ref),
+            run_mutant("missing deterministic created annotation", ".github/workflows/release.yml", mutate_remove_created_annotation, ref),
         )
         if failure is not None
     ]

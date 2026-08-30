@@ -34,6 +34,14 @@ for tag in v1 v1.2 v1.2.3-rc.1 v01.2.3 v1.02.3 v1.2.03 latest; do
   rm -f "$output"
 done
 
+mismatch_output=$(mktemp)
+if GITHUB_REF_NAME=v1.2.3 GITHUB_SHA=0000000000000000000000000000000000000000 \
+  GITHUB_OUTPUT="$mismatch_output" bash "$script" >"$mismatch_output.stdout" 2>"$mismatch_output.stderr"; then
+  fail "accepted a checkout that does not match GITHUB_SHA"
+fi
+grep -F 'tagged checkout mismatch' "$mismatch_output.stderr" >/dev/null || fail "checkout mismatch error is missing"
+rm -f "$mismatch_output" "$mismatch_output.stdout" "$mismatch_output.stderr"
+
 first=$(mktemp)
 second=$(mktemp)
 trap 'rm -f "$first" "$second"' EXIT

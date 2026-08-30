@@ -46,6 +46,7 @@ jobs:
           python3 scripts/workflow-policy-test.py
           python3 scripts/workflow-policy-regression-test.py
           bash scripts/release-metadata-test.sh
+          bash scripts/check-release-tags-test.sh
       - name: Check formatting
         shell: bash
         run: |
@@ -131,6 +132,15 @@ jobs:
             type=raw,value=${{ steps.release-metadata.outputs.version }}
             type=semver,pattern={{version}},value=${{ steps.release-metadata.outputs.version }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.release-metadata.outputs.version }}
+          labels: |
+            org.opencontainers.image.created=${{ steps.release-metadata.outputs.created }}
+          annotations: |
+            org.opencontainers.image.created=${{ steps.release-metadata.outputs.created }}
+      - name: Reject existing immutable release tags
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: bash scripts/check-release-tags.sh
       - name: Build and push image
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
