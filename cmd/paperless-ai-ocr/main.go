@@ -23,6 +23,13 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 10 * time.Second
+	writeTimeout      = 10 * time.Second
+	idleTimeout       = 60 * time.Second
+)
+
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "--version" {
 		metadata := buildinfo.Current()
@@ -53,15 +60,37 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	signalStopped := stopSignalNotificationAfterCancellation(signalCtx, stop)
 	err = app.Run(signalCtx, app.Options{
 		Runtime: service.Runtime, Readiness: readiness, Metrics: metrics, Listener: listener,
-		HTTPServer: &http.Server{ReadHeaderTimeout: 5 * time.Second}, Handler: service.Handler,
+		HTTPServer: productionHTTPServer(service.Handler), Handler: service.Handler,
 		PollInterval: cfg.PollInterval, IdleInterval: app.DefaultIdleInterval(),
 	})
+	stop()
+	<-signalStopped
 	if err != nil {
 		fmt.Fprintln(stderr, "paperless-ai-ocr: runtime failed")
 		return 1
 	}
 	return 0
+}
+
+func productionHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+}
+
+func stopSignalNotificationAfterCancellation(ctx context.Context, stop func()) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-ctx.Done()
+		stop()
+	}()
+	return done
 }

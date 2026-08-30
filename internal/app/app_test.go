@@ -22,7 +22,8 @@ import (
 func TestRunStartupOrderAndReadiness(t *testing.T) {
 	readiness := server.NewReadiness()
 	initialize := make(chan struct{})
-	runtime := &fakeRuntime{events: make(chan string, 16), claimResults: []claimResult{{}}, initialize: initialize}
+	reconcile := make(chan struct{})
+	runtime := &fakeRuntime{events: make(chan string, 16), claimResults: []claimResult{{}}, initialize: initialize, reconcile: reconcile}
 	listener := newTestListener(t)
 	ctx, cancel := context.WithCancelCause(context.Background())
 	done := make(chan error, 1)
@@ -48,7 +49,7 @@ func TestRunStartupOrderAndReadiness(t *testing.T) {
 		t.Fatal("readiness became true before runtime initialization")
 	}
 	close(initialize)
-	for _, want := range []string{"initialize", "reconcile", "claim"} {
+	for _, want := range []string{"initialize", "reconcile"} {
 		select {
 		case got := <-runtime.events:
 			if got != want {
@@ -57,6 +58,23 @@ func TestRunStartupOrderAndReadiness(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("timed out waiting for %q", want)
 		}
+	}
+	if readiness.Ready() {
+		t.Fatal("readiness became true before initial reconciliation completed")
+	}
+	select {
+	case event := <-runtime.events:
+		t.Fatalf("unexpected startup event before reconciliation completed: %q", event)
+	default:
+	}
+	close(reconcile)
+	select {
+	case got := <-runtime.events:
+		if got != "claim" {
+			t.Fatalf("startup event = %q, want claim", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for claim")
 	}
 	if !readiness.Ready() {
 		t.Fatal("readiness = false after initialization")
@@ -70,6 +88,29 @@ func TestRunStartupOrderAndReadiness(t *testing.T) {
 		t.Fatal("readiness remained true after shutdown")
 	}
 	runtime.assertOrder(t, "cancel", "close")
+}
+
+func TestRunInitialReconciliationFailureNeverBecomesReady(t *testing.T) {
+	readiness := server.NewReadiness()
+	runtime := &fakeRuntime{
+		events:       make(chan string, 16),
+		claimResults: []claimResult{{}},
+		reconcileErr: errors.New("CANARY private reconciliation failure"),
+	}
+	err := Run(context.Background(), Options{
+		Runtime: runtime, Readiness: readiness, Metrics: observability.NewMetrics(),
+		Listener: newTestListener(t), HTTPServer: &http.Server{}, PollInterval: time.Hour,
+		IdleInterval: time.Hour, ShutdownTimeout: time.Second,
+	})
+	if err == nil || err.Error() != "internal: background operation failed" {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if readiness.Ready() {
+		t.Fatal("readiness became true after failed initial reconciliation")
+	}
+	if slices.Contains(runtime.ordered, "claim") {
+		t.Fatalf("worker claimed after failed reconciliation: %v", runtime.ordered)
+	}
 }
 
 func TestRunReleasesActiveLeaseOnShutdown(t *testing.T) {
@@ -132,6 +173,54 @@ func TestRunFailsWhenActiveLeaseReleaseFails(t *testing.T) {
 		t.Fatalf("Run() error = %v, want safe shutdown failure", err)
 	}
 	runtime.assertOrder(t, "cancel", "release", "close")
+}
+
+func TestRunBoundsShutdownWithoutClosingActiveRuntime(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	exited := make(chan struct{})
+	runtime := &fakeRuntime{
+		events:       make(chan string, 16),
+		claimResults: []claimResult{{job: queue.Job{ID: 7, Attempts: 2, LeaseOwner: "worker", State: queue.StateProcessing}, ok: true}},
+		state:        queue.StateProcessing,
+		stateFound:   true,
+		process: func(context.Context, queue.Job) (worker.Result, error) {
+			close(started)
+			<-release
+			close(exited)
+			return worker.Result{}, context.Canceled
+		},
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		options := testOptions(t, runtime)
+		options.ShutdownTimeout = 25 * time.Millisecond
+		done <- Run(ctx, options)
+	}()
+	<-started
+	startedAt := time.Now()
+	cancel(context.Canceled)
+	select {
+	case err := <-done:
+		if err == nil || err.Error() != "internal: shutdown failed" {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run() did not honor shutdown timeout")
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Errorf("shutdown elapsed = %s, want bounded", elapsed)
+	}
+	if runtime.closed {
+		t.Fatal("runtime closed while worker loop was still active")
+	}
+	close(release)
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("stuck worker did not exit after test cleanup")
+	}
 }
 
 func TestRunAcceptsStaleReleaseAfterConfirmedRetry(t *testing.T) {
@@ -260,6 +349,26 @@ func TestRunMetricsScrapeCurrentQueueDepth(t *testing.T) {
 	}
 }
 
+func TestWorkerMetricObserversUseAggregateTranscribeMetrics(t *testing.T) {
+	metrics := observability.NewMetrics()
+	observers := workerMetricObservers(metrics)
+	observers.providerAttempt(250 * time.Millisecond)
+	observers.processedPages(2)
+	observers.renderedBytes(18)
+	response := httptest.NewRecorder()
+	metrics.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := response.Body.String()
+	for _, want := range []string{
+		`paperless_ai_ocr_provider_requests_total{operation="transcribe"} 1`,
+		"paperless_ai_ocr_processed_pages_total 2",
+		"paperless_ai_ocr_rendered_bytes_total 18",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q: %q", want, body)
+		}
+	}
+}
+
 func TestRunStopsWhenWorkerErrorLeavesLeaseActive(t *testing.T) {
 	runtime := &fakeRuntime{
 		events:       make(chan string, 16),
@@ -318,6 +427,26 @@ func TestRunReturnsSafeFatalCause(t *testing.T) {
 	}
 }
 
+func TestRunSanitizesParentCancellationCause(t *testing.T) {
+	const canary = "CANARY secret cancellation cause"
+	ctx, cancel := context.WithCancelCause(context.Background())
+	runtime := &fakeRuntime{events: make(chan string, 16), claimResults: []claimResult{{}}}
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, testOptions(t, runtime)) }()
+	for range 6 {
+		<-runtime.events
+	}
+	cause := errors.New(canary)
+	cancel(cause)
+	err := <-done
+	if err == nil || strings.Contains(err.Error(), canary) {
+		t.Fatalf("Run() error = %v, want sanitized cause", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("errors.Is(error, cause) = false: %v", err)
+	}
+}
+
 type claimResult struct {
 	job queue.Job
 	ok  bool
@@ -333,6 +462,7 @@ type fakeRuntime struct {
 	terminalErr       error
 	reconcileErr      error
 	initialize        <-chan struct{}
+	reconcile         <-chan struct{}
 	state             queue.State
 	stateFound        bool
 	stateAfterRelease queue.State
@@ -341,6 +471,7 @@ type fakeRuntime struct {
 	released          queue.Job
 	finalized         string
 	depth             map[queue.State]int64
+	closed            bool
 }
 
 func (runtime *fakeRuntime) event(value string) {
@@ -371,6 +502,9 @@ func (runtime *fakeRuntime) Initialize(ctx context.Context) error {
 }
 func (runtime *fakeRuntime) Reconcile(context.Context) (reconcile.Report, error) {
 	runtime.event("reconcile")
+	if runtime.reconcile != nil {
+		<-runtime.reconcile
+	}
 	return reconcile.Report{}, runtime.reconcileErr
 }
 func (runtime *fakeRuntime) Claim(context.Context) (queue.Job, bool, error) {
@@ -416,8 +550,12 @@ func (runtime *fakeRuntime) QueueDepth(context.Context) (map[queue.State]int64, 
 func (runtime *fakeRuntime) State(context.Context, queue.Job) (queue.State, bool, error) {
 	return runtime.state, runtime.stateFound, nil
 }
-func (runtime *fakeRuntime) Cancel()      { runtime.event("cancel") }
-func (runtime *fakeRuntime) Close() error { runtime.event("close"); return nil }
+func (runtime *fakeRuntime) Cancel() { runtime.event("cancel") }
+func (runtime *fakeRuntime) Close() error {
+	runtime.event("close")
+	runtime.closed = true
+	return nil
+}
 
 func (runtime *fakeRuntime) assertOrder(t *testing.T, values ...string) {
 	t.Helper()

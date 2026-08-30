@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/nosovk/paperless-ai-ocr/internal/aigate"
+	"github.com/nosovk/paperless-ai-ocr/internal/observability"
 	"github.com/nosovk/paperless-ai-ocr/internal/ocr"
 	"github.com/nosovk/paperless-ai-ocr/internal/paperless"
 	"github.com/nosovk/paperless-ai-ocr/internal/pdf"
@@ -37,6 +40,68 @@ func TestProcessDirectPDFAndLeavesJobForFinalizer(t *testing.T) {
 	if result.JobID != fixture.job.ID || result.DocumentID != fixture.job.DocumentID || result.SourceChecksum != fixture.job.SourceChecksum || result.DownloadSHA256 == "" || !strings.Contains(result.Content, "PAGE 3") {
 		t.Errorf("Process() result = %+v", result)
 	}
+}
+
+func TestProcessObservesNewOCRWorkOnly(t *testing.T) {
+	fixture := newFixture(t, 3, aigate.PageImages)
+	metrics := observability.NewMetrics()
+	fixture.worker.options.ObserveProviderAttempt = func(duration time.Duration) {
+		metrics.RecordProviderLatency(observability.OperationTranscribe, duration)
+	}
+	fixture.worker.options.ObserveProcessedPages = metrics.RecordProcessedPages
+	fixture.worker.options.ObserveRenderedBytes = metrics.RecordRenderedBytes
+	if _, err := fixture.worker.Process(context.Background(), fixture.job); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	response := httptest.NewRecorder()
+	metrics.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := response.Body.String()
+	for _, want := range []string{
+		`paperless_ai_ocr_provider_requests_total{operation="transcribe"} 1`,
+		"paperless_ai_ocr_processed_pages_total 3",
+		"paperless_ai_ocr_rendered_bytes_total 27",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q: %q", want, body)
+		}
+	}
+}
+
+func TestProcessMetricsRetryAndCheckpointSemantics(t *testing.T) {
+	t.Run("attempt latency and failed render workload", func(t *testing.T) {
+		fixture := newFixture(t, 2, aigate.PageImages)
+		fixture.transcriber.errors = []error{retryableError{}, saferr.New(saferr.CategoryProvider, "permanent failure")}
+		var providerCalls, processedPages int
+		var renderedBytes int64
+		fixture.worker.options.ObserveProviderAttempt = func(time.Duration) { providerCalls++ }
+		fixture.worker.options.ObserveProcessedPages = func(pages int) { processedPages += pages }
+		fixture.worker.options.ObserveRenderedBytes = func(bytes int64) { renderedBytes += bytes }
+		if _, err := fixture.worker.Process(context.Background(), fixture.job); err == nil {
+			t.Fatal("Process() error = nil, want failure")
+		}
+		if providerCalls != 2 || processedPages != 0 || renderedBytes != 18 {
+			t.Errorf("observations = provider %d pages %d bytes %d", providerCalls, processedPages, renderedBytes)
+		}
+	})
+
+	t.Run("completed checkpoint reuse", func(t *testing.T) {
+		fixture := newFixture(t, 2, aigate.PageImages)
+		fixture.store.batches = []queue.Batch{{
+			JobID: fixture.job.ID, FirstPage: 1, LastPage: 2, RenderDPI: 200,
+			RenderFormat: "png", State: queue.StateCompleted, ResultText: rawPages(1, 2),
+		}}
+		var providerCalls, processedPages int
+		var renderedBytes int64
+		fixture.worker.options.ObserveProviderAttempt = func(time.Duration) { providerCalls++ }
+		fixture.worker.options.ObserveProcessedPages = func(pages int) { processedPages += pages }
+		fixture.worker.options.ObserveRenderedBytes = func(bytes int64) { renderedBytes += bytes }
+		if _, err := fixture.worker.Process(context.Background(), fixture.job); err != nil {
+			t.Fatalf("Process() error = %v", err)
+		}
+		if providerCalls != 0 || processedPages != 0 || renderedBytes != 0 {
+			t.Errorf("reused observations = provider %d pages %d bytes %d", providerCalls, processedPages, renderedBytes)
+		}
+	})
 }
 
 func TestProcessUsesImagesForOversizedOrLongPDF(t *testing.T) {

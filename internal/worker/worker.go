@@ -87,6 +87,10 @@ type Options struct {
 	Jitter           func(time.Duration) time.Duration
 	Retry            func(error) (aigate.RetryClass, time.Duration, bool)
 	Unsupported      func(error) bool
+	// Observers are trusted nonblocking internal callbacks and must not panic.
+	ObserveProviderAttempt func(time.Duration)
+	ObserveProcessedPages  func(int)
+	ObserveRenderedBytes   func(int64)
 }
 
 // Worker processes exactly one already claimed job.
@@ -154,6 +158,15 @@ func New(options Options) (*Worker, error) {
 	}
 	if options.Unsupported == nil {
 		options.Unsupported = aigate.UnsupportedAttachment
+	}
+	if options.ObserveProviderAttempt == nil {
+		options.ObserveProviderAttempt = func(time.Duration) {}
+	}
+	if options.ObserveProcessedPages == nil {
+		options.ObserveProcessedPages = func(int) {}
+	}
+	if options.ObserveRenderedBytes == nil {
+		options.ObserveRenderedBytes = func(int64) {}
 	}
 	return &Worker{options: options}, nil
 }
@@ -405,6 +418,7 @@ func (worker *Worker) renderTranscribeAndCheckpoint(ctx context.Context, job que
 			return err
 		}
 		images := make([][]byte, len(pages))
+		var renderedBytes int64
 		for index, page := range pages {
 			if page.Number != pageRange.FirstPage+index || page.Size <= 0 || page.Size > 8<<20 {
 				return saferr.New(saferr.CategoryRendering, "rendered page output exceeded limits")
@@ -414,7 +428,9 @@ func (worker *Worker) renderTranscribeAndCheckpoint(ctx context.Context, job que
 				return saferr.New(saferr.CategoryRendering, "rendered page output could not be read safely")
 			}
 			images[index] = data
+			renderedBytes += int64(len(data))
 		}
+		worker.options.ObserveRenderedBytes(renderedBytes)
 		var err error
 		batch, err = worker.transcribeAndCheckpoint(ctx, job, pageRange, draft, nil, images)
 		return err
@@ -434,7 +450,9 @@ func (worker *Worker) transcribeAndCheckpoint(ctx context.Context, job queue.Job
 		if err = worker.renew(ctx, job); err != nil {
 			return ocr.Batch{}, err
 		}
+		started := time.Now()
 		raw, err = worker.options.Transcriber.Transcribe(ctx, input)
+		worker.options.ObserveProviderAttempt(time.Since(started))
 		if err == nil {
 			break
 		}
@@ -478,6 +496,7 @@ func (worker *Worker) transcribeAndCheckpoint(ctx context.Context, job queue.Job
 	if err := worker.options.Store.CheckpointBatchContext(ctx, job.ID, job.Attempts, job.LeaseOwner, pageRange, worker.options.RenderDPI, renderFormat, string(canonical)); err != nil {
 		return ocr.Batch{}, err
 	}
+	worker.options.ObserveProcessedPages(pageRange.LastPage - pageRange.FirstPage + 1)
 	return batch, nil
 }
 

@@ -90,6 +90,7 @@ type serviceRuntime struct {
 	capability aigate.Capability
 	worker     *worker.Worker
 	finalizer  *finalize.Finalizer
+	metrics    *observability.Metrics
 	cancel     context.CancelCauseFunc
 }
 
@@ -131,7 +132,7 @@ func NewService(cfg config.Config, readiness *server.Readiness, metrics *observa
 	}
 	_, cancel := context.WithCancelCause(context.Background())
 	runtime := &serviceRuntime{db: db, queue: q, paperless: paperlessClient, ai: aiClient,
-		dispatcher: dispatcher, reconciler: reconciler, config: cfg, owner: owner, cancel: cancel}
+		dispatcher: dispatcher, reconciler: reconciler, config: cfg, owner: owner, metrics: metrics, cancel: cancel}
 	webhook, err := server.New(cfg.WebhookToken, q)
 	if err != nil {
 		cleanup()
@@ -169,12 +170,16 @@ func (runtime *serviceRuntime) Initialize(context.Context) error {
 	if err != nil {
 		return err
 	}
+	observers := workerMetricObservers(runtime.metrics)
 	runtime.worker, err = worker.New(worker.Options{
 		Store: runtime.queue, Paperless: runtime.paperless, Capability: runtime.capability,
 		Transcriber: runtime.ai, WorkspaceOptions: pdf.WorkspaceOptions{TemporaryByteBudget: runtime.config.TemporaryRenderBudget},
 		Inspector: inspector, Renderer: renderer, Model: runtime.config.AIModel, BatchSize: runtime.config.BatchSize,
 		RenderDPI: runtime.config.RenderDPI, ModelAttempts: runtime.config.ModelAttempts,
 		LeaseDuration: leaseDuration, DocumentDeadline: runtime.config.DocumentDeadline,
+		ObserveProviderAttempt: observers.providerAttempt,
+		ObserveProcessedPages:  observers.processedPages,
+		ObserveRenderedBytes:   observers.renderedBytes,
 	})
 	if err != nil {
 		return err
@@ -183,6 +188,22 @@ func (runtime *serviceRuntime) Initialize(context.Context) error {
 		Store: runtime.queue, Paperless: runtime.paperless, Dispatcher: runtime.dispatcher, LeaseDuration: leaseDuration,
 	})
 	return err
+}
+
+type workerObservers struct {
+	providerAttempt func(time.Duration)
+	processedPages  func(int)
+	renderedBytes   func(int64)
+}
+
+func workerMetricObservers(metrics *observability.Metrics) workerObservers {
+	return workerObservers{
+		providerAttempt: func(duration time.Duration) {
+			metrics.RecordProviderLatency(observability.OperationTranscribe, duration)
+		},
+		processedPages: metrics.RecordProcessedPages,
+		renderedBytes:  metrics.RecordRenderedBytes,
+	}
 }
 
 func (runtime *serviceRuntime) Reconcile(ctx context.Context) (reconcile.Report, error) {
@@ -292,7 +313,6 @@ func Run(parent context.Context, options Options) error {
 
 	startupErr := initialize(ctx, options)
 	if startupErr == nil {
-		options.Readiness.Set(true)
 		report, err := options.Runtime.Reconcile(ctx)
 		if err != nil {
 			background(err)
@@ -301,6 +321,7 @@ func Run(parent context.Context, options Options) error {
 		}
 	}
 	if startupErr == nil && ctx.Err() == nil {
+		options.Readiness.Set(true)
 		loops.Add(2)
 		go func() {
 			defer loops.Done()
@@ -328,23 +349,37 @@ func Run(parent context.Context, options Options) error {
 
 	options.Readiness.Set(false)
 	options.Runtime.Cancel()
-	loops.Wait()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+	httpDone := make(chan error, 1)
+	go func() { httpDone <- options.HTTPServer.Shutdown(shutdownCtx) }()
+	loopsDone := make(chan struct{})
+	go func() {
+		loops.Wait()
+		close(loopsDone)
+	}()
+	select {
+	case <-loopsDone:
+	case <-shutdownCtx.Done():
+		return saferr.New(saferr.CategoryInternal, "shutdown failed")
+	}
 	activeMu.Lock()
 	claimed := active
 	activeMu.Unlock()
 	var releaseErr error
 	if claimed.ID != 0 {
-		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		var retried bool
-		retried, releaseErr = settleShutdownClaim(releaseCtx, options.Runtime, claimed)
+		retried, releaseErr = settleShutdownClaim(shutdownCtx, options.Runtime, claimed)
 		if retried {
 			options.Metrics.RecordRetry()
 		}
-		releaseCancel()
 	}
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	shutdownErr := options.HTTPServer.Shutdown(shutdownCtx)
-	shutdownCancel()
+	var shutdownErr error
+	select {
+	case shutdownErr = <-httpDone:
+	case <-shutdownCtx.Done():
+		return saferr.New(saferr.CategoryInternal, "shutdown failed")
+	}
 	select {
 	case serveErr := <-serveDone:
 		if shutdownErr == nil {
@@ -352,13 +387,23 @@ func Run(parent context.Context, options Options) error {
 		}
 	default:
 	}
-	closeErr := options.Runtime.Close()
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- options.Runtime.Close() }()
+	var closeErr error
+	select {
+	case closeErr = <-closeDone:
+	case <-shutdownCtx.Done():
+		return saferr.New(saferr.CategoryInternal, "shutdown failed")
+	}
 	if startupErr != nil {
 		return saferr.New(saferr.CategoryInternal, "startup failed")
 	}
 	cause := context.Cause(ctx)
 	if cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
-		return cause
+		if _, ok := errors.AsType[*saferr.Error](cause); ok {
+			return cause
+		}
+		return saferr.Wrap(saferr.CategoryInternal, "application canceled", cause)
 	}
 	if releaseErr != nil || shutdownErr != nil || closeErr != nil {
 		return saferr.New(saferr.CategoryInternal, "shutdown failed")
