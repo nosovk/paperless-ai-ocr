@@ -112,6 +112,7 @@ func boundedTransport() *http.Transport {
 func redirectPolicy(baseURL *url.URL, callerPolicy func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
 	return func(request *http.Request, via []*http.Request) error {
 		request.Header.Del("Authorization")
+		defer request.Header.Del("Authorization")
 		if len(via) >= 10 {
 			return errors.New("too many redirects")
 		}

@@ -331,8 +331,9 @@ func TestWalkDocumentsCallbackContextErrorsPreserveOnlyExactSentinels(t *testing
 	}{
 		{name: "canceled", callback: context.Canceled, wantIs: context.Canceled},
 		{name: "deadline", callback: context.DeadlineExceeded, wantIs: context.DeadlineExceeded},
-		{name: "wrapped canceled", callback: fmt.Errorf("CANARY wrapped canceled: %w", context.Canceled), wantNoIs: context.Canceled, canary: "CANARY wrapped canceled"},
-		{name: "wrapped deadline", callback: fmt.Errorf("CANARY wrapped deadline: %w", context.DeadlineExceeded), wantNoIs: context.DeadlineExceeded, canary: "CANARY wrapped deadline"},
+		{name: "wrapped canceled", callback: fmt.Errorf("CANARY wrapped canceled: %w", context.Canceled), wantIs: context.Canceled, canary: "CANARY wrapped canceled"},
+		{name: "wrapped deadline", callback: fmt.Errorf("CANARY wrapped deadline: %w", context.DeadlineExceeded), wantIs: context.DeadlineExceeded, canary: "CANARY wrapped deadline"},
+		{name: "both prefers canceled", callback: errors.Join(fmt.Errorf("CANARY canceled: %w", context.Canceled), fmt.Errorf("CANARY deadline: %w", context.DeadlineExceeded)), wantIs: context.Canceled, wantNoIs: context.DeadlineExceeded, canary: "CANARY"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			err := client.WalkDocuments(context.Background(), func([]Document) error { return test.callback })
@@ -1272,12 +1273,15 @@ func TestCallerRedirectPolicyIsPreserved(t *testing.T) {
 	callerErr := errors.New(callerCanary)
 	var policyCalls atomic.Int32
 	var policyMethod string
+	var policyRequest *http.Request
 	httpClient := &http.Client{CheckRedirect: func(request *http.Request, via []*http.Request) error {
 		policyCalls.Add(1)
 		policyMethod = via[0].Method
+		policyRequest = request
 		if authorization := request.Header.Get("Authorization"); authorization != "" {
 			t.Errorf("caller policy Authorization = %q, want empty", authorization)
 		}
+		request.Header.Set("Authorization", "Token CANARY-restored-error-secret")
 		if request.URL.Path != "/paperless/redirected" || len(via) != 1 {
 			t.Errorf("caller policy request = %s, via = %d", request.URL.Path, len(via))
 		}
@@ -1304,7 +1308,37 @@ func TestCallerRedirectPolicyIsPreserved(t *testing.T) {
 	if got, want := policyMethod, http.MethodGet; got != want {
 		t.Errorf("original method = %q, want %q", got, want)
 	}
-	assertRedacted(t, err, callerCanary, testToken, server.URL, "/paperless/redirected", "Authorization")
+	if authorization := policyRequest.Header.Get("Authorization"); authorization != "" {
+		t.Errorf("rejected redirect Authorization = %q, want empty", authorization)
+	}
+	assertRedacted(t, err, callerCanary, testToken, "CANARY-restored-error-secret", server.URL, "/paperless/redirected", "Authorization")
+}
+
+func TestCallerRedirectPolicyCannotRestoreAuthorization(t *testing.T) {
+	var destinationAuthorization string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/paperless/api/documents/1/" {
+			http.Redirect(writer, request, "/paperless/redirected", http.StatusFound)
+			return
+		}
+		destinationAuthorization = request.Header.Get("Authorization")
+		io.WriteString(writer, `{"id":1}`)
+	}))
+	t.Cleanup(server.Close)
+	httpClient := &http.Client{CheckRedirect: func(request *http.Request, _ []*http.Request) error {
+		if request.Header.Get("Authorization") != "" {
+			t.Error("caller inspected inherited Authorization")
+		}
+		request.Header.Set("Authorization", "Token CANARY-restored-secret")
+		return nil
+	}}
+	client := newTestClient(t, server.URL+"/paperless/", Options{HTTPClient: httpClient})
+	if _, err := client.GetDocument(context.Background(), 1); err != nil {
+		t.Fatalf("GetDocument() error = %v", err)
+	}
+	if destinationAuthorization != "" {
+		t.Errorf("destination Authorization = %q, want empty", destinationAuthorization)
+	}
 }
 
 func TestMandatoryRedirectPolicyRunsBeforeCallerPolicy(t *testing.T) {

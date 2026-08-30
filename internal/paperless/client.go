@@ -540,6 +540,7 @@ func boundedTransport() *http.Transport {
 func redirectPolicy(baseURL *url.URL, callerPolicy func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
 	return func(request *http.Request, via []*http.Request) error {
 		request.Header.Del("Authorization")
+		defer request.Header.Del("Authorization")
 		if len(via) >= 10 {
 			return errors.New("too many redirects")
 		}
@@ -611,10 +612,10 @@ func paperlessHTTPError(operation string, cause error) error {
 }
 
 func paperlessCallbackError(cause error) error {
-	if cause == context.Canceled {
+	if errors.Is(cause, context.Canceled) {
 		return saferr.Wrap(saferr.CategoryPaperless, "walk documents callback failed", context.Canceled)
 	}
-	if cause == context.DeadlineExceeded {
+	if errors.Is(cause, context.DeadlineExceeded) {
 		return saferr.Wrap(saferr.CategoryPaperless, "walk documents callback failed", context.DeadlineExceeded)
 	}
 	return saferr.New(saferr.CategoryPaperless, "walk documents callback failed")

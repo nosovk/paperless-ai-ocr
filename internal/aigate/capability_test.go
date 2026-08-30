@@ -680,11 +680,14 @@ func TestRedirectPolicyStripsAuthorizationBeforeCallerPolicy(t *testing.T) {
 	)
 	callerErr := errors.New(callerCanary)
 	var calls int
+	var policyRequest *http.Request
 	httpClient := &http.Client{CheckRedirect: func(request *http.Request, _ []*http.Request) error {
 		calls++
+		policyRequest = request
 		if authorization := request.Header.Get("Authorization"); authorization != "" {
 			t.Errorf("caller policy Authorization = %q, want empty", authorization)
 		}
+		request.Header.Set("Authorization", "Bearer CANARY-restored-error-secret")
 		return callerErr
 	}}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -700,7 +703,37 @@ func TestRedirectPolicyStripsAuthorizationBeforeCallerPolicy(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("caller policy calls = %d, want 1", calls)
 	}
-	assertSafeErrorChain(t, err, keyCanary, endpointCanary, callerCanary, server.URL, "Authorization")
+	if authorization := policyRequest.Header.Get("Authorization"); authorization != "" {
+		t.Errorf("rejected redirect Authorization = %q, want empty", authorization)
+	}
+	assertSafeErrorChain(t, err, keyCanary, endpointCanary, callerCanary, "CANARY-restored-error-secret", server.URL, "Authorization")
+}
+
+func TestCallerRedirectPolicyCannotRestoreAuthorization(t *testing.T) {
+	var destinationAuthorization string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/base/v1/responses" {
+			http.Redirect(writer, request, "/base/v1/redirected", http.StatusTemporaryRedirect)
+			return
+		}
+		destinationAuthorization = request.Header.Get("Authorization")
+		writeProbeSuccess(t, writer)
+	}))
+	defer server.Close()
+	httpClient := &http.Client{CheckRedirect: func(request *http.Request, _ []*http.Request) error {
+		if request.Header.Get("Authorization") != "" {
+			t.Error("caller inspected inherited Authorization")
+		}
+		request.Header.Set("Authorization", "Bearer CANARY-restored-secret")
+		return nil
+	}}
+	client := newTestClient(t, server.URL+"/base/v1", "key", "model", ClientOptions{HTTPClient: httpClient})
+	if _, err := client.Probe(context.Background()); err != nil {
+		t.Fatalf("Probe() error = %v", err)
+	}
+	if destinationAuthorization != "" {
+		t.Errorf("destination Authorization = %q, want empty", destinationAuthorization)
+	}
 }
 
 type responseRequest struct {
