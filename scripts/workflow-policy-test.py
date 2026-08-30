@@ -318,6 +318,7 @@ def assert_release(workflow: Workflow) -> None:
         == {
             "IMAGE": "ghcr.io/${{ github.repository }}",
             "VERSION": "${{ steps.release-metadata.outputs.version }}",
+            "REVISION": "${{ github.sha }}",
         },
         "release state inputs are invalid",
     )

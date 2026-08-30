@@ -189,6 +189,7 @@ def release_state_step() -> str:
         "        env:\n"
         "          IMAGE: ghcr.io/${{ github.repository }}\n"
         "          VERSION: ${{ steps.release-metadata.outputs.version }}\n"
+        "          REVISION: ${{ github.sha }}\n"
         "        run: bash scripts/release-state.sh\n"
     )
 

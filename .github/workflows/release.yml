@@ -140,6 +140,7 @@ jobs:
         env:
           IMAGE: ghcr.io/${{ github.repository }}
           VERSION: ${{ steps.release-metadata.outputs.version }}
+          REVISION: ${{ github.sha }}
         run: bash scripts/release-state.sh
       - name: Build and push image
         id: build
