@@ -86,3 +86,41 @@ func TestWorkspaceOwnedFileCancellationAndIOFailureCleanup(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkspaceRemainingReservationResizesWithoutProtectionGap(t *testing.T) {
+	workspace := newTestWorkspace(t, context.Background(), 93, WorkspaceOptions{TemporaryByteBudget: 13, MinimumFreeBytes: 10})
+	file, err := workspace.Create(context.Background(), "source.pdf")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := file.Write([]byte("safe")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	lease, err := workspace.reserveRemaining(context.Background())
+	if err != nil {
+		t.Fatalf("reserveRemaining() error = %v", err)
+	}
+	if workspace.reserved != 13 || workspace.active != 1 {
+		t.Fatalf("reserved/active = %d/%d, want 13/1", workspace.reserved, workspace.active)
+	}
+	if err := lease.resize(8); err != nil {
+		t.Fatalf("resize(8) error = %v", err)
+	}
+	if workspace.reserved != 12 || workspace.active != 1 {
+		t.Fatalf("reserved/active after resize = %d/%d, want 12/1", workspace.reserved, workspace.active)
+	}
+	if err := lease.resize(9); err == nil {
+		t.Fatal("resize beyond reservation error = nil")
+	}
+	if workspace.reserved != 12 || workspace.active != 1 {
+		t.Fatalf("reserved/active after failed resize = %d/%d, want 12/1", workspace.reserved, workspace.active)
+	}
+	lease.release()
+	if workspace.reserved != 4 || workspace.active != 0 {
+		t.Fatalf("reserved/active after release = %d/%d, want 4/0", workspace.reserved, workspace.active)
+	}
+}

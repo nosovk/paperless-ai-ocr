@@ -183,6 +183,35 @@ func (workspace *Workspace) reserve(ctx context.Context, bytes int64) (*reservat
 	return &reservation{workspace: workspace, bytes: bytes}, nil
 }
 
+func (workspace *Workspace) reserveRemaining(ctx context.Context) (*reservation, error) {
+	if workspace == nil || ctx == nil {
+		return nil, saferr.New(saferr.CategoryRendering, "temporary storage reservation failed")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, renderingError("temporary storage reservation canceled", err)
+	}
+
+	workspace.mu.Lock()
+	defer workspace.mu.Unlock()
+	if workspace.closed {
+		return nil, saferr.New(saferr.CategoryRendering, "workspace is closed")
+	}
+	bytes := workspace.budget - workspace.reserved
+	available, err := workspace.availableBytes(workspace.dir)
+	if err != nil {
+		return nil, renderingError("workspace storage check failed", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, renderingError("temporary storage reservation canceled", err)
+	}
+	if available < 0 || bytes > math.MaxInt64-workspace.minimumFree || available < bytes+workspace.minimumFree {
+		return nil, saferr.New(saferr.CategoryRendering, "insufficient temporary storage")
+	}
+	workspace.reserved += bytes
+	workspace.active++
+	return &reservation{workspace: workspace, bytes: bytes}, nil
+}
+
 func (reservation *reservation) grow(ctx context.Context, bytes int64) error {
 	if reservation == nil || reservation.workspace == nil || bytes < 0 {
 		return saferr.New(saferr.CategoryRendering, "temporary storage reservation failed")
@@ -217,7 +246,7 @@ func (reservation *reservation) grow(ctx context.Context, bytes int64) error {
 	return nil
 }
 
-func (reservation *reservation) accountExisting(ctx context.Context, bytes int64) error {
+func (reservation *reservation) resize(bytes int64) error {
 	if reservation == nil || reservation.workspace == nil || bytes < 0 {
 		return saferr.New(saferr.CategoryRendering, "temporary storage reservation failed")
 	}
@@ -227,14 +256,11 @@ func (reservation *reservation) accountExisting(ctx context.Context, bytes int64
 	if reservation.released || workspace.closed {
 		return saferr.New(saferr.CategoryRendering, "temporary storage reservation failed")
 	}
-	if err := ctx.Err(); err != nil {
-		return renderingError("temporary storage reservation canceled", err)
-	}
-	if bytes > math.MaxInt64-workspace.reserved || workspace.reserved+bytes > workspace.budget {
+	if bytes > reservation.bytes {
 		return saferr.New(saferr.CategoryRendering, "temporary byte budget exceeded")
 	}
-	workspace.reserved += bytes
-	reservation.bytes += bytes
+	workspace.reserved -= reservation.bytes - bytes
+	reservation.bytes = bytes
 	return nil
 }
 

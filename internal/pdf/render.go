@@ -105,7 +105,7 @@ func (renderer *Renderer) Render(ctx context.Context, workspace *Workspace, sour
 	if err != nil {
 		return err
 	}
-	lease, err := workspace.reserve(ctx, 0)
+	lease, err := workspace.reserveRemaining(ctx)
 	if err != nil {
 		return err
 	}
@@ -149,10 +149,7 @@ func (renderer *Renderer) Render(ctx context.Context, workspace *Workspace, sour
 		return renderingError("PDF rendering failed", renderCommandFailure{})
 	}
 
-	workspace.mu.Lock()
-	remaining := workspace.budget - workspace.reserved
-	workspace.mu.Unlock()
-	pages, err := collectRenderedPages(batchDir, firstPage, lastPage, remaining)
+	pages, err := collectRenderedPages(batchDir, firstPage, lastPage, lease.bytes)
 	if err != nil {
 		return err
 	}
@@ -160,7 +157,7 @@ func (renderer *Renderer) Render(ctx context.Context, workspace *Workspace, sour
 	for _, page := range pages {
 		outputBytes += page.Size
 	}
-	if err := lease.accountExisting(ctx, outputBytes); err != nil {
+	if err := lease.resize(outputBytes); err != nil {
 		return err
 	}
 	if callbackErr := visit(pages); callbackErr != nil {

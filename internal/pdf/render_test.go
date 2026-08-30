@@ -315,36 +315,64 @@ func TestRenderSharesBudgetWithSourceAndReleasesActualOutput(t *testing.T) {
 	}
 }
 
-func TestRenderAccountsExistingOutputWithoutReservingDiskSpaceTwice(t *testing.T) {
-	calls := 0
-	workspace, err := newWorkspace(context.Background(), 79, WorkspaceOptions{TemporaryByteBudget: 13}, workspaceHooks{
-		root: t.TempDir(),
-		availableBytes: func(string) (int64, error) {
-			calls++
-			if calls >= 5 {
-				return 0, nil
+func TestRenderPreflightsRemainingCapacityAgainstMinimumFreeBytes(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		available    int64
+		wantError    bool
+		wantStarted  bool
+		wantCallback bool
+	}{
+		{name: "below boundary", available: 18, wantError: true},
+		{name: "exact boundary", available: 19, wantStarted: true, wantCallback: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sourceReady := false
+			workspace, err := newWorkspace(context.Background(), 79, WorkspaceOptions{TemporaryByteBudget: 13, MinimumFreeBytes: 10}, workspaceHooks{
+				root: t.TempDir(),
+				availableBytes: func(string) (int64, error) {
+					if sourceReady {
+						return test.available, nil
+					}
+					return 100, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("newWorkspace() error = %v", err)
 			}
-			return 100, nil
-		},
-	})
-	if err != nil {
-		t.Fatalf("newWorkspace() error = %v", err)
-	}
-	t.Cleanup(func() { _ = workspace.Close() })
-	file, err := workspace.Create(context.Background(), "existing.pdf")
-	if err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
-	if _, err := file.Write([]byte("safe")); err != nil {
-		t.Fatalf("source Write() error = %v", err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatalf("source Close() error = %v", err)
-	}
-	renderer := newTestRenderer(t, RenderOptions{Executable: writeRenderExecutable(t, `printf '\211PNG\r\n\032\nx' >"$9-1.png"`)})
+			t.Cleanup(func() { _ = workspace.Close() })
+			file, err := workspace.Create(context.Background(), "preflight.pdf")
+			if err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			if _, err := file.Write([]byte("safe")); err != nil {
+				t.Fatalf("source Write() error = %v", err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatalf("source Close() error = %v", err)
+			}
+			sourceReady = true
+			started := filepath.Join(t.TempDir(), "started")
+			renderer := newTestRenderer(t, RenderOptions{Executable: writeRenderExecutable(t,
+				`: >`+shellQuote(started)+`; printf '\211PNG\r\n\032\nx' >"$9-1.png"`)})
+			callbackCalled := false
 
-	if err := renderer.Render(context.Background(), workspace, "existing.pdf", 1, 1, func([]Page) error { return nil }); err != nil {
-		t.Fatalf("Render() error = %v", err)
+			err = renderer.Render(context.Background(), workspace, "preflight.pdf", 1, 1, func([]Page) error {
+				callbackCalled = true
+				return nil
+			})
+			if (err != nil) != test.wantError {
+				t.Fatalf("Render() error = %v, wantError %t", err, test.wantError)
+			}
+			_, statErr := os.Stat(started)
+			startedExecutable := statErr == nil
+			if startedExecutable != test.wantStarted || callbackCalled != test.wantCallback {
+				t.Fatalf("executable/callback = %t/%t, want %t/%t", startedExecutable, callbackCalled, test.wantStarted, test.wantCallback)
+			}
+			if workspace.reserved != 4 {
+				t.Fatalf("reserved after render = %d, want source 4", workspace.reserved)
+			}
+		})
 	}
 }
 
