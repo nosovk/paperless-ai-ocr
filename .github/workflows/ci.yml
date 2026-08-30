@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, vet, unit, and Poppler tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install Poppler and process utilities
+        run: sudo apt-get update && sudo apt-get install --yes poppler-utils util-linux
+      - name: Validate workflow policy
+        run: python3 scripts/workflow-policy-test.py
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted=$(gofmt -l .)
+          if [[ -n "$unformatted" ]]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Unit tests
+        run: go test ./...
+      - name: Run real Poppler tests explicitly
+        run: go test ./internal/pdf -run '^(TestInspectRealPDFs|TestRenderRealPDFOnePage|TestRenderRealPDFRangeAndSequentialReuse)$' -count=1 -v
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13.2
+
+  race:
+    name: Race tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install Poppler and process utilities
+        run: sudo apt-get update && sudo apt-get install --yes poppler-utils util-linux
+      - name: Run race tests
+        run: go test -race ./...
+
+  vulnerability-scan:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          repo-checkout: false
+          go-version-file: go.mod
+          go-package: ./...
+
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build linux/amd64 image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            VERSION=ci
+            REVISION=${{ github.sha }}
+            CREATED=1970-01-01T00:00:00Z
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
