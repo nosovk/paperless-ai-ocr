@@ -155,7 +155,7 @@ func (client *Client) WalkDocuments(ctx context.Context, visit func([]Document) 
 		return page.Next, nil
 	})
 	if callbackErr != nil {
-		return paperlessError("walk documents", callbackErr)
+		return paperlessCallbackError(callbackErr)
 	}
 	if err != nil {
 		return err
@@ -608,6 +608,16 @@ func paperlessHTTPError(operation string, cause error) error {
 		return saferr.Wrap(saferr.CategoryPaperless, operation+" failed", statusError)
 	}
 	return saferr.New(saferr.CategoryPaperless, operation+" failed")
+}
+
+func paperlessCallbackError(cause error) error {
+	if cause == context.Canceled {
+		return saferr.Wrap(saferr.CategoryPaperless, "walk documents callback failed", context.Canceled)
+	}
+	if cause == context.DeadlineExceeded {
+		return saferr.Wrap(saferr.CategoryPaperless, "walk documents callback failed", context.DeadlineExceeded)
+	}
+	return saferr.New(saferr.CategoryPaperless, "walk documents callback failed")
 }
 
 func defaultValue[T time.Duration | int64 | int](value, fallback T) T {

@@ -268,8 +268,8 @@ func TestWalkDocumentsStopsForCallbackAndContext(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	client := newTestClient(t, server.URL, Options{})
-	if err := client.WalkDocuments(context.Background(), func([]Document) error { return callbackErr }); !errors.Is(err, callbackErr) {
-		t.Errorf("WalkDocuments() error = %v, want callback error", err)
+	if err := client.WalkDocuments(context.Background(), func([]Document) error { return callbackErr }); errors.Is(err, callbackErr) {
+		t.Errorf("WalkDocuments() retained callback error: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -290,9 +290,10 @@ func TestWalkDocumentsCallbackErrorIsCategorizedAndRedacted(t *testing.T) {
 
 	err := client.WalkDocuments(context.Background(), func([]Document) error { return callbackErr })
 	assertPaperlessError(t, err)
-	if !errors.Is(err, callbackErr) {
-		t.Errorf("errors.Is(error, callback error) = false")
+	if errors.Is(err, callbackErr) {
+		t.Errorf("errors.Is(error, callback error) = true")
 	}
+	assertNoPrivateCause(t, err, callbackErr, callbackCanary)
 	assertRedacted(t, err, callbackCanary)
 }
 
@@ -308,10 +309,43 @@ func TestWalkDocumentsReclassifiesSafeCallbackError(t *testing.T) {
 
 	err := client.WalkDocuments(context.Background(), func([]Document) error { return callbackErr })
 	assertPaperlessError(t, err)
-	if !errors.Is(err, callbackErr) {
-		t.Errorf("errors.Is(error, callback error) = false")
+	if errors.Is(err, callbackErr) {
+		t.Errorf("errors.Is(error, callback error) = true")
 	}
+	assertNoPrivateCause(t, err, callbackErr, "canary provider callback")
 	assertRedacted(t, err, "canary provider callback")
+}
+
+func TestWalkDocumentsCallbackContextErrorsPreserveOnlyExactSentinels(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":1,"tags":[]}]}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+	for _, test := range []struct {
+		name     string
+		callback error
+		wantIs   error
+		wantNoIs error
+		canary   string
+	}{
+		{name: "canceled", callback: context.Canceled, wantIs: context.Canceled},
+		{name: "deadline", callback: context.DeadlineExceeded, wantIs: context.DeadlineExceeded},
+		{name: "wrapped canceled", callback: fmt.Errorf("CANARY wrapped canceled: %w", context.Canceled), wantNoIs: context.Canceled, canary: "CANARY wrapped canceled"},
+		{name: "wrapped deadline", callback: fmt.Errorf("CANARY wrapped deadline: %w", context.DeadlineExceeded), wantNoIs: context.DeadlineExceeded, canary: "CANARY wrapped deadline"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := client.WalkDocuments(context.Background(), func([]Document) error { return test.callback })
+			assertPaperlessError(t, err)
+			if test.wantIs != nil && !errors.Is(err, test.wantIs) {
+				t.Errorf("errors.Is(error, %v) = false", test.wantIs)
+			}
+			if test.wantNoIs != nil && errors.Is(err, test.wantNoIs) {
+				t.Errorf("errors.Is(error, %v) = true", test.wantNoIs)
+			}
+			assertNoPrivateCause(t, err, test.callback, test.canary)
+		})
+	}
 }
 
 func TestGetDocumentAndChecksum(t *testing.T) {
@@ -1409,6 +1443,22 @@ func assertRedacted(t *testing.T, err error, canaries ...string) {
 		for _, canary := range canaries {
 			if strings.Contains(formatted, canary) {
 				t.Errorf("format %s disclosed %q: %q", format, canary, formatted)
+			}
+		}
+	}
+}
+
+func assertNoPrivateCause(t *testing.T, err, private error, canaries ...string) {
+	t.Helper()
+	if private != context.Canceled && private != context.DeadlineExceeded && errors.Is(err, private) {
+		t.Errorf("private cause remains traversable: %v", err)
+	}
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		for _, formatted := range []string{current.Error(), fmt.Sprintf("%s", current), fmt.Sprintf("%v", current), fmt.Sprintf("%+v", current), fmt.Sprintf("%q", current)} {
+			for _, canary := range canaries {
+				if canary != "" && strings.Contains(formatted, canary) {
+					t.Errorf("private callback data %q in %q", canary, formatted)
+				}
 			}
 		}
 	}
