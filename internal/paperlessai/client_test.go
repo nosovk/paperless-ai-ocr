@@ -83,6 +83,22 @@ func TestDispatchRejectsRedirectWithoutForwardingKey(t *testing.T) {
 	}
 }
 
+func TestRedirectPolicyStripsKeyBeforeRejecting(t *testing.T) {
+	client := newTestClient(t, "https://webhook.example/secret-endpoint", "https://paperless.example/")
+	request := httptest.NewRequest(http.MethodPost, "https://webhook.example/CANARY-redirect", nil)
+	request.Header.Set("x-api-key", testWebhookKey)
+	err := client.httpClient.CheckRedirect(request, []*http.Request{
+		httptest.NewRequest(http.MethodPost, "https://webhook.example/secret-endpoint", nil),
+	})
+	if key := request.Header.Get("x-api-key"); key != "" {
+		t.Errorf("redirect policy x-api-key = %q, want empty", key)
+	}
+	if err == nil {
+		t.Fatal("redirect policy error = nil")
+	}
+	assertRedacted(t, err, testWebhookKey, "CANARY-redirect", "secret-endpoint", "x-api-key")
+}
+
 func TestDispatchHonorsTimeoutAndBoundsResponseDrain(t *testing.T) {
 	t.Run("timeout", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {

@@ -577,8 +577,8 @@ func TestRedirectPolicy(t *testing.T) {
 	if _, err := client.Probe(context.Background()); err != nil {
 		t.Fatalf("same-base redirect Probe() error = %v", err)
 	}
-	if redirectedAuthorization != "Bearer key" {
-		t.Errorf("redirected Authorization = %q, want Bearer key", redirectedAuthorization)
+	if redirectedAuthorization != "" {
+		t.Errorf("redirected Authorization = %q, want empty", redirectedAuthorization)
 	}
 
 	externalAuth := make(chan string, 1)
@@ -613,6 +613,37 @@ func TestRedirectPolicy(t *testing.T) {
 	if _, err := pathEscapeClient.Probe(context.Background()); err == nil {
 		t.Fatal("base-path redirect Probe() error = nil")
 	}
+}
+
+func TestRedirectPolicyStripsAuthorizationBeforeCallerPolicy(t *testing.T) {
+	const (
+		keyCanary      = "CANARY-ai-key"
+		endpointCanary = "/base/v1/CANARY-redirect-endpoint"
+		callerCanary   = "CANARY-caller-policy-error"
+	)
+	callerErr := errors.New(callerCanary)
+	var calls int
+	httpClient := &http.Client{CheckRedirect: func(request *http.Request, _ []*http.Request) error {
+		calls++
+		if authorization := request.Header.Get("Authorization"); authorization != "" {
+			t.Errorf("caller policy Authorization = %q, want empty", authorization)
+		}
+		return callerErr
+	}}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/base/v1/responses" {
+			http.Redirect(writer, request, endpointCanary, http.StatusTemporaryRedirect)
+			return
+		}
+		t.Errorf("caller-rejected redirect reached %q", request.URL.Path)
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL+"/base/v1", keyCanary, "model", ClientOptions{HTTPClient: httpClient})
+	_, err := client.Probe(context.Background())
+	if calls != 1 {
+		t.Fatalf("caller policy calls = %d, want 1", calls)
+	}
+	assertSafeErrorChain(t, err, keyCanary, endpointCanary, callerCanary, server.URL, "Authorization")
 }
 
 type responseRequest struct {
@@ -702,4 +733,20 @@ func providerCategory(err error) saferr.Category {
 		return ""
 	}
 	return safeError.Category()
+}
+
+func assertSafeErrorChain(t *testing.T, err error, canaries ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("error = nil")
+	}
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		for _, formatted := range []string{current.Error(), fmt.Sprintf("%s", current), fmt.Sprintf("%v", current), fmt.Sprintf("%+v", current), fmt.Sprintf("%q", current)} {
+			for _, canary := range canaries {
+				if strings.Contains(formatted, canary) {
+					t.Errorf("error disclosed %q in %q", canary, formatted)
+				}
+			}
+		}
+	}
 }

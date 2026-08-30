@@ -1164,7 +1164,7 @@ func TestRedirectDoesNotForwardAuthorizationCrossOrigin(t *testing.T) {
 	}
 }
 
-func TestSameOriginRedirectRetainsAuthorization(t *testing.T) {
+func TestSameOriginRedirectStripsAuthorization(t *testing.T) {
 	t.Parallel()
 
 	var redirectedAuth string
@@ -1182,8 +1182,8 @@ func TestSameOriginRedirectRetainsAuthorization(t *testing.T) {
 	if _, err := client.GetDocument(context.Background(), 1); err != nil {
 		t.Fatalf("GetDocument() error = %v", err)
 	}
-	if got, want := redirectedAuth, "Token "+testToken; got != want {
-		t.Errorf("redirected Authorization = %q, want %q", got, want)
+	if redirectedAuth != "" {
+		t.Errorf("redirected Authorization = %q, want empty", redirectedAuth)
 	}
 }
 
@@ -1234,12 +1234,16 @@ func TestMutatingRedirectsAreRejectedBeforeMethodRewrite(t *testing.T) {
 func TestCallerRedirectPolicyIsPreserved(t *testing.T) {
 	t.Parallel()
 
-	callerErr := errors.New("caller redirect rejection")
+	const callerCanary = "CANARY caller redirect endpoint/header/key"
+	callerErr := errors.New(callerCanary)
 	var policyCalls atomic.Int32
 	var policyMethod string
 	httpClient := &http.Client{CheckRedirect: func(request *http.Request, via []*http.Request) error {
 		policyCalls.Add(1)
 		policyMethod = via[0].Method
+		if authorization := request.Header.Get("Authorization"); authorization != "" {
+			t.Errorf("caller policy Authorization = %q, want empty", authorization)
+		}
 		if request.URL.Path != "/paperless/redirected" || len(via) != 1 {
 			t.Errorf("caller policy request = %s, via = %d", request.URL.Path, len(via))
 		}
@@ -1266,6 +1270,7 @@ func TestCallerRedirectPolicyIsPreserved(t *testing.T) {
 	if got, want := policyMethod, http.MethodGet; got != want {
 		t.Errorf("original method = %q, want %q", got, want)
 	}
+	assertRedacted(t, err, callerCanary, testToken, server.URL, "/paperless/redirected", "Authorization")
 }
 
 func TestMandatoryRedirectPolicyRunsBeforeCallerPolicy(t *testing.T) {

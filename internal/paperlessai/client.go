@@ -78,7 +78,8 @@ func New(webhookURL, paperlessURL *url.URL, webhookKey string, options Options) 
 		clone := *httpClient
 		httpClient = &clone
 	}
-	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+	httpClient.CheckRedirect = func(request *http.Request, _ []*http.Request) error {
+		request.Header.Del("x-api-key")
 		return errors.New("redirect rejected")
 	}
 
