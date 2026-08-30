@@ -642,6 +642,33 @@ func (q *Queue) ScheduleRetryContext(ctx context.Context, id int64, attempt int,
 	})
 }
 
+// ReleaseContext returns an active lease to immediate retry during shutdown.
+// It reports false when the lease generation is no longer active.
+func (q *Queue) ReleaseContext(ctx context.Context, id int64, attempt int, owner string) (bool, error) {
+	if id <= 0 || attempt <= 0 || blank(owner) {
+		return false, validationError("invalid lease release input")
+	}
+	released := false
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
+		now := formatTime(q.now())
+		result, err := conn.ExecContext(ctx, `UPDATE jobs SET state = 'retry', available_at = ?,
+			lease_owner = NULL, lease_expires_at = NULL, error_category = 'internal',
+			error_message = 'service shutting down', updated_at = ?
+			WHERE id = ? AND state = 'processing' AND attempts = ? AND lease_owner = ?
+			AND lease_expires_at > ?`, now, now, id, attempt, owner, now)
+		if err != nil {
+			return internalError("cannot release active job lease", err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return internalError("cannot confirm active job lease release", err)
+		}
+		released = changed == 1
+		return nil
+	})
+	return released, err
+}
+
 // Complete marks the active claim generation completed.
 func (q *Queue) Complete(id int64, attempt int, owner string) error {
 	return q.CompleteContext(context.Background(), id, attempt, owner)
@@ -744,6 +771,48 @@ func (q *Queue) RecoverExpiredLeases() (int64, error) {
 		return nil
 	})
 	return recovered, err
+}
+
+// DepthContext returns aggregate counts for every fixed queue state.
+func (q *Queue) DepthContext(ctx context.Context) (map[State]int64, error) {
+	depth := map[State]int64{
+		StatePending: 0, StateProcessing: 0, StateRetry: 0, StateCompleted: 0, StateFailed: 0,
+	}
+	rows, err := q.db.QueryContext(ctx, "SELECT state, count(*) FROM jobs GROUP BY state")
+	if err != nil {
+		return nil, internalError("cannot count queued jobs", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var state State
+		var count int64
+		if err := rows.Scan(&state, &count); err != nil {
+			return nil, internalError("cannot count queued jobs", err)
+		}
+		if _, ok := depth[state]; !ok {
+			return nil, internalError("cannot count queued jobs", errors.New("invalid queue state"))
+		}
+		depth[state] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError("cannot count queued jobs", err)
+	}
+	return depth, nil
+}
+
+// ActiveContext reports whether an exact claim generation still owns an unexpired lease.
+func (q *Queue) ActiveContext(ctx context.Context, id int64, attempt int, owner string) (bool, error) {
+	if id <= 0 || attempt <= 0 || blank(owner) {
+		return false, validationError("invalid active lease lookup")
+	}
+	var active int
+	err := q.db.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE id = ? AND state = 'processing'
+		AND attempts = ? AND lease_owner = ? AND lease_expires_at > ?`, id, attempt, owner,
+		formatTime(q.now())).Scan(&active)
+	if err != nil {
+		return false, internalError("cannot inspect active job lease", err)
+	}
+	return active == 1, nil
 }
 
 func (q *Queue) updateOne(statement string, args ...any) error {

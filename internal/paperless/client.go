@@ -26,6 +26,7 @@ const (
 	defaultMaxPages             = 10_000
 	maxErrorDrainBytes          = int64(4 << 10)
 	downloadBufferBytes         = 32 << 10
+	pingDrainBytes              = 4 << 10
 )
 
 // Options configures HTTP bounds. Zero values select safe defaults.
@@ -108,6 +109,26 @@ func New(baseURL *url.URL, token string, options Options) (*Client, error) {
 		maxPages:             defaultValue(options.MaxPages, defaultMaxPages),
 		ensureTagGate:        make(chan struct{}, 1),
 	}, nil
+}
+
+// Ping verifies authenticated Paperless API connectivity without enumerating data.
+func (client *Client) Ping(ctx context.Context) error {
+	requestCtx, cancel := context.WithTimeout(ctx, client.requestTimeout)
+	defer cancel()
+	request, err := client.request(requestCtx, http.MethodGet, client.endpoint("api/"), nil)
+	if err != nil {
+		return paperlessError("ping", err)
+	}
+	response, err := client.httpClient.Do(request)
+	if err != nil {
+		return paperlessError("ping", err)
+	}
+	defer response.Body.Close()
+	drainLimit(response.Body, pingDrainBytes)
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return paperlessError("ping", &StatusError{Operation: "ping", StatusCode: response.StatusCode})
+	}
+	return nil
 }
 
 // WalkDocuments visits the archive one bounded API page at a time.
@@ -563,7 +584,11 @@ func normalizedBasePath(basePath string) string {
 }
 
 func drain(reader io.Reader) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(reader, maxErrorDrainBytes))
+	drainLimit(reader, maxErrorDrainBytes)
+}
+
+func drainLimit(reader io.Reader, limit int64) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(reader, limit))
 }
 
 func paperlessError(operation string, cause error) error {

@@ -1082,6 +1082,79 @@ func TestRecoverExpiredLeasesIncludesExactBoundaryOnly(t *testing.T) {
 	}
 }
 
+func TestReleaseContextReturnsOnlyActiveLeaseToImmediateRetry(t *testing.T) {
+	now := testNow
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+	if err := q.RecordTerminalFailureContext(context.Background(), job.ID, job.Attempts, "owner",
+		SafeDiagnostic{Category: saferr.CategoryProvider, Message: "terminal OCR failure"}); err != nil {
+		t.Fatalf("RecordTerminalFailureContext() error = %v", err)
+	}
+
+	released, err := q.ReleaseContext(context.Background(), job.ID, job.Attempts, "owner")
+	if err != nil || !released {
+		t.Fatalf("ReleaseContext() = (%t, %v), want (true, nil)", released, err)
+	}
+	retry := loadJob(t, q, job.ID)
+	if retry.State != StateRetry || !retry.AvailableAt.Equal(now.UTC()) || retry.LeaseOwner != "" ||
+		retry.ErrorCategory != saferr.CategoryInternal || retry.ErrorMessage != "service shutting down" {
+		t.Errorf("released job = %+v", retry)
+	}
+
+	if diagnostic, found, err := q.TerminalFailureContext(context.Background(), job.ID, job.Attempts, "owner"); err == nil || found || diagnostic != (SafeDiagnostic{}) {
+		t.Errorf("stale terminal lookup = (%+v, %t, %v), want fenced error", diagnostic, found, err)
+	}
+	var stage FinalizationStage
+	if err := q.db.QueryRow("SELECT stage FROM finalizations WHERE job_id = ?", job.ID).Scan(&stage); err != nil {
+		t.Fatalf("load finalization stage: %v", err)
+	}
+	if stage != FinalizationFailurePending {
+		t.Errorf("finalization stage = %q, want %q", stage, FinalizationFailurePending)
+	}
+
+	released, err = q.ReleaseContext(context.Background(), job.ID, job.Attempts, "owner")
+	if err != nil || released {
+		t.Fatalf("second ReleaseContext() = (%t, %v), want (false, nil)", released, err)
+	}
+}
+
+func TestDepthContextReturnsAllFixedStates(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	processing := enqueueAndClaim(t, q, 1, "processing", PriorityBackfill, "owner")
+	if _, _, err := q.Enqueue(EnqueueInput{DocumentID: 2, SourceChecksum: "pending", Model: "model", PromptVersion: "prompt"}); err != nil {
+		t.Fatalf("Enqueue() error = %v", err)
+	}
+
+	depth, err := q.DepthContext(context.Background())
+	if err != nil {
+		t.Fatalf("DepthContext() error = %v", err)
+	}
+	if depth[StatePending] != 1 || depth[StateProcessing] != 1 || depth[StateRetry] != 0 ||
+		depth[StateCompleted] != 0 || depth[StateFailed] != 0 || len(depth) != 5 {
+		t.Errorf("depth = %#v", depth)
+	}
+	if err := q.Complete(processing.ID, processing.Attempts, "owner"); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+}
+
+func TestActiveContextIsLeaseFenced(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+	active, err := q.ActiveContext(context.Background(), job.ID, job.Attempts, "owner")
+	if err != nil || !active {
+		t.Fatalf("ActiveContext() = (%t, %v), want (true, nil)", active, err)
+	}
+	if err := q.ScheduleRetry(job.ID, job.Attempts, "owner", testNow.Add(time.Minute),
+		SafeDiagnostic{Category: saferr.CategoryInternal, Message: "retry"}); err != nil {
+		t.Fatalf("ScheduleRetry() error = %v", err)
+	}
+	active, err = q.ActiveContext(context.Background(), job.ID, job.Attempts, "owner")
+	if err != nil || active {
+		t.Fatalf("ActiveContext(retried) = (%t, %v), want (false, nil)", active, err)
+	}
+}
+
 func TestBatchCheckpointsAreFencedByParentLease(t *testing.T) {
 	now := testNow
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), now)

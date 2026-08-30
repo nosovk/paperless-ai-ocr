@@ -54,6 +54,46 @@ func TestNewValidatesConfiguration(t *testing.T) {
 	}
 }
 
+func TestPingUsesBoundedAPIRootRequest(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		if request.Method != http.MethodGet || request.URL.Path != "/paperless/api/" || request.URL.RawQuery != "" {
+			t.Errorf("request = %s %s", request.Method, request.URL.RequestURI())
+		}
+		if got, want := request.Header.Get("Authorization"), "Token "+testToken; got != want {
+			t.Errorf("Authorization = %q, want %q", got, want)
+		}
+		writer.WriteHeader(http.StatusOK)
+		io.WriteString(writer, strings.Repeat("x", 8192))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, server.URL+"/paperless", Options{})
+	if err := client.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping() error = %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestPingRejectsFailureWithoutResponseBody(t *testing.T) {
+	const canary = "CANARY private Paperless response"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		http.Error(writer, canary, http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, server.URL, Options{})
+	err := client.Ping(context.Background())
+	if err == nil || strings.Contains(err.Error(), canary) {
+		t.Fatalf("Ping() error = %v, want safe failure", err)
+	}
+}
+
 func TestWalkDocumentsFollowsRelativeAndAbsolutePagination(t *testing.T) {
 	t.Parallel()
 

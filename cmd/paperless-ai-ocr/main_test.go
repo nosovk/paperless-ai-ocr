@@ -45,7 +45,7 @@ func TestDevelopmentCommandBehavior(t *testing.T) {
 		}
 	})
 
-	t.Run("not configured", func(t *testing.T) {
+	t.Run("invalid configuration", func(t *testing.T) {
 		cmd := exec.Command(binary)
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -60,7 +60,7 @@ func TestDevelopmentCommandBehavior(t *testing.T) {
 		if got := stdout.String(); got != "" {
 			t.Errorf("stdout = %q, want empty", got)
 		}
-		if got, want := stderr.String(), "paperless-ai-ocr: service is not yet configured\n"; got != want {
+		if got, want := stderr.String(), "paperless-ai-ocr: startup failed\n"; got != want {
 			t.Errorf("stderr = %q, want %q", got, want)
 		}
 	})
