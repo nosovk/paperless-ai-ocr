@@ -29,6 +29,7 @@ type Logger struct {
 	mu     sync.Mutex
 	writer io.Writer
 	async  *asyncLogger
+	failed bool
 }
 
 type asyncLogger struct {
@@ -140,17 +141,45 @@ func (logger *Logger) write(value entry) error {
 			return errDropEntry
 		}
 	}
-	return logger.writeEntry(value)
+	return logger.writeSyncEntry(value)
 }
 
-func (logger *Logger) writeEntry(value entry) (err error) {
+func (logger *Logger) marshalEntry(value entry) ([]byte, error) {
 	data, err := json.Marshal(value)
 	if err != nil {
-		return errWriteEntry
+		return nil, errWriteEntry
 	}
-	data = append(data, '\n')
+	return append(data, '\n'), nil
+}
+
+func (logger *Logger) writeSyncEntry(value entry) error {
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
+	if logger.failed {
+		return errWriteEntry
+	}
+	data, err := logger.marshalEntry(value)
+	if err != nil {
+		return err
+	}
+	if err := logger.writeData(data); err != nil {
+		logger.failed = true
+		return err
+	}
+	return nil
+}
+
+func (logger *Logger) writeEntry(value entry) error {
+	data, err := logger.marshalEntry(value)
+	if err != nil {
+		return err
+	}
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
+	return logger.writeData(data)
+}
+
+func (logger *Logger) writeData(data []byte) (err error) {
 	defer func() {
 		if recover() != nil {
 			err = errWriteEntry

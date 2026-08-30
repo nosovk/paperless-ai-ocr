@@ -176,6 +176,69 @@ func TestLoggerRejectsShortWrite(t *testing.T) {
 	}
 }
 
+func TestSynchronousLoggerFailurePermanentlyPoisonsWriter(t *testing.T) {
+	const canary = "CANARY one-shot writer failure"
+	for _, test := range []struct {
+		name   string
+		writer *oneShotFailureWriter
+	}{
+		{
+			name: "partial error",
+			writer: &oneShotFailureWriter{
+				mode: failurePartialError,
+				err:  errors.New(canary),
+			},
+		},
+		{
+			name: "partial panic",
+			writer: &oneShotFailureWriter{
+				mode:       failurePartialPanic,
+				panicValue: canary,
+			},
+		},
+		{
+			name: "zero-byte error",
+			writer: &oneShotFailureWriter{
+				mode: failureZeroByteError,
+				err:  errors.New(canary),
+			},
+		},
+		{
+			name: "invalid progress",
+			writer: &oneShotFailureWriter{
+				mode: failureZeroByteNoError,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			logger := New(test.writer)
+			assertSafeWriteError(t, logger.Startup(), canary)
+			assertSafeWriteError(t, logger.Ready(), canary)
+			assertSafeWriteError(t, logger.Shutdown(), canary)
+			if calls := test.writer.calls.Load(); calls != 1 {
+				t.Fatalf("writer calls = %d, want 1", calls)
+			}
+		})
+	}
+}
+
+func assertSafeWriteError(t *testing.T, err error, canaries ...string) {
+	t.Helper()
+	if err != errWriteEntry {
+		t.Fatalf("error = %v, want secure log write failure", err)
+	}
+	for _, formatted := range []string{err.Error(), fmt.Sprintf("%s", err), fmt.Sprintf("%v", err), fmt.Sprintf("%+v", err), fmt.Sprintf("%q", err)} {
+		for _, canary := range canaries {
+			if strings.Contains(formatted, canary) {
+				t.Fatalf("error disclosed canary in %q", formatted)
+			}
+		}
+	}
+	if errors.Unwrap(err) != nil {
+		t.Fatalf("writer cause remains traversable: %v", err)
+	}
+}
+
 func TestAsyncLoggerCallsAreNonblockingAndDropsWhenFull(t *testing.T) {
 	writer := newBlockingWriter()
 	logger, err := NewAsync(writer, 1)
@@ -347,6 +410,43 @@ func (writer errorWriter) Write([]byte) (int, error) { return 0, writer.err }
 type shortWriter struct{}
 
 func (shortWriter) Write(data []byte) (int, error) { return len(data) - 1, nil }
+
+type failureMode uint8
+
+const (
+	failurePartialError failureMode = iota
+	failurePartialPanic
+	failureZeroByteError
+	failureZeroByteNoError
+)
+
+type oneShotFailureWriter struct {
+	mode       failureMode
+	err        error
+	panicValue any
+	calls      atomic.Int64
+	output     bytes.Buffer
+}
+
+func (writer *oneShotFailureWriter) Write(data []byte) (int, error) {
+	if writer.calls.Add(1) > 1 {
+		return writer.output.Write(data)
+	}
+	switch writer.mode {
+	case failurePartialError:
+		written, _ := writer.output.Write(data[:len(data)/2])
+		return written, writer.err
+	case failurePartialPanic:
+		_, _ = writer.output.Write(data[:len(data)/2])
+		panic(writer.panicValue)
+	case failureZeroByteError:
+		return 0, writer.err
+	case failureZeroByteNoError:
+		return 0, nil
+	default:
+		return len(data), nil
+	}
+}
 
 type blockingWriter struct {
 	started chan struct{}
