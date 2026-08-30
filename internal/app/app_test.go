@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"github.com/nosovk/paperless-ai-ocr/internal/observability"
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
 	"github.com/nosovk/paperless-ai-ocr/internal/reconcile"
+	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
 	"github.com/nosovk/paperless-ai-ocr/internal/server"
 	"github.com/nosovk/paperless-ai-ocr/internal/worker"
 )
@@ -422,28 +424,68 @@ func TestRunFinalizationPaths(t *testing.T) {
 func TestRunReturnsSafeFatalCause(t *testing.T) {
 	runtime := &fakeRuntime{events: make(chan string, 16), reconcileErr: errors.New("CANARY private failure")}
 	err := Run(context.Background(), testOptions(t, runtime))
-	if err == nil || err.Error() != "internal: background operation failed" {
-		t.Fatalf("Run() error = %v", err)
+	if err != errBackground {
+		t.Fatalf("Run() error = %v, want trusted internal cause", err)
 	}
 }
 
-func TestRunSanitizesParentCancellationCause(t *testing.T) {
+func TestRunSanitizesParentCancellationCauses(t *testing.T) {
 	const canary = "CANARY secret cancellation cause"
-	ctx, cancel := context.WithCancelCause(context.Background())
-	runtime := &fakeRuntime{events: make(chan string, 16), claimResults: []claimResult{{}}}
-	done := make(chan error, 1)
-	go func() { done <- Run(ctx, testOptions(t, runtime)) }()
-	for range 6 {
-		<-runtime.events
-	}
-	cause := errors.New(canary)
-	cancel(cause)
-	err := <-done
-	if err == nil || strings.Contains(err.Error(), canary) {
-		t.Fatalf("Run() error = %v, want sanitized cause", err)
-	}
-	if !errors.Is(err, cause) {
-		t.Fatalf("errors.Is(error, cause) = false: %v", err)
+	for _, test := range []struct {
+		name      string
+		cause     error
+		wantError bool
+	}{
+		{name: "categorized", cause: saferr.New(saferr.CategoryInternal, canary), wantError: true},
+		{name: "ordinary", cause: errors.New(canary), wantError: true},
+		{name: "wrapped canceled", cause: fmt.Errorf("%s: %w", canary, context.Canceled), wantError: true},
+		{name: "wrapped deadline", cause: fmt.Errorf("%s: %w", canary, context.DeadlineExceeded), wantError: true},
+		{name: "canceled", cause: context.Canceled},
+		{name: "deadline", cause: context.DeadlineExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			runtime := &fakeRuntime{events: make(chan string, 16), claimResults: []claimResult{{}}}
+			done := make(chan error, 1)
+			go func() { done <- Run(ctx, testOptions(t, runtime)) }()
+			for range 6 {
+				<-runtime.events
+			}
+			cancel(test.cause)
+			err := <-done
+			if !test.wantError {
+				if err != nil {
+					t.Fatalf("Run() error = %v, want nil", err)
+				}
+				return
+			}
+			if err != errParentCanceled {
+				t.Fatalf("Run() error = %v, want fixed cancellation sentinel", err)
+			}
+			for _, formatted := range []string{
+				err.Error(), fmt.Sprintf("%s", err), fmt.Sprintf("%v", err),
+				fmt.Sprintf("%+v", err), fmt.Sprintf("%q", err),
+			} {
+				if strings.Contains(formatted, canary) {
+					t.Errorf("formatted error exposed canary: %q", formatted)
+				}
+			}
+			for current := err; current != nil; current = errors.Unwrap(current) {
+				if strings.Contains(current.Error(), canary) {
+					t.Errorf("unwrap chain exposed canary: %q", current.Error())
+				}
+			}
+			var safeError *saferr.Error
+			if !errors.As(err, &safeError) || safeError.Error() != "internal: application canceled" {
+				t.Fatalf("errors.As() = %v, safe error = %v", errors.As(err, &safeError), safeError)
+			}
+			if externalSafeError, ok := test.cause.(*saferr.Error); ok && safeError == externalSafeError {
+				t.Fatal("errors.As() reached external cancellation cause")
+			}
+			if errors.Is(err, test.cause) {
+				t.Fatal("external cancellation cause remained traversable")
+			}
+		})
 	}
 }
 

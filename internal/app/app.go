@@ -38,7 +38,10 @@ const (
 	idleInterval        = time.Second
 )
 
-var errBackground = saferr.New(saferr.CategoryInternal, "background operation failed")
+var (
+	errBackground     = saferr.New(saferr.CategoryInternal, "background operation failed")
+	errParentCanceled = saferr.New(saferr.CategoryInternal, "application canceled")
+)
 
 // Runtime supplies initialized service operations to the lifecycle coordinator.
 type Runtime interface {
@@ -281,7 +284,16 @@ func Run(parent context.Context, options Options) error {
 	defer cancel(context.Canceled)
 	stopParent := context.AfterFunc(parent, func() {
 		options.Readiness.Set(false)
-		cancel(context.Cause(parent))
+		cause := context.Cause(parent)
+		if cause == context.Canceled {
+			cancel(context.Canceled)
+			return
+		}
+		if cause == context.DeadlineExceeded {
+			cancel(context.DeadlineExceeded)
+			return
+		}
+		cancel(errParentCanceled)
 	})
 	defer stopParent()
 	if options.Handler == nil {
@@ -400,10 +412,7 @@ func Run(parent context.Context, options Options) error {
 	}
 	cause := context.Cause(ctx)
 	if cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
-		if _, ok := errors.AsType[*saferr.Error](cause); ok {
-			return cause
-		}
-		return saferr.Wrap(saferr.CategoryInternal, "application canceled", cause)
+		return cause
 	}
 	if releaseErr != nil || shutdownErr != nil || closeErr != nil {
 		return saferr.New(saferr.CategoryInternal, "shutdown failed")
