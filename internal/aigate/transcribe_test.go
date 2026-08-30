@@ -438,6 +438,27 @@ func TestTranscribeAcceptsReasoningBeforeOneMessage(t *testing.T) {
 	}
 }
 
+func TestTranscribeAcceptsResponsesAPIMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(writer, `{
+			"id":"resp_transcribe_123","object":"response","created_at":1788102000,"model":"provider-private-model",
+			"status":"completed","parallel_tool_calls":true,"temperature":0.2,"top_p":1,"private_metadata":{"trace":"secret"},
+			"output":[
+				{"id":"reasoning_123","type":"reasoning","status":"completed","summary":[],"private":"ignored"},
+				{"id":"msg_123","type":"message","status":"completed","role":"assistant","private":"ignored",
+					"content":[{"type":"output_text","text":"{\"pages\":[]}","annotations":[],"logprobs":[],"private":"ignored"}]}
+			],
+			"usage":{"input_tokens":123,"output_tokens":7,"total_tokens":130,"input_tokens_details":{"cached_tokens":10},"output_tokens_details":{"reasoning_tokens":2}}
+		}`)
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL+"/v1", "key", "model", ClientOptions{})
+	raw, err := client.Transcribe(context.Background(), Transcription{Capability: DirectPDF, FirstPage: 1, LastPage: 1, PDF: []byte{1}})
+	if err != nil || string(raw) != `{"pages":[]}` {
+		t.Fatalf("Transcribe() = (%s, %v), want pages, nil", raw, err)
+	}
+}
+
 func TestTranscribeResponseStatus(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -706,7 +727,7 @@ func FuzzProviderResponse(f *testing.F) {
 	for _, body := range []string{
 		`{"output":[{"type":"message","content":[{"type":"refusal","refusal":"FUZZ-SECRET-REFUSAL"}]}]}`,
 		`{"output":[{"type":"message","content":[{"type":"output_text","text":"{}","text":"FUZZ-DUPLICATE-SECRET"}]}]}`,
-		`{"output":[{"type":"message","content":[{"type":"output_text","text":"{}","unknown":"FUZZ-UNKNOWN-SECRET"}]}],"unknown":"FUZZ-ROOT-SECRET"}`,
+		`{"output":[{"type":"mystery","private":"FUZZ-INVALID-ITEM-SECRET"}]}`,
 		`{"output":[]} {}`,
 		"{\xff}",
 		`{"output":[{"type":"message","content":[{"type":"output_text","text":"FUZZ-UNICODE-\ud800"}]}]}`,
@@ -714,6 +735,7 @@ func FuzzProviderResponse(f *testing.F) {
 	} {
 		addSeed(body, http.StatusOK, oracle{})
 	}
+	addSeed(`{"id":"resp_metadata","output":[{"id":"msg_metadata","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"{\"pages\":[]}","unknown":"FUZZ-UNKNOWN-SECRET"}]}],"unknown":"FUZZ-ROOT-SECRET","usage":{"total_tokens":1}}`, http.StatusOK, oracle{success: true})
 	addSeed(`{"error":{"message":"FUZZ-RATE-LIMIT-SECRET"}}`, http.StatusTooManyRequests, oracle{retry: true, retryClass: RetryRateLimit})
 	addSeed(`{"error":{"message":"FUZZ-UNAVAILABLE-SECRET"}}`, http.StatusBadGateway, oracle{retry: true, retryClass: RetryUnavailable})
 	addSeed(`{"error":{"message":"FUZZ-AUTH-SECRET"}}`, http.StatusUnauthorized, oracle{message: "provider: transcription authentication failed"})

@@ -233,6 +233,38 @@ func TestProbeRejectsInvalidSuccessResponses(t *testing.T) {
 	}
 }
 
+func TestProbeAcceptsResponsesAPIMetadata(t *testing.T) {
+	body := fmt.Sprintf(`{
+		"id":"resp_probe_123","object":"response","created_at":1788102000,"model":"provider-private-model",
+		"status":"completed","parallel_tool_calls":true,"temperature":0.2,"private_metadata":{"trace":"secret"},
+		"output":[{"id":"msg_probe_123","type":"message","status":"completed","role":"assistant","private":"ignored",
+			"content":[{"type":"output_text","text":%q,"annotations":[],"logprobs":[],"private":"ignored"}]}],
+		"usage":{"input_tokens":123,"output_tokens":7,"total_tokens":130,"input_tokens_details":{"cached_tokens":10},"output_tokens_details":{"reasoning_tokens":2}}
+	}`, probeNonce)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(writer, body)
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL+"/v1", "key", "model", ClientOptions{})
+	capability, err := client.Probe(context.Background())
+	if err != nil || capability != DirectPDF {
+		t.Fatalf("Probe() = (%q, %v), want direct PDF, nil", capability, err)
+	}
+}
+
+func TestUnsupportedClassificationAcceptsProviderMetadata(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_error_123","object":"error","created_at":1788102000,"model":"provider-private-model",
+		"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].file_data",
+			"message":"private provider explanation","request_id":"request-private","metadata":{"trace":"private"}},
+		"usage":{"input_tokens":12,"output_tokens":0,"total_tokens":12}
+	}`)
+	unsupported, valid := unsupportedAttachment(DirectPDF, http.StatusBadRequest, body)
+	if !unsupported || !valid {
+		t.Fatalf("unsupportedAttachment() = (%t, %t), want true, true", unsupported, valid)
+	}
+}
+
 func TestProbeBoundsResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(writer, strings.Repeat("x", 129))
@@ -772,7 +804,8 @@ func FuzzCapabilityProviderResponse(f *testing.F) {
 		{body: `{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].file_data","message":"FUZZ-CAPABILITY-SECRET"}}`, statusCode: http.StatusBadRequest, directPDF: true, want: oracle{unsupported: true}},
 		{body: `{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].image_url","message":"FUZZ-CAPABILITY-SECRET"}}`, statusCode: http.StatusUnprocessableEntity, want: oracle{unsupported: true}},
 		{body: `{"output":[],"output":[{"type":"message","content":[{"type":"output_text","text":"` + probeNonce + `"}]}]}`, statusCode: http.StatusOK, directPDF: true},
-		{body: `{"output":[{"type":"message","content":[{"type":"output_text","text":"` + probeNonce + `"}]}],"unknown":"FUZZ-UNKNOWN-SECRET"}`, statusCode: http.StatusOK},
+		{body: `{"id":"resp_metadata","output":[{"id":"msg_metadata","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"` + probeNonce + `","unknown":"FUZZ-UNKNOWN-SECRET"}]}],"unknown":"FUZZ-ROOT-SECRET","usage":{"total_tokens":1}}`, statusCode: http.StatusOK, want: oracle{success: true}},
+		{body: `{"output":[{"type":"mystery","private":"FUZZ-INVALID-ITEM-SECRET"}]}`, statusCode: http.StatusOK},
 		{body: `{"output":[]} {"trailing":"FUZZ-TRAILING-SECRET"}`, statusCode: http.StatusOK},
 		{body: "{\xffFUZZ-MALFORMED-SECRET}", statusCode: http.StatusBadRequest},
 		{body: `{"output":[{"type":"message","content":[{"type":"output_text","text":"FUZZ-UNICODE-\ud800"}]}]}`, statusCode: http.StatusOK},

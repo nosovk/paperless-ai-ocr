@@ -279,7 +279,6 @@ func decodeSingleJSON(data []byte, destination any) error {
 		return err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
 		return err
 	}
