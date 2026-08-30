@@ -692,10 +692,14 @@ func socketError(cause error) error {
 func FuzzProviderResponse(f *testing.F) {
 	for _, seed := range []string{
 		`{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"pages\":[]}"}]}]}`,
-		`{"output":[{"type":"message","content":[{"type":"refusal","refusal":"CANARY"}]}]}`,
-		`{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].file_data"}}`,
+		`{"output":[{"type":"message","content":[{"type":"refusal","refusal":"FUZZ-SECRET-REFUSAL"}]}]}`,
+		`{"output":[{"type":"message","content":[{"type":"output_text","text":"{}","text":"FUZZ-DUPLICATE-SECRET"}]}]}`,
+		`{"output":[{"type":"message","content":[{"type":"output_text","text":"{}","unknown":"FUZZ-UNKNOWN-SECRET"}]}],"unknown":"FUZZ-ROOT-SECRET"}`,
+		`{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].file_data","message":"FUZZ-ERROR-SECRET"}}`,
 		`{"output":[]} {}`,
 		"{\xff}",
+		`{"output":[{"type":"message","content":[{"type":"output_text","text":"FUZZ-UNICODE-\ud800"}]}]}`,
+		`{"padding":"FUZZ-OVERSIZE-SECRET-` + strings.Repeat("x", 60<<10) + `"}`,
 	} {
 		f.Add(seed, http.StatusOK)
 		f.Add(seed, http.StatusBadRequest)
@@ -708,6 +712,7 @@ func FuzzProviderResponse(f *testing.F) {
 			statusCode = http.StatusBadRequest
 		}
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("X-Provider-Private", "FUZZ-HEADER-SECRET")
 			writer.WriteHeader(statusCode)
 			_, _ = io.WriteString(writer, responseBody)
 		}))
@@ -715,11 +720,41 @@ func FuzzProviderResponse(f *testing.F) {
 		client := newTestClient(t, server.URL+"/v1", "key", "model", ClientOptions{})
 		_, err := client.Transcribe(context.Background(), Transcription{Capability: DirectPDF, FirstPage: 1, LastPage: 1, PDF: []byte{1}})
 		if err != nil {
-			for _, formatted := range []string{err.Error(), fmt.Sprintf("%v", err), fmt.Sprintf("%+v", err), fmt.Sprintf("%q", err)} {
-				if strings.Contains(responseBody, "CANARY") && strings.Contains(formatted, "CANARY") {
-					t.Fatalf("error disclosed marked provider response %q", formatted)
+			assertFuzzErrorSafe(t, err, responseBody, "FUZZ-HEADER-SECRET", server.URL, "key", "model")
+		}
+	})
+}
+
+func assertFuzzErrorSafe(t *testing.T, err error, responseBody string, canaries ...string) {
+	t.Helper()
+	if fragment := printableFragment(responseBody); fragment != "" {
+		canaries = append(canaries, fragment)
+	}
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		for _, formatted := range []string{current.Error(), fmt.Sprintf("%s", current), fmt.Sprintf("%v", current), fmt.Sprintf("%+v", current), fmt.Sprintf("%q", current)} {
+			for _, canary := range canaries {
+				if strings.Contains(formatted, canary) {
+					t.Fatalf("error disclosed %q in %q", canary, formatted)
 				}
 			}
 		}
-	})
+	}
+}
+
+func printableFragment(value string) string {
+	const fragmentBytes = 16
+	for start := 0; start+fragmentBytes <= len(value); start++ {
+		fragment := value[start : start+fragmentBytes]
+		printable := true
+		for index := range len(fragment) {
+			if fragment[index] < 0x21 || fragment[index] > 0x7e {
+				printable = false
+				break
+			}
+		}
+		if printable {
+			return fragment
+		}
+	}
+	return ""
 }

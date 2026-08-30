@@ -750,3 +750,52 @@ func assertSafeErrorChain(t *testing.T, err error, canaries ...string) {
 		}
 	}
 }
+
+func FuzzCapabilityProviderResponse(f *testing.F) {
+	for _, seed := range []struct {
+		body       string
+		statusCode int
+		directPDF  bool
+	}{
+		{body: `{"output":[{"type":"message","content":[{"type":"output_text","text":"` + probeNonce + `"}]}],"private":"FUZZ-CAPABILITY-SECRET"}`, statusCode: http.StatusOK, directPDF: true},
+		{body: `{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].file_data","message":"FUZZ-CAPABILITY-SECRET"}}`, statusCode: http.StatusBadRequest, directPDF: true},
+		{body: `{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].image_url","message":"FUZZ-CAPABILITY-SECRET"}}`, statusCode: http.StatusUnprocessableEntity},
+		{body: `{"output":[],"output":[{"type":"message","content":[]}],"private":"FUZZ-DUPLICATE-SECRET"}`, statusCode: http.StatusOK, directPDF: true},
+		{body: `{"output":[],"unknown":"FUZZ-UNKNOWN-SECRET"}`, statusCode: http.StatusOK},
+		{body: `{"output":[]} {"trailing":"FUZZ-TRAILING-SECRET"}`, statusCode: http.StatusOK},
+		{body: "{\xffFUZZ-MALFORMED-SECRET}", statusCode: http.StatusBadRequest},
+		{body: `{"private":"FUZZ-UNICODE-\ud800"}`, statusCode: http.StatusOK},
+		{body: `{"padding":"FUZZ-OVERSIZE-SECRET-` + strings.Repeat("x", 60<<10) + `"}`, statusCode: http.StatusOK},
+	} {
+		f.Add(seed.body, seed.statusCode, seed.directPDF)
+	}
+	f.Fuzz(func(t *testing.T, responseBody string, statusCode int, directPDF bool) {
+		if len(responseBody) > 1<<16 {
+			responseBody = responseBody[:1<<16]
+		}
+		if statusCode < 100 || statusCode > 599 {
+			statusCode = http.StatusBadRequest
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("X-Provider-Private", "FUZZ-CAPABILITY-HEADER-SECRET")
+			writer.WriteHeader(statusCode)
+			_, _ = io.WriteString(writer, responseBody)
+		}))
+		defer server.Close()
+		client := newTestClient(t, server.URL+"/FUZZ-CAPABILITY-URL-SECRET/v1", "FUZZ-CAPABILITY-KEY-SECRET", "FUZZ-CAPABILITY-MODEL-SECRET", ClientOptions{})
+		capability := PageImages
+		if directPDF {
+			capability = DirectPDF
+		}
+		unsupported, err := client.probeAttachment(context.Background(), capability)
+		if unsupported && err != nil {
+			t.Fatalf("probeAttachment() returned unsupported with error: %v", err)
+		}
+		if err != nil {
+			if providerCategory(err) != saferr.CategoryProvider && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("unexpected error class: %T %v", err, err)
+			}
+			assertFuzzErrorSafe(t, err, responseBody, "FUZZ-CAPABILITY-HEADER-SECRET", "FUZZ-CAPABILITY-URL-SECRET", "FUZZ-CAPABILITY-KEY-SECRET", "FUZZ-CAPABILITY-MODEL-SECRET")
+		}
+	})
+}

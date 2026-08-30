@@ -421,6 +421,8 @@ func FuzzWebhookPayload(f *testing.F) {
 		`{"document_id":1,"unknown":"CANARY"}`,
 		`{"document_id":1}{}`,
 		"{\xff}",
+		`{"document_id":1,"text":"FUZZ-UNICODE-\ud800"}`,
+		`{"document_id":1,"unknown":{"nested":"FUZZ-NESTED-SECRET"}}`,
 		`{"document_id":1,"padding":"` + strings.Repeat("x", 4096) + `"}`,
 	} {
 		f.Add(seed, true)
@@ -443,8 +445,10 @@ func FuzzWebhookPayload(f *testing.F) {
 		if !validStatus[response.Code] {
 			t.Fatalf("status = %d for %q", response.Code, body)
 		}
-		if strings.Contains(body, "CANARY") && (strings.Contains(response.Body.String(), "CANARY") || strings.Contains(response.Header().Get("WWW-Authenticate"), "CANARY")) {
-			t.Fatalf("response disclosed marked input %q", body)
+		for _, marker := range []string{"CANARY", "FUZZ-"} {
+			if strings.Contains(body, marker) && (strings.Contains(response.Body.String(), marker) || strings.Contains(response.Header().Get("WWW-Authenticate"), marker)) {
+				t.Fatalf("response disclosed marked input %q", body)
+			}
 		}
 		if !authorized && len(enqueuer.snapshot()) != 0 {
 			t.Fatal("unauthorized request enqueued")
