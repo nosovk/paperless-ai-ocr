@@ -44,6 +44,7 @@ type Store interface {
 	ListBatchesContext(context.Context, int64, int, string) ([]queue.Batch, error)
 	CheckpointBatchContext(context.Context, int64, int, string, queue.BatchRange, int, string, string) error
 	TerminalFailureContext(context.Context, int64, int, string) (queue.SafeDiagnostic, bool, error)
+	SuccessFinalizationStartedContext(context.Context, int64, int, string) (bool, error)
 	RecordTerminalFailureContext(context.Context, int64, int, string, queue.SafeDiagnostic) error
 	ScheduleRetryContext(context.Context, int64, int, string, time.Time, queue.SafeDiagnostic) error
 }
@@ -106,6 +107,10 @@ type Result struct {
 type lostLeaseError struct{}
 
 func (*lostLeaseError) Error() string { return "active job lease was lost" }
+
+type successFinalizationStartedError struct{}
+
+func (*successFinalizationStartedError) Error() string { return "success finalization already started" }
 
 // New validates deterministic worker dependencies.
 func New(options Options) (*Worker, error) {
@@ -185,6 +190,10 @@ func (worker *Worker) Process(ctx context.Context, job queue.Job) (Result, error
 	if errors.As(err, &lostLease) {
 		return Result{}, saferr.New(saferr.CategoryValidation, "active job lease was lost")
 	}
+	var finalizationStarted *successFinalizationStartedError
+	if errors.As(err, &finalizationStarted) {
+		return Result{}, saferr.New(saferr.CategoryValidation, "success finalization already started")
+	}
 	safeErr := publicError(err)
 	if transitionErr := worker.recordTerminalFailure(job, category(safeErr)); transitionErr != nil {
 		return Result{}, transitionError(transitionErr)
@@ -229,6 +238,11 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 		return Result{}, err
 	} else if found {
 		return Result{}, saferr.New(diagnostic.Category, diagnostic.Message)
+	}
+	if started, err := worker.options.Store.SuccessFinalizationStartedContext(ctx, job.ID, job.Attempts, job.LeaseOwner); err != nil {
+		return Result{}, err
+	} else if started {
+		return Result{}, &successFinalizationStartedError{}
 	}
 	documentID, err := safeDocumentID(job.DocumentID)
 	if err != nil {

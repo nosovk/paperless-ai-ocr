@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nosovk/paperless-ai-ocr/internal/paperless"
+	"github.com/nosovk/paperless-ai-ocr/internal/paperlessai"
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
 	"github.com/nosovk/paperless-ai-ocr/internal/saferr"
 	"github.com/nosovk/paperless-ai-ocr/internal/worker"
@@ -190,6 +191,28 @@ func TestProcessDoesNotRepeatAmbiguousDispatch(t *testing.T) {
 	}
 }
 
+func TestProcessHTTP500KeepsDispatchReservedAndRequiresReconciliation(t *testing.T) {
+	fixture := newFixture(t, queue.FinalizationFailedTagRemoved)
+	fixture.dispatcher.err = saferr.Wrap(saferr.CategoryProvider, "Paperless AI dispatch failed",
+		&paperlessai.StatusError{StatusCode: 500})
+
+	err := fixture.finalizer.Process(context.Background(), fixture.job, fixture.result)
+	assertSafeError(t, err, saferr.CategoryProvider)
+	if fixture.store.dispatch != queue.DispatchReserved {
+		t.Errorf("dispatch state = %q, want reserved", fixture.store.dispatch)
+	}
+	if got, want := fixture.store.failedDiagnostic, (queue.SafeDiagnostic{
+		Category: saferr.CategoryProvider,
+		Message:  uncertainDispatchDiagnostic,
+	}); got != want {
+		t.Errorf("failed diagnostic = %+v, want %+v", got, want)
+	}
+	trace := fixture.trace.snapshot()
+	if slices.Contains(trace, "dispatch:none") || slices.Contains(trace, "retry") {
+		t.Errorf("HTTP 500 cleared reservation or retried: %q", trace)
+	}
+}
+
 func TestProcessReservedDispatchPreemptsChangedChecksumWithoutPaperlessCall(t *testing.T) {
 	fixture := newFixture(t, queue.FinalizationFailedTagRemoved)
 	fixture.store.dispatch = queue.DispatchReserved
@@ -362,6 +385,46 @@ func TestProcessStopsAfterLeaseLoss(t *testing.T) {
 	}
 }
 
+func TestProcessHeartbeatDoesNotRaceCompletion(t *testing.T) {
+	fixture := newFixture(t, queue.FinalizationMetadataDispatched)
+	fixture.finalizer.options.LeaseDuration = 30 * time.Millisecond
+	fixture.store.terminalStarted = make(chan struct{})
+	fixture.store.releaseTerminal = make(chan struct{})
+	result := make(chan error, 1)
+	go func() { result <- fixture.finalizer.Process(context.Background(), fixture.job, fixture.result) }()
+	<-fixture.store.terminalStarted
+	time.Sleep(20 * time.Millisecond)
+	close(fixture.store.releaseTerminal)
+
+	if err := <-result; err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if fixture.store.renewDuringTerminal {
+		t.Error("heartbeat renewed while completion transition was in progress")
+	}
+}
+
+func TestFailOCRHeartbeatDoesNotRaceTerminalFailure(t *testing.T) {
+	fixture := newFixture(t, queue.FinalizationFailureTagAdded)
+	fixture.finalizer.options.LeaseDuration = 30 * time.Millisecond
+	fixture.store.failureCategory = saferr.CategoryRendering
+	fixture.store.failureMessage = "OCR processing failed"
+	fixture.store.terminalStarted = make(chan struct{})
+	fixture.store.releaseTerminal = make(chan struct{})
+	result := make(chan error, 1)
+	go func() { result <- fixture.finalizer.FailOCR(context.Background(), fixture.job) }()
+	<-fixture.store.terminalStarted
+	time.Sleep(20 * time.Millisecond)
+	close(fixture.store.releaseTerminal)
+
+	if err := <-result; err != nil {
+		t.Fatalf("FailOCR() error = %v", err)
+	}
+	if fixture.store.renewDuringTerminal {
+		t.Error("heartbeat renewed while failure transition was in progress")
+	}
+}
+
 type fixture struct {
 	finalizer  *Finalizer
 	store      *fakeStore
@@ -413,23 +476,35 @@ func (trace *traceLog) reset() {
 }
 
 type fakeStore struct {
-	trace            *traceLog
-	stage            queue.FinalizationStage
-	now              time.Time
-	renewCalls       int
-	renewErrAt       int
-	dispatch         queue.DispatchState
-	failureCategory  saferr.Category
-	failureMessage   string
-	admissionMu      sync.Mutex
-	admissionToken   string
-	admissionAttempt int
-	failCheckpoint   queue.FinalizationStage
-	failedDiagnostic queue.SafeDiagnostic
+	trace               *traceLog
+	stage               queue.FinalizationStage
+	now                 time.Time
+	renewCalls          int
+	renewErrAt          int
+	dispatch            queue.DispatchState
+	failureCategory     saferr.Category
+	failureMessage      string
+	admissionMu         sync.Mutex
+	admissionToken      string
+	admissionAttempt    int
+	failCheckpoint      queue.FinalizationStage
+	failedDiagnostic    queue.SafeDiagnostic
+	terminalStarted     chan struct{}
+	releaseTerminal     chan struct{}
+	terminalMu          sync.Mutex
+	terminalActive      bool
+	renewDuringTerminal bool
 }
 
 func (store *fakeStore) RenewLeaseContext(context.Context, int64, int, string, time.Duration) error {
 	store.trace.add("renew")
+	store.terminalMu.Lock()
+	if store.terminalActive {
+		store.renewDuringTerminal = true
+		store.terminalMu.Unlock()
+		return saferr.New(saferr.CategoryValidation, "lease cleared by terminal transition")
+	}
+	store.terminalMu.Unlock()
 	store.renewCalls++
 	if store.renewCalls == store.renewErrAt {
 		return saferr.New(saferr.CategoryValidation, "stale lease")
@@ -474,13 +549,29 @@ func (store *fakeStore) SetDispatchStateContext(_ context.Context, _ int64, _ in
 
 func (store *fakeStore) CompleteContext(context.Context, int64, int, string) error {
 	store.trace.add("complete")
+	store.blockTerminal()
 	return nil
 }
 
 func (store *fakeStore) FailContext(_ context.Context, _ int64, _ int, _ string, diagnostic queue.SafeDiagnostic) error {
 	store.trace.add("fail")
 	store.failedDiagnostic = diagnostic
+	store.blockTerminal()
 	return nil
+}
+
+func (store *fakeStore) blockTerminal() {
+	if store.terminalStarted == nil {
+		return
+	}
+	store.terminalMu.Lock()
+	store.terminalActive = true
+	store.terminalMu.Unlock()
+	close(store.terminalStarted)
+	<-store.releaseTerminal
+	store.terminalMu.Lock()
+	store.terminalActive = false
+	store.terminalMu.Unlock()
 }
 
 func (store *fakeStore) ScheduleRetryContext(context.Context, int64, int, string, time.Time, queue.SafeDiagnostic) error {

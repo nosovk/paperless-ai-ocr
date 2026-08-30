@@ -60,9 +60,6 @@ func (err *StatusError) Format(state fmt.State, verb rune) {
 	}
 }
 
-// RetrySafe reports that the server confirmed rejection before accepting work.
-func (*StatusError) RetrySafe() bool { return true }
-
 // New creates a bounded client using separate Paperless and webhook origins.
 func New(webhookURL, paperlessURL *url.URL, webhookKey string, options Options) (*Client, error) {
 	if !validURL(webhookURL) || !validURL(paperlessURL) || strings.TrimSpace(webhookKey) == "" ||

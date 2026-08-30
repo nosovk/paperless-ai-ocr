@@ -148,8 +148,8 @@ func TestDispatchStatusErrorRetainsOnlySafeStatus(t *testing.T) {
 	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("errors.As(*StatusError) = false: %v", err)
 	}
-	if !statusErr.RetrySafe() {
-		t.Error("StatusError.RetrySafe() = false, want true")
+	if classified, ok := any(statusErr).(interface{ RetrySafe() bool }); ok {
+		t.Errorf("StatusError unexpectedly classifies retry safety as %t", classified.RetrySafe())
 	}
 	if unwrapped := errors.Unwrap(statusErr); unwrapped != nil {
 		t.Errorf("errors.Unwrap(StatusError) = %v, want nil", unwrapped)

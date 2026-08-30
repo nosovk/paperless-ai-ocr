@@ -101,6 +101,20 @@ func TestProcessSkipsOCRWhenTerminalFailureIntentAlreadyExists(t *testing.T) {
 	}
 }
 
+func TestProcessSkipsOCRWhenSuccessFinalizationAlreadyStarted(t *testing.T) {
+	fixture := newFixture(t, 1, aigate.PageImages)
+	fixture.store.finalizationStarted = true
+
+	_, err := fixture.worker.Process(context.Background(), fixture.job)
+	if errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("Process() error = %v, want validation category", err)
+	}
+	if fixture.store.terminal || fixture.paperless.getCalls != 0 || fixture.renderer.calls != 0 || fixture.transcriber.callCount() != 0 {
+		t.Fatalf("finalization resume mutated terminal/Paperless/render/model = %t/%d/%d/%d",
+			fixture.store.terminal, fixture.paperless.getCalls, fixture.renderer.calls, fixture.transcriber.callCount())
+	}
+}
+
 func TestProcessRestartRevalidatesCanonicalCheckpointAndSkipsWork(t *testing.T) {
 	fixture := newFixture(t, 6, aigate.PageImages)
 	fixture.store.batches = []queue.Batch{
@@ -613,25 +627,30 @@ func newFixture(t *testing.T, pages int, capability aigate.Capability) *fixture 
 }
 
 type fakeStore struct {
-	mu           sync.Mutex
-	job          queue.Job
-	batches      []queue.Batch
-	renews       int
-	renewErrAt   int
-	failed       bool
-	completed    bool
-	retried      bool
-	diagnostic   queue.SafeDiagnostic
-	blockRenewAt int
-	renewStarted chan struct{}
-	failErr      error
-	retryErr     error
-	renewErr     error
-	terminal     bool
+	mu                  sync.Mutex
+	job                 queue.Job
+	batches             []queue.Batch
+	renews              int
+	renewErrAt          int
+	failed              bool
+	completed           bool
+	retried             bool
+	diagnostic          queue.SafeDiagnostic
+	blockRenewAt        int
+	renewStarted        chan struct{}
+	failErr             error
+	retryErr            error
+	renewErr            error
+	terminal            bool
+	finalizationStarted bool
 }
 
 func (store *fakeStore) TerminalFailureContext(context.Context, int64, int, string) (queue.SafeDiagnostic, bool, error) {
 	return store.diagnostic, store.terminal, nil
+}
+
+func (store *fakeStore) SuccessFinalizationStartedContext(context.Context, int64, int, string) (bool, error) {
+	return store.finalizationStarted, nil
 }
 
 func (store *fakeStore) RecordTerminalFailureContext(_ context.Context, _ int64, _ int, _ string, diagnostic queue.SafeDiagnostic) error {

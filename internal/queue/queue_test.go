@@ -1322,6 +1322,34 @@ func TestTerminalFailureIntentLoadsUnderReclaimedLease(t *testing.T) {
 	}
 }
 
+func TestRecordTerminalFailureRejectsSuccessFinalizationWithoutPartialMutation(t *testing.T) {
+	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
+	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")
+	state, err := q.AcquireFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", time.Minute)
+	if err != nil || state.Stage != FinalizationPending {
+		t.Fatalf("AcquireFinalizationContext() = (%+v, %v)", state, err)
+	}
+	if err := q.AdvanceFinalizationContext(context.Background(), job.ID, job.Attempts, "owner", "token", FinalizationPending, FinalizationContentUpdated); err != nil {
+		t.Fatalf("AdvanceFinalizationContext() error = %v", err)
+	}
+
+	err = q.RecordTerminalFailureContext(context.Background(), job.ID, job.Attempts, "owner",
+		SafeDiagnostic{Category: saferr.CategoryProvider, Message: "OCR processing failed"})
+	if errorCategory(err) != saferr.CategoryValidation {
+		t.Fatalf("RecordTerminalFailureContext() error = %v, want validation", err)
+	}
+	var stage string
+	var category, message sql.NullString
+	if err := q.db.QueryRow(`SELECT f.stage, c.failure_category, c.failure_message
+		FROM finalizations AS f JOIN finalization_controls AS c ON c.job_id = f.job_id
+		WHERE f.job_id = ?`, job.ID).Scan(&stage, &category, &message); err != nil {
+		t.Fatalf("load finalization state: %v", err)
+	}
+	if stage != string(FinalizationContentUpdated) || category.Valid || message.Valid {
+		t.Errorf("finalization state = (%q, %v, %v), want unchanged content_updated without failure intent", stage, category, message)
+	}
+}
+
 func TestCompleteContextHonorsCancellation(t *testing.T) {
 	q := openTestQueue(t, filepath.Join(t.TempDir(), "queue.db"), testNow)
 	job := enqueueAndClaim(t, q, 1, "checksum", PriorityBackfill, "owner")

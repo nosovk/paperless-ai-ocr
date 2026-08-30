@@ -536,12 +536,25 @@ func (q *Queue) RecordTerminalFailureContext(ctx context.Context, id int64, atte
 			return err
 		}
 		timestamp := formatTime(now)
-		if _, err := conn.ExecContext(ctx, `INSERT INTO finalizations (
-			job_id, stage, created_at, updated_at
-		) VALUES (?, 'failure_pending', ?, ?)
-		ON CONFLICT(job_id) DO UPDATE SET stage = 'failure_pending', updated_at = excluded.updated_at
-		WHERE finalizations.stage IN ('pending', 'failure_pending')`, id, timestamp, timestamp); err != nil {
-			return internalError("cannot record terminal OCR failure", err)
+		var stage FinalizationStage
+		err := conn.QueryRowContext(ctx, "SELECT stage FROM finalizations WHERE job_id = ?", id).Scan(&stage)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := conn.ExecContext(ctx, `INSERT INTO finalizations (
+				job_id, stage, created_at, updated_at
+			) VALUES (?, 'failure_pending', ?, ?)`, id, timestamp, timestamp); err != nil {
+				return internalError("cannot record terminal OCR failure", err)
+			}
+		case err != nil:
+			return internalError("cannot inspect terminal OCR failure transition", err)
+		case stage == FinalizationPending:
+			if _, err := conn.ExecContext(ctx, `UPDATE finalizations SET
+				stage = 'failure_pending', updated_at = ? WHERE job_id = ? AND stage = 'pending'`,
+				timestamp, id); err != nil {
+				return internalError("cannot record terminal OCR failure", err)
+			}
+		case stage != FinalizationFailurePending:
+			return validationError("success finalization already started")
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO finalization_controls (
 			job_id, dispatch_state, failure_category, failure_message, created_at, updated_at
@@ -553,6 +566,29 @@ func (q *Queue) RecordTerminalFailureContext(ctx context.Context, id int64, atte
 		}
 		return nil
 	})
+}
+
+// SuccessFinalizationStartedContext reports whether OCR work must not resume.
+func (q *Queue) SuccessFinalizationStartedContext(ctx context.Context, id int64, attempt int, owner string) (bool, error) {
+	if id <= 0 || attempt <= 0 || blank(owner) {
+		return false, validationError("invalid success finalization lookup")
+	}
+	started := false
+	err := q.writeContext(ctx, func(conn *sql.Conn) error {
+		if err := requireActiveLease(ctx, conn, q.now().UTC(), id, attempt, owner); err != nil {
+			return err
+		}
+		var stage FinalizationStage
+		if err := conn.QueryRowContext(ctx, "SELECT stage FROM finalizations WHERE job_id = ?", id).Scan(&stage); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return internalError("cannot inspect success finalization state", err)
+		}
+		started = stage != FinalizationPending && stage != FinalizationFailurePending && stage != FinalizationFailureTagAdded
+		return nil
+	})
+	return started, err
 }
 
 // TerminalFailureContext loads persisted terminal OCR intent under the active lease.

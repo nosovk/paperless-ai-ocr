@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -127,9 +128,9 @@ func (finalizer *Finalizer) Process(ctx context.Context, job queue.Job, result w
 	processCtx, cancel := context.WithCancel(ctx)
 	heartbeatDone := make(chan error, 1)
 	go finalizer.heartbeat(processCtx, job, token, cancel, heartbeatDone)
-	err = finalizer.process(processCtx, job, result, token)
-	cancel()
-	if heartbeatErr := <-heartbeatDone; heartbeatErr != nil {
+	stopHeartbeat := heartbeatStop(cancel, heartbeatDone)
+	err = finalizer.process(processCtx, job, result, token, stopHeartbeat)
+	if heartbeatErr := stopHeartbeat(); heartbeatErr != nil {
 		err = heartbeatErr
 	}
 	if err == nil {
@@ -177,9 +178,9 @@ func (finalizer *Finalizer) FailOCR(ctx context.Context, job queue.Job) error {
 	processCtx, cancel := context.WithCancel(ctx)
 	heartbeatDone := make(chan error, 1)
 	go finalizer.heartbeat(processCtx, job, token, cancel, heartbeatDone)
-	err = finalizer.failOCR(processCtx, job, token)
-	cancel()
-	if heartbeatErr := <-heartbeatDone; heartbeatErr != nil {
+	stopHeartbeat := heartbeatStop(cancel, heartbeatDone)
+	err = finalizer.failOCR(processCtx, job, token, stopHeartbeat)
+	if heartbeatErr := stopHeartbeat(); heartbeatErr != nil {
 		err = heartbeatErr
 	}
 	if err == nil {
@@ -229,7 +230,7 @@ func (finalizer *Finalizer) heartbeat(ctx context.Context, job queue.Job, token 
 	}
 }
 
-func (finalizer *Finalizer) process(ctx context.Context, job queue.Job, result worker.Result, token string) error {
+func (finalizer *Finalizer) process(ctx context.Context, job queue.Job, result worker.Result, token string, stopHeartbeat func() error) error {
 	if err := finalizer.renewLease(ctx, job); err != nil {
 		return err
 	}
@@ -320,10 +321,13 @@ func (finalizer *Finalizer) process(ctx context.Context, job queue.Job, result w
 	if err := finalizer.renew(ctx, job, token); err != nil {
 		return err
 	}
-	return finalizer.options.Store.CompleteContext(ctx, job.ID, job.Attempts, job.LeaseOwner)
+	if err := stopHeartbeat(); err != nil {
+		return err
+	}
+	return finalizer.complete(job)
 }
 
-func (finalizer *Finalizer) failOCR(ctx context.Context, job queue.Job, token string) error {
+func (finalizer *Finalizer) failOCR(ctx context.Context, job queue.Job, token string, stopHeartbeat func() error) error {
 	if err := finalizer.renewLease(ctx, job); err != nil {
 		return err
 	}
@@ -360,7 +364,10 @@ func (finalizer *Finalizer) failOCR(ctx context.Context, job queue.Job, token st
 	if err := finalizer.renew(ctx, job, token); err != nil {
 		return err
 	}
-	return finalizer.options.Store.FailContext(ctx, job.ID, job.Attempts, job.LeaseOwner,
+	if err := stopHeartbeat(); err != nil {
+		return err
+	}
+	return finalizer.failTerminal(job,
 		queue.SafeDiagnostic{Category: state.FailureCategory, Message: state.FailureMessage})
 }
 
@@ -425,6 +432,18 @@ func (finalizer *Finalizer) retry(job queue.Job) error {
 	defer cancel()
 	return finalizer.options.Store.ScheduleRetryContext(ctx, job.ID, job.Attempts, job.LeaseOwner,
 		finalizer.options.Now().Add(finalizer.options.RetryDelay), queue.SafeDiagnostic{Category: saferr.CategoryInternal, Message: retryDiagnostic})
+}
+
+func (finalizer *Finalizer) complete(job queue.Job) error {
+	ctx, cancel := context.WithTimeout(context.Background(), transitionTimeout)
+	defer cancel()
+	return finalizer.options.Store.CompleteContext(ctx, job.ID, job.Attempts, job.LeaseOwner)
+}
+
+func (finalizer *Finalizer) failTerminal(job queue.Job, diagnostic queue.SafeDiagnostic) error {
+	ctx, cancel := context.WithTimeout(context.Background(), transitionTimeout)
+	defer cancel()
+	return finalizer.options.Store.FailContext(ctx, job.ID, job.Attempts, job.LeaseOwner, diagnostic)
 }
 
 func (finalizer *Finalizer) fail(job queue.Job, category saferr.Category, message ...string) error {
@@ -510,4 +529,16 @@ func randomToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(bytes[:]), nil
+}
+
+func heartbeatStop(cancel context.CancelFunc, done <-chan error) func() error {
+	var once sync.Once
+	var err error
+	return func() error {
+		once.Do(func() {
+			cancel()
+			err = <-done
+		})
+		return err
+	}
 }
