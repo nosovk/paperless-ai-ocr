@@ -252,6 +252,31 @@ func TestProbeAcceptsResponsesAPIMetadata(t *testing.T) {
 	}
 }
 
+func TestProbeAcceptsReasoningAroundOneMessage(t *testing.T) {
+	for _, body := range []string{
+		fmt.Sprintf(`{"output":[{"type":"reasoning","summary":[]},{"type":"message","content":[{"type":"output_text","text":%q}]}]}`, probeNonce),
+		fmt.Sprintf(`{"output":[{"type":"message","content":[{"type":"output_text","text":%q}]},{"type":"reasoning","summary":[{"type":"summary_text","text":"private"}]}]}`, probeNonce),
+		fmt.Sprintf(`{"output":[{"type":"reasoning","summary":[]},{"type":"reasoning","summary":[]},{"type":"message","content":[{"type":"output_text","text":%q}]}]}`, probeNonce),
+	} {
+		if err := validateProbeResponse([]byte(body)); err != nil {
+			t.Errorf("validateProbeResponse() error = %v for %s", err, body)
+		}
+	}
+}
+
+func TestProbeRejectsInvalidReasoningEnvelopes(t *testing.T) {
+	for _, body := range []string{
+		`{"output":[{"type":"reasoning","summary":[]}]}`,
+		fmt.Sprintf(`{"output":[{"type":"message","content":[{"type":"output_text","text":%q}]},{"type":"message","content":[{"type":"output_text","text":%q}]}]}`, probeNonce, probeNonce),
+		fmt.Sprintf(`{"output":[{"type":"mystery"},{"type":"message","content":[{"type":"output_text","text":%q}]}]}`, probeNonce),
+		fmt.Sprintf(`{"output":[{"type":"reasoning","content":[{"type":"output_text","text":%q}]},{"type":"message","content":[{"type":"output_text","text":%q}]}]}`, probeNonce, probeNonce),
+	} {
+		if err := validateProbeResponse([]byte(body)); err == nil {
+			t.Errorf("validateProbeResponse() error = nil for %s", body)
+		}
+	}
+}
+
 func TestUnsupportedClassificationAcceptsProviderMetadata(t *testing.T) {
 	body := []byte(`{
 		"id":"resp_error_123","object":"error","created_at":1788102000,"model":"provider-private-model",
@@ -805,6 +830,7 @@ func FuzzCapabilityProviderResponse(f *testing.F) {
 		{body: `{"error":{"type":"invalid_request_error","code":"unsupported_value","param":"input[0].content[1].image_url","message":"FUZZ-CAPABILITY-SECRET"}}`, statusCode: http.StatusUnprocessableEntity, want: oracle{unsupported: true}},
 		{body: `{"output":[],"output":[{"type":"message","content":[{"type":"output_text","text":"` + probeNonce + `"}]}]}`, statusCode: http.StatusOK, directPDF: true},
 		{body: `{"id":"resp_metadata","output":[{"id":"msg_metadata","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"` + probeNonce + `","unknown":"FUZZ-UNKNOWN-SECRET"}]}],"unknown":"FUZZ-ROOT-SECRET","usage":{"total_tokens":1}}`, statusCode: http.StatusOK, want: oracle{success: true}},
+		{body: `{"output":[{"type":"reasoning","summary":[]},{"type":"message","content":[{"type":"output_text","text":"` + probeNonce + `"}]},{"type":"reasoning","summary":[]}]}`, statusCode: http.StatusOK, directPDF: true, want: oracle{success: true}},
 		{body: `{"output":[{"type":"mystery","private":"FUZZ-INVALID-ITEM-SECRET"}]}`, statusCode: http.StatusOK},
 		{body: `{"output":[]} {"trailing":"FUZZ-TRAILING-SECRET"}`, statusCode: http.StatusOK},
 		{body: "{\xffFUZZ-MALFORMED-SECRET}", statusCode: http.StatusBadRequest},

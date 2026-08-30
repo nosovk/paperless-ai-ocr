@@ -57,7 +57,8 @@ type probeContent struct {
 
 type probeResponse struct {
 	Output []struct {
-		Type    string `json:"type"`
+		Type    string          `json:"type"`
+		Summary json.RawMessage `json:"summary"`
 		Content []struct {
 			Type    string `json:"type"`
 			Text    string `json:"text"`
@@ -256,12 +257,29 @@ func validateProbeResponse(data []byte) error {
 	if err := decodeSingleJSON(data, &response); err != nil {
 		return err
 	}
-	if len(response.Output) != 1 || response.Output[0].Type != "message" || len(response.Output[0].Content) != 1 {
-		return errors.New("unexpected probe output envelope")
+	messages := 0
+	for _, output := range response.Output {
+		switch output.Type {
+		case "reasoning":
+			if len(output.Content) != 0 {
+				return errors.New("unexpected probe reasoning content")
+			}
+			continue
+		case "message":
+			messages++
+		default:
+			return errors.New("unexpected probe output item")
+		}
+		if messages != 1 || len(output.Content) != 1 {
+			return errors.New("unexpected probe output envelope")
+		}
+		content := output.Content[0]
+		if content.Type != "output_text" || content.Text != probeNonce || content.Refusal != "" {
+			return errors.New("probe nonce did not match")
+		}
 	}
-	content := response.Output[0].Content[0]
-	if content.Type != "output_text" || content.Text != probeNonce || content.Refusal != "" {
-		return errors.New("probe nonce did not match")
+	if messages != 1 {
+		return errors.New("unexpected probe output envelope")
 	}
 	return nil
 }
