@@ -95,7 +95,7 @@ for descriptor in descriptors:
 if set(platforms) != {("linux", "amd64"), ("linux", "arm64")}:
     raise SystemExit(f"existing image {reference} does not contain the required release platforms")
 platform_digests = {descriptor_digest for descriptor_digest, _ in platforms.values()}
-if not attestation_references <= platform_digests:
+if attestation_references != platform_digests:
     raise SystemExit(f"existing image {reference} has an invalid attestation descriptor")
 for _, annotations in platforms.values():
     if annotations.get("org.opencontainers.image.version") != version:

@@ -139,6 +139,10 @@ assert_rejected "${valid_image/\"vnd.docker.reference.digest\":\"$digest_a\"/\"v
 assert_rejected "${valid_image/\"vnd.docker.reference.digest\":\"$digest_b\"/\"vnd.docker.reference.digest\":\"$digest_a\"}" 'invalid attestation descriptor' 'duplicate attestation references'
 assert_rejected "${valid_image/$digest_e/$digest_d}" 'duplicate descriptor digest' 'duplicate attestation descriptor digests'
 assert_rejected "${valid_image/\"architecture\":\"arm64\"/\"architecture\":\"amd64\"}" 'does not contain the required release platforms' 'duplicate amd64 release descriptors'
+readonly no_attestations=$(python3 -c 'import json,sys; value=json.loads(sys.argv[1]); value["manifest"]["manifests"]=[item for item in value["manifest"]["manifests"] if item["platform"]["os"] != "unknown"]; print(json.dumps(value, separators=(",", ":")))' "$valid_image")
+assert_rejected "$no_attestations" 'invalid attestation descriptor' 'an index without BuildKit attestation descriptors'
+readonly one_attestation=$(python3 -c 'import json,sys; value=json.loads(sys.argv[1]); value["manifest"]["manifests"]=[item for item in value["manifest"]["manifests"] if item["digest"] != sys.argv[2]]; print(json.dumps(value, separators=(",", ":")))' "$valid_image" "$digest_e")
+assert_rejected "$one_attestation" 'invalid attestation descriptor' 'incomplete attestation descriptor coverage'
 
 make_inspector "printf '%s\\n' '$(image_json "$digest_a" 1.2.3 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef)'"
 if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
