@@ -81,6 +81,22 @@ The container runs as UID/GID `65532`, includes Poppler, and stores SQLite at
 `/app/data/paperless-ai-ocr.db`. `/app/data` and `/tmp` must be writable; the
 root filesystem can remain read-only.
 
+The stable `v0.1.0` release will be published to GHCR with equivalent `v0.1.0`
+and `0.1.0` tags. No `latest` or mutable minor tag will be published. After the
+release workflow completes and the package is public, inspect the
+multi-architecture manifest and resolve its immutable digest before deployment:
+
+```sh
+docker buildx imagetools inspect ghcr.io/nosovk/paperless-ai-ocr:v0.1.0
+docker pull ghcr.io/nosovk/paperless-ai-ocr@sha256:<manifest-digest>
+```
+
+Pin `ghcr.io/nosovk/paperless-ai-ocr@sha256:<manifest-digest>` in production and
+homelab configuration. When using the Compose baseline below, replace its entire
+`image:` value with that digest reference; `PAPERLESS_AI_OCR_VERSION` accepts a
+tag only. See the [v0.1.0 release notes](CHANGELOG.md#010---2026-08-31) for
+capabilities, security properties, and operational limitations.
+
 Use [`compose.example.yaml`](compose.example.yaml) as the hardened baseline:
 
 ```sh
