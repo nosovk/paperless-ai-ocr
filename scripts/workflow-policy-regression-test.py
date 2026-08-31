@@ -265,6 +265,25 @@ def mutate_attestation_to_build(text: str) -> str:
     )
 
 
+def mutate_unconditional_attestation(text: str) -> str:
+    return text.replace(
+        "      - name: Attest image provenance\n"
+        "        id: attest\n"
+        "        if: steps.release-state.outputs.publish == 'true'\n",
+        "      - name: Attest image provenance\n"
+        "        id: attest\n",
+        1,
+    )
+
+
+def mutate_remove_manifest_descriptor_annotations(text: str) -> str:
+    return text.replace(
+        "DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,manifest-descriptor,index",
+        "DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index",
+        1,
+    )
+
+
 def mutate_summary_to_build(text: str) -> str:
     return text.replace(
         "          DIGEST: ${{ steps.final-digest.outputs.digest }}",
@@ -379,7 +398,9 @@ def main() -> None:
             run_mutant("conditional final digest", ".github/workflows/release.yml", lambda text: mutate_step_attribute(text, "Resolve final digest", "if: steps.release-state.outputs.publish == 'true'"), ref),
             run_mutant("publish output bypasses final digest", ".github/workflows/release.yml", mutate_publish_output_to_build, ref),
             run_mutant("attestation bypasses final digest", ".github/workflows/release.yml", mutate_attestation_to_build, ref),
+            run_mutant("recovery creates unsupported attestation", ".github/workflows/release.yml", mutate_unconditional_attestation, ref),
             run_mutant("summary bypasses final digest", ".github/workflows/release.yml", mutate_summary_to_build, ref),
+            run_mutant("missing platform descriptor annotations", ".github/workflows/release.yml", mutate_remove_manifest_descriptor_annotations, ref),
             run_mutant("missing deterministic created label", ".github/workflows/release.yml", mutate_remove_created_label, ref),
             run_mutant("missing deterministic created annotation", ".github/workflows/release.yml", mutate_remove_created_annotation, ref),
         )

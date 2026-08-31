@@ -35,22 +35,69 @@ manifest = document.get("manifest")
 digest = manifest.get("digest") if isinstance(manifest, dict) else None
 if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
     raise SystemExit(f"could not determine release state for {reference}: expected exactly one manifest digest")
+if manifest.get("schemaVersion") != 2 or manifest.get("mediaType") not in {
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+}:
+    raise SystemExit(f"existing image {reference} has an invalid image index")
+
+descriptors = manifest.get("manifests")
+if not isinstance(descriptors, list):
+    raise SystemExit(f"existing image {reference} has an invalid image index")
 
 platforms = {}
-for descriptor in manifest.get("manifests", []):
+attestation_references = set()
+descriptor_digests = set()
+manifest_media_types = {
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+}
+for descriptor in descriptors:
+    if not isinstance(descriptor, dict):
+        raise SystemExit(f"existing image {reference} has an invalid release descriptor")
     platform = descriptor.get("platform", {})
+    if not isinstance(platform, dict):
+        raise SystemExit(f"existing image {reference} has an invalid release descriptor")
     key = (platform.get("os"), platform.get("architecture"))
-    if key not in {("linux", "amd64"), ("linux", "arm64")}:
-        if key != ("unknown", "unknown"):
-            raise SystemExit(f"existing image {reference} does not contain the required release platforms")
+    descriptor_digest = descriptor.get("digest")
+    media_type = descriptor.get("mediaType")
+    if media_type not in manifest_media_types or not isinstance(descriptor_digest, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", descriptor_digest
+    ) is None:
+        if key == ("unknown", "unknown"):
+            raise SystemExit(f"existing image {reference} has an invalid attestation descriptor")
+        raise SystemExit(f"existing image {reference} has an invalid release descriptor")
+    if descriptor_digest in descriptor_digests:
+        raise SystemExit(f"existing image {reference} has a duplicate descriptor digest")
+    descriptor_digests.add(descriptor_digest)
+    annotations = descriptor.get("annotations")
+    if not isinstance(annotations, dict):
+        if key == ("unknown", "unknown"):
+            raise SystemExit(f"existing image {reference} has an invalid attestation descriptor")
+        raise SystemExit(f"existing image {reference} has an invalid release descriptor")
+    if key == ("unknown", "unknown"):
+        attestation_reference = annotations.get("vnd.docker.reference.digest")
+        if (
+            annotations.get("vnd.docker.reference.type") != "attestation-manifest"
+            or not isinstance(attestation_reference, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", attestation_reference) is None
+            or attestation_reference in attestation_references
+        ):
+            raise SystemExit(f"existing image {reference} has an invalid attestation descriptor")
+        attestation_references.add(attestation_reference)
         continue
+    if key not in {("linux", "amd64"), ("linux", "arm64")}:
+        raise SystemExit(f"existing image {reference} does not contain the required release platforms")
     if key in platforms:
         raise SystemExit(f"existing image {reference} does not contain the required release platforms")
-    platforms[key] = descriptor.get("annotations", {})
+    platforms[key] = (descriptor_digest, annotations)
 
 if set(platforms) != {("linux", "amd64"), ("linux", "arm64")}:
     raise SystemExit(f"existing image {reference} does not contain the required release platforms")
-for annotations in platforms.values():
+platform_digests = {descriptor_digest for descriptor_digest, _ in platforms.values()}
+if not attestation_references <= platform_digests:
+    raise SystemExit(f"existing image {reference} has an invalid attestation descriptor")
+for _, annotations in platforms.values():
     if annotations.get("org.opencontainers.image.version") != version:
         raise SystemExit(f"existing image {reference} does not match release version {version}")
     if annotations.get("org.opencontainers.image.revision") != revision:

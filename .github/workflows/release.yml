@@ -124,7 +124,7 @@ jobs:
         id: metadata
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         env:
-          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,manifest-descriptor,index
         with:
           images: ghcr.io/${{ github.repository }}
           flavor: latest=false
@@ -199,6 +199,7 @@ jobs:
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
       - name: Attest image provenance
         id: attest
+        if: steps.release-state.outputs.publish == 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository }}
@@ -210,11 +211,16 @@ jobs:
         env:
           IMAGE: ghcr.io/${{ github.repository }}
           DIGEST: ${{ steps.final-digest.outputs.digest }}
+          PUBLISH: ${{ steps.release-state.outputs.publish }}
           ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
         run: |
           {
             printf '## Published image\n\n'
             printf '`%s@%s`\n\n' "$IMAGE" "$DIGEST"
-            printf '[GitHub provenance attestation](%s)\n\n' "$ATTESTATION_URL"
+            if [[ $PUBLISH == true ]]; then
+              printf '[GitHub provenance attestation](%s)\n\n' "$ATTESTATION_URL"
+            else
+              printf 'Existing immutable release tags and image digest were verified; no new provenance attestation was created.\n\n'
+            fi
             printf '> Release prerequisite: configure the linked GHCR package as public before advertising anonymous pulls. Package visibility is not controlled by this workflow.\n'
           } >> "$GITHUB_STEP_SUMMARY"

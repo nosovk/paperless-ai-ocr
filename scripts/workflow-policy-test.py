@@ -300,7 +300,10 @@ def assert_release(workflow: Workflow) -> None:
     require(names.index(validation_name) < names.index("Log in to GitHub Container Registry"), "tag validation must precede registry login")
     assert_qemu_before_buildx(publish)
     metadata = publish_steps["Generate image metadata"].text
-    require("DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index" in metadata, "multi-arch annotations must cover manifest and index")
+    require(
+        "DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,manifest-descriptor,index" in metadata,
+        "multi-arch annotations must cover manifests, platform descriptors, and index",
+    )
     require("flavor: latest=false" in metadata and "value=latest" not in metadata.lower(), "release must not publish latest")
     for tag in ("type=raw,value=${{ steps.release-metadata.outputs.version }}", "type=semver,pattern={{version}},value=${{ steps.release-metadata.outputs.version }}"):
         require(tag in metadata, f"release metadata missing tag rule: {tag}")
@@ -357,11 +360,17 @@ def assert_release(workflow: Workflow) -> None:
         require(value in final_digest.text, f"final digest resolution missing: {value}")
     require(names.index("Build and push image") < names.index(final_state_name) < names.index("Resolve final digest") < names.index("Attest image provenance"), "final registry state and digest must be verified after the optional build and before attestation")
     require(publish.child("outputs").values() == {"digest": "${{ steps.final-digest.outputs.digest }}"}, "publish output must use the verified final digest")
-    attest = publish_steps["Attest image provenance"].text
+    attest_step = publish_steps["Attest image provenance"]
+    require(
+        "        if: steps.release-state.outputs.publish == 'true'" in attest_step.lines,
+        "provenance attestation must only describe an image built by this workflow run",
+    )
+    attest = attest_step.text
     for value in ("subject-name: ghcr.io/${{ github.repository }}", "subject-digest: ${{ steps.final-digest.outputs.digest }}", "push-to-registry: true", "create-storage-record: false"):
         require(value in attest, f"attestation missing: {value}")
     summary = publish_steps["Summarize release"].text
     require("DIGEST: ${{ steps.final-digest.outputs.digest }}" in summary, "release summary must use the verified final digest")
+    require("PUBLISH: ${{ steps.release-state.outputs.publish }}" in summary, "release summary must distinguish publication from recovery")
     require("GITHUB_STEP_SUMMARY" in summary and "Package visibility is not controlled by this workflow" in summary, "release summary is incomplete")
 
 

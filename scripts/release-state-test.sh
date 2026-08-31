@@ -49,6 +49,9 @@ EOF
 
 readonly digest_a=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 readonly digest_b=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+readonly digest_c=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+readonly digest_d=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+readonly digest_e=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 readonly revision=0123456789abcdef0123456789abcdef01234567
 
 image_json() {
@@ -58,14 +61,29 @@ image_json() {
   local platforms=${4:-both}
   local amd64=''
   local arm64=''
+  local attestations=''
   if [[ $platforms == both || $platforms == amd64 ]]; then
     amd64=$(printf '{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","annotations":{"org.opencontainers.image.version":"%s","org.opencontainers.image.revision":"%s"},"platform":{"os":"linux","architecture":"amd64"}}' "$digest_a" "$version" "$image_revision")
   fi
   if [[ $platforms == both || $platforms == arm64 ]]; then
     arm64=$(printf '{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","annotations":{"org.opencontainers.image.version":"%s","org.opencontainers.image.revision":"%s"},"platform":{"os":"linux","architecture":"arm64"}}' "$digest_b" "$version" "$image_revision")
   fi
-  printf '{"manifest":{"digest":"%s","manifests":[%s%s%s]}}' \
-    "$digest" "$amd64" "${amd64:+${arm64:+,}}" "$arm64"
+  if [[ $platforms == both ]]; then
+    attestations=$(printf ',{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"%s"},"platform":{"os":"unknown","architecture":"unknown"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"%s"},"platform":{"os":"unknown","architecture":"unknown"}}' "$digest_d" "$digest_a" "$digest_e" "$digest_b")
+  fi
+  printf '{"manifest":{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","digest":"%s","manifests":[%s%s%s%s]}}' \
+    "$digest" "$amd64" "${amd64:+${arm64:+,}}" "$arm64" "$attestations"
+}
+
+assert_rejected() {
+  local json=$1
+  local expected=$2
+  local description=$3
+  make_inspector "printf '%s\\n' '$json'"
+  if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
+    fail "accepted $description"
+  fi
+  grep -F "$expected" "$work_dir/stderr" >/dev/null || fail "$description error is not actionable"
 }
 
 make_inspector "printf 'manifest unknown: not found\\n' >&2; exit 1"
@@ -74,13 +92,15 @@ assert_exact_tags_inspected
 assert_output 'publish=true'
 assert_output 'digest='
 
-make_inspector "printf '%s\\n' '$(image_json "$digest_a")'"
+readonly valid_image=$(image_json "$digest_c")
+
+make_inspector "printf '%s\\n' '$valid_image'"
 run_check
 assert_exact_tags_inspected
 assert_output 'publish=false'
-assert_output "digest=$digest_a"
+assert_output "digest=$digest_c"
 
-make_inspector "if [[ \$1 == *:v1.2.3 ]]; then printf '%s\\n' '$(image_json "$digest_a")'; exit 0; fi; printf 'manifest unknown\\n' >&2; exit 1"
+make_inspector "if [[ \$1 == *:v1.2.3 ]]; then printf '%s\\n' '$valid_image'; exit 0; fi; printf 'manifest unknown\\n' >&2; exit 1"
 if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
   fail "accepted a partial release publication"
 fi
@@ -109,6 +129,16 @@ if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
   fail "accepted an existing tag without an unambiguous digest"
 fi
 grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "ambiguous inspection error is not actionable"
+
+assert_rejected "${valid_image/\"schemaVersion\":2/\"schemaVersion\":1}" 'invalid image index' 'an invalid OCI schema version'
+assert_rejected "${valid_image/application\/vnd.oci.image.index.v1+json/application\/vnd.oci.image.manifest.v1+json}" 'invalid image index' 'a non-index root media type'
+assert_rejected "${valid_image/application\/vnd.oci.image.manifest.v1+json/application\/vnd.oci.image.layer.v1.tar+gzip}" 'invalid release descriptor' 'a non-image runnable descriptor'
+assert_rejected "${valid_image/$digest_a/sha256:ABC}" 'invalid release descriptor' 'a malformed runnable descriptor digest'
+assert_rejected "${valid_image/\"vnd.docker.reference.type\":\"attestation-manifest\"/\"vnd.docker.reference.type\":\"other\"}" 'invalid attestation descriptor' 'an unknown descriptor without the BuildKit attestation type'
+assert_rejected "${valid_image/\"vnd.docker.reference.digest\":\"$digest_a\"/\"vnd.docker.reference.digest\":\"$digest_d\"}" 'invalid attestation descriptor' 'an attestation descriptor not bound to a runnable manifest'
+assert_rejected "${valid_image/\"vnd.docker.reference.digest\":\"$digest_b\"/\"vnd.docker.reference.digest\":\"$digest_a\"}" 'invalid attestation descriptor' 'duplicate attestation references'
+assert_rejected "${valid_image/$digest_e/$digest_d}" 'duplicate descriptor digest' 'duplicate attestation descriptor digests'
+assert_rejected "${valid_image/\"architecture\":\"arm64\"/\"architecture\":\"amd64\"}" 'does not contain the required release platforms' 'duplicate amd64 release descriptors'
 
 make_inspector "printf '%s\\n' '$(image_json "$digest_a" 1.2.3 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef)'"
 if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
