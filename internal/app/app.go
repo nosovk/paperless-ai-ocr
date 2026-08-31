@@ -148,7 +148,7 @@ func NewServiceWithOptions(cfg config.Config, readiness *server.Readiness, metri
 		cleanup()
 		return nil, err
 	}
-	dispatcher, err := paperlessai.New(cfg.PaperlessAIWebhookURL, cfg.PaperlessURL, cfg.PaperlessAIWebhookKey, paperlessai.Options{})
+	dispatcher, err := paperlessai.New(cfg.PaperlessAIWebhookURL, cfg.PaperlessURL, cfg.PaperlessAIWebhookKey, paperlessai.Options{RequestTimeout: cfg.PaperlessAIWebhookTimeout})
 	if err != nil {
 		cleanup()
 		return nil, err

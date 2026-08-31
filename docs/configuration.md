@@ -40,6 +40,7 @@ processing when the service retries dispatch.
 | `MODEL_ATTEMPTS` | `3` | Integer from 1 through 10 provider attempts per batch. |
 | `RENDER_TIMEOUT` | `5m` | Positive Go duration for a Poppler render operation. |
 | `MODEL_TIMEOUT` | `3m` | Positive Go duration for each AI HTTP request. |
+| `PAPERLESS_AI_WEBHOOK_TIMEOUT` | `30s` | Positive Go duration for the downstream Paperless AI webhook request. |
 | `DOCUMENT_DEADLINE` | `6h` | Positive Go duration for one claimed document attempt. |
 | `TEMPORARY_RENDER_BUDGET` | `1GiB` | Positive integer plus `B`, `KiB`, `MiB`, or `GiB`. |
 

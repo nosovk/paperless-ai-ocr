@@ -56,6 +56,57 @@ func TestNewServiceWithOptionsUsesCompositionSeams(t *testing.T) {
 	}
 }
 
+func TestNewServiceUsesPaperlessAIWebhookTimeout(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	webhook := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(requestStarted)
+		<-releaseRequest
+	}))
+	defer webhook.Close()
+	defer close(releaseRequest)
+
+	endpoint, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		PaperlessURL: endpoint, PaperlessAPIToken: "paperless-token",
+		AIBaseURL: endpoint, AIAPIKey: "ai-key", AIModel: "model",
+		WebhookToken: "webhook-token", PaperlessAIWebhookURL: endpoint,
+		PaperlessAIWebhookKey: "paperless-ai-key", PaperlessAIWebhookTimeout: 20 * time.Millisecond,
+		RenderDPI: 72, BatchSize: 5, ModelAttempts: 1, RenderTimeout: time.Second,
+		ModelTimeout: time.Second, DocumentDeadline: time.Minute, TemporaryRenderBudget: 1 << 20,
+	}
+	service, err := NewServiceWithOptions(cfg, server.NewReadiness(), observability.NewMetrics(), ServiceOptions{
+		DatabasePath: filepath.Join(t.TempDir(), "timeout.db"),
+	})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	defer service.Runtime.Close()
+
+	dispatchDone := make(chan error, 1)
+	go func() {
+		dispatchDone <- service.Runtime.(*serviceRuntime).dispatcher.Dispatch(context.Background(), 1)
+	}()
+	select {
+	case <-requestStarted:
+	case err := <-dispatchDone:
+		t.Fatalf("Dispatch() completed before request started: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("Dispatch() did not start request")
+	}
+	select {
+	case err := <-dispatchDone:
+		if err == nil {
+			t.Fatal("Dispatch() error = nil, want timeout")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Dispatch() did not use configured timeout")
+	}
+}
+
 func TestRunStartupOrderAndReadiness(t *testing.T) {
 	readiness := server.NewReadiness()
 	initialize := make(chan struct{})

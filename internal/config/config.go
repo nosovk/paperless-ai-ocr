@@ -13,42 +13,44 @@ import (
 )
 
 const (
-	defaultHTTPPort              = 8080
-	defaultPollInterval          = 15 * time.Minute
-	defaultRenderDPI             = 200
-	defaultBatchSize             = 5
-	defaultModelAttempts         = 3
-	maximumModelAttempts         = 10
-	defaultRenderTimeout         = 5 * time.Minute
-	defaultModelTimeout          = 3 * time.Minute
-	defaultDocumentDeadline      = 6 * time.Hour
-	defaultTemporaryRenderBudget = int64(1 << 30)
-	fixedActiveDocuments         = 1
-	fixedActiveModelRequests     = 1
+	defaultHTTPPort                  = 8080
+	defaultPollInterval              = 15 * time.Minute
+	defaultRenderDPI                 = 200
+	defaultBatchSize                 = 5
+	defaultModelAttempts             = 3
+	maximumModelAttempts             = 10
+	defaultRenderTimeout             = 5 * time.Minute
+	defaultModelTimeout              = 3 * time.Minute
+	defaultPaperlessAIWebhookTimeout = 30 * time.Second
+	defaultDocumentDeadline          = 6 * time.Hour
+	defaultTemporaryRenderBudget     = int64(1 << 30)
+	fixedActiveDocuments             = 1
+	fixedActiveModelRequests         = 1
 )
 
 // Config is the validated runtime configuration. Concurrency is intentionally
 // fixed at one and cannot be changed through the environment.
 type Config struct {
-	PaperlessURL          *url.URL
-	PaperlessAPIToken     string
-	AIBaseURL             *url.URL
-	AIAPIKey              string
-	AIModel               string
-	WebhookToken          string
-	PaperlessAIWebhookURL *url.URL
-	PaperlessAIWebhookKey string
-	HTTPPort              int
-	PollInterval          time.Duration
-	RenderDPI             int
-	BatchSize             int
-	ModelAttempts         int
-	RenderTimeout         time.Duration
-	ModelTimeout          time.Duration
-	DocumentDeadline      time.Duration
-	TemporaryRenderBudget int64
-	ActiveDocuments       int
-	ActiveModelRequests   int
+	PaperlessURL              *url.URL
+	PaperlessAPIToken         string
+	AIBaseURL                 *url.URL
+	AIAPIKey                  string
+	AIModel                   string
+	WebhookToken              string
+	PaperlessAIWebhookURL     *url.URL
+	PaperlessAIWebhookKey     string
+	HTTPPort                  int
+	PollInterval              time.Duration
+	RenderDPI                 int
+	BatchSize                 int
+	ModelAttempts             int
+	RenderTimeout             time.Duration
+	ModelTimeout              time.Duration
+	PaperlessAIWebhookTimeout time.Duration
+	DocumentDeadline          time.Duration
+	TemporaryRenderBudget     int64
+	ActiveDocuments           int
+	ActiveModelRequests       int
 }
 
 // Load reads configuration from environment variables. Byte sizes use a
@@ -115,6 +117,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	paperlessAIWebhookTimeout, err := positiveDuration("PAPERLESS_AI_WEBHOOK_TIMEOUT", defaultPaperlessAIWebhookTimeout)
+	if err != nil {
+		return Config{}, err
+	}
 	documentDeadline, err := positiveDuration("DOCUMENT_DEADLINE", defaultDocumentDeadline)
 	if err != nil {
 		return Config{}, err
@@ -125,25 +131,26 @@ func Load() (Config, error) {
 	}
 
 	return Config{
-		PaperlessURL:          paperlessURL,
-		PaperlessAPIToken:     paperlessAPIToken,
-		AIBaseURL:             aiBaseURL,
-		AIAPIKey:              aiAPIKey,
-		AIModel:               aiModel,
-		WebhookToken:          webhookToken,
-		PaperlessAIWebhookURL: paperlessAIWebhookURL,
-		PaperlessAIWebhookKey: paperlessAIWebhookKey,
-		HTTPPort:              httpPort,
-		PollInterval:          pollInterval,
-		RenderDPI:             renderDPI,
-		BatchSize:             batchSize,
-		ModelAttempts:         modelAttempts,
-		RenderTimeout:         renderTimeout,
-		ModelTimeout:          modelTimeout,
-		DocumentDeadline:      documentDeadline,
-		TemporaryRenderBudget: temporaryRenderBudget,
-		ActiveDocuments:       fixedActiveDocuments,
-		ActiveModelRequests:   fixedActiveModelRequests,
+		PaperlessURL:              paperlessURL,
+		PaperlessAPIToken:         paperlessAPIToken,
+		AIBaseURL:                 aiBaseURL,
+		AIAPIKey:                  aiAPIKey,
+		AIModel:                   aiModel,
+		WebhookToken:              webhookToken,
+		PaperlessAIWebhookURL:     paperlessAIWebhookURL,
+		PaperlessAIWebhookKey:     paperlessAIWebhookKey,
+		HTTPPort:                  httpPort,
+		PollInterval:              pollInterval,
+		RenderDPI:                 renderDPI,
+		BatchSize:                 batchSize,
+		ModelAttempts:             modelAttempts,
+		RenderTimeout:             renderTimeout,
+		ModelTimeout:              modelTimeout,
+		PaperlessAIWebhookTimeout: paperlessAIWebhookTimeout,
+		DocumentDeadline:          documentDeadline,
+		TemporaryRenderBudget:     temporaryRenderBudget,
+		ActiveDocuments:           fixedActiveDocuments,
+		ActiveModelRequests:       fixedActiveModelRequests,
 	}, nil
 }
 

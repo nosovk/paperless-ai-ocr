@@ -28,6 +28,7 @@ var optionalEnvironment = []string{
 	"MODEL_ATTEMPTS",
 	"RENDER_TIMEOUT",
 	"MODEL_TIMEOUT",
+	"PAPERLESS_AI_WEBHOOK_TIMEOUT",
 	"DOCUMENT_DEADLINE",
 	"TEMPORARY_RENDER_BUDGET",
 }
@@ -89,6 +90,9 @@ func TestLoadDefaults(t *testing.T) {
 	if got, want := config.ModelTimeout, 3*time.Minute; got != want {
 		t.Errorf("ModelTimeout = %s, want %s", got, want)
 	}
+	if got, want := config.PaperlessAIWebhookTimeout, 30*time.Second; got != want {
+		t.Errorf("PaperlessAIWebhookTimeout = %s, want %s", got, want)
+	}
 	if got, want := config.DocumentDeadline, 6*time.Hour; got != want {
 		t.Errorf("DocumentDeadline = %s, want %s", got, want)
 	}
@@ -138,15 +142,16 @@ func TestLoadParsesRequiredValues(t *testing.T) {
 func TestLoadOverridesDefaults(t *testing.T) {
 	setValidEnvironment(t)
 	overrides := map[string]string{
-		"HTTP_PORT":               "9090",
-		"POLL_INTERVAL":           "30m",
-		"RENDER_DPI":              "300",
-		"BATCH_SIZE":              "4",
-		"MODEL_ATTEMPTS":          "4",
-		"RENDER_TIMEOUT":          "90s",
-		"MODEL_TIMEOUT":           "2m30s",
-		"DOCUMENT_DEADLINE":       "90m",
-		"TEMPORARY_RENDER_BUDGET": "1536MiB",
+		"HTTP_PORT":                    "9090",
+		"POLL_INTERVAL":                "30m",
+		"RENDER_DPI":                   "300",
+		"BATCH_SIZE":                   "4",
+		"MODEL_ATTEMPTS":               "4",
+		"RENDER_TIMEOUT":               "90s",
+		"MODEL_TIMEOUT":                "2m30s",
+		"PAPERLESS_AI_WEBHOOK_TIMEOUT": "45s",
+		"DOCUMENT_DEADLINE":            "90m",
+		"TEMPORARY_RENDER_BUDGET":      "1536MiB",
 	}
 	for name, value := range overrides {
 		t.Setenv(name, value)
@@ -177,6 +182,9 @@ func TestLoadOverridesDefaults(t *testing.T) {
 	}
 	if got, want := config.ModelTimeout, 150*time.Second; got != want {
 		t.Errorf("ModelTimeout = %s, want %s", got, want)
+	}
+	if got, want := config.PaperlessAIWebhookTimeout, 45*time.Second; got != want {
+		t.Errorf("PaperlessAIWebhookTimeout = %s, want %s", got, want)
 	}
 	if got, want := config.DocumentDeadline, 90*time.Minute; got != want {
 		t.Errorf("DocumentDeadline = %s, want %s", got, want)
@@ -247,6 +255,7 @@ func TestLoadRejectsInvalidDurations(t *testing.T) {
 		{name: "POLL_INTERVAL", value: "0s"},
 		{name: "RENDER_TIMEOUT", value: "-1s"},
 		{name: "MODEL_TIMEOUT", value: "999999999999999999999h"},
+		{name: "PAPERLESS_AI_WEBHOOK_TIMEOUT", value: "0s"},
 		{name: "DOCUMENT_DEADLINE", value: "0"},
 	}
 

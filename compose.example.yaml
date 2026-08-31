@@ -11,6 +11,7 @@ services:
       WEBHOOK_TOKEN: ${WEBHOOK_TOKEN:?set WEBHOOK_TOKEN}
       PAPERLESS_AI_WEBHOOK_URL: http://paperless-ai:3000/api/webhook/manual
       PAPERLESS_AI_WEBHOOK_KEY: ${PAPERLESS_AI_WEBHOOK_KEY:?set PAPERLESS_AI_WEBHOOK_KEY}
+      PAPERLESS_AI_WEBHOOK_TIMEOUT: ${PAPERLESS_AI_WEBHOOK_TIMEOUT:-30s}
     volumes:
       - paperless-ai-ocr-data:/app/data
     tmpfs:

@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.1] - 2026-09-01
+
+### Added
+
+- Optional `PAPERLESS_AI_WEBHOOK_TIMEOUT` configuration for long-running
+  downstream Paperless AI requests, retaining the existing 30-second default.
+
 ## [0.1.0] - 2026-08-31
 
 First stable release.
