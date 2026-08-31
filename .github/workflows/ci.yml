@@ -29,8 +29,11 @@ jobs:
           go-version-file: go.mod
       - name: Install Poppler and process utilities
         run: sudo apt-get update && sudo apt-get install --yes poppler-utils util-linux
+      - name: Install pinned actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: Validate workflow policy
         run: |
+          actionlint .github/workflows/ci.yml .github/workflows/release.yml
           python3 scripts/workflow-policy-test.py
           python3 scripts/workflow-policy-regression-test.py
           bash scripts/release-metadata-test.sh
@@ -120,7 +123,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install pinned govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
+        run: go install golang.org/x/vuln/cmd/govulncheck@"${GOVULNCHECK_VERSION}"
       - name: Run govulncheck
         run: govulncheck ./...
 

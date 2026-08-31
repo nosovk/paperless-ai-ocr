@@ -254,6 +254,7 @@ def assert_required_step(step: Block, command: str, message: str) -> None:
     values = step.values()
     require("if" not in values, f"{step.header} must not be conditional")
     require("continue-on-error" not in values, f"{step.header} must fail closed")
+    require("shell" not in values, f"{step.header} must use the default fail-closed shell")
 
 
 def block_scalar_commands(step: Block, key: str) -> tuple[str, ...]:
@@ -521,7 +522,27 @@ def assert_ci(workflow: Workflow) -> None:
         require("timeout-minutes:" in job.text, f"CI job {job.header!r} must have a timeout")
 
     test_steps = named_steps(jobs["test"])
-    policy = test_steps["Validate workflow policy"].text
+    assert_required_step(
+        test_steps["Install pinned actionlint"],
+        "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12",
+        "CI actionlint install must be pinned",
+    )
+    policy_step = test_steps["Validate workflow policy"]
+    policy = policy_step.text
+    require("if" not in policy_step.values(), "CI workflow policy validation must not be conditional")
+    require("continue-on-error" not in policy_step.values(), "CI workflow policy validation must fail closed")
+    require("shell" not in policy_step.values(), "CI workflow policy validation must use the default fail-closed shell")
+    require(
+        block_scalar_commands(policy_step, "run")
+        == (
+            "actionlint .github/workflows/ci.yml .github/workflows/release.yml",
+            "python3 scripts/workflow-policy-test.py",
+            "python3 scripts/workflow-policy-regression-test.py",
+            "bash scripts/release-metadata-test.sh",
+            "bash scripts/release-state-test.sh",
+        ),
+        "CI workflow policy commands must be exact",
+    )
     require("python3 scripts/workflow-policy-test.py" in policy, "CI must run workflow policy validation")
     require("python3 scripts/workflow-policy-regression-test.py" in policy, "CI must run policy mutation tests")
     require("bash scripts/release-metadata-test.sh" in policy, "CI must test release metadata validation")
@@ -554,7 +575,7 @@ def assert_ci(workflow: Workflow) -> None:
         "CI acceptance tests must use the controlled script",
     )
     vulnerability_steps = named_steps(jobs["vulnerability-scan"])
-    require("go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" in vulnerability_steps["Install pinned govulncheck"].text, "CI govulncheck install must be pinned")
+    require('go install golang.org/x/vuln/cmd/govulncheck@"${GOVULNCHECK_VERSION}"' in vulnerability_steps["Install pinned govulncheck"].text, "CI govulncheck install must be pinned")
     require("govulncheck ./..." in vulnerability_steps["Run govulncheck"].text, "CI vulnerability scan missing")
     docker = named_steps(jobs["docker-build"])["Build linux/amd64 image"].text
     require("platforms: linux/amd64" in docker and "push: false" in docker, "CI Docker build policy is invalid")
@@ -622,8 +643,8 @@ def assert_release(workflow: Workflow) -> None:
     require("golangci/golangci-lint-action" in lint.text, "verify lint step missing")
     require(lint.child("with").values() == {"version": "v2.13.2"}, "verify golangci-lint version must be v2.13.2")
     install = verify_steps["Install pinned verification tools"].text
-    require("actionlint/cmd/actionlint@${ACTIONLINT_VERSION}" in install, "actionlint install must be pinned")
-    require("govulncheck@${GOVULNCHECK_VERSION}" in install, "govulncheck install must be pinned")
+    require('actionlint/cmd/actionlint@"${ACTIONLINT_VERSION}"' in install, "actionlint install must be pinned")
+    require('govulncheck@"${GOVULNCHECK_VERSION}"' in install, "govulncheck install must be pinned")
     verify_build = verify_steps["Cross-build release image"].text
     require("platforms: linux/amd64,linux/arm64" in verify_build and "push: false" in verify_build, "verify must cross-build without pushing")
     assert_qemu_before_buildx(verify)

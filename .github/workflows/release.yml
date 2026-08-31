@@ -35,8 +35,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes poppler-utils util-linux
       - name: Install pinned verification tools
         run: |
-          go install github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}
-          go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
+          go install github.com/rhysd/actionlint/cmd/actionlint@"${ACTIONLINT_VERSION}"
+          go install golang.org/x/vuln/cmd/govulncheck@"${GOVULNCHECK_VERSION}"
       - name: Validate release tag and metadata
         id: release-metadata
         run: bash scripts/release-metadata.sh
@@ -216,7 +216,7 @@ jobs:
         run: |
           {
             printf '## Published image\n\n'
-            printf '`%s@%s`\n\n' "$IMAGE" "$DIGEST"
+            printf '\x60%s@%s\x60\n\n' "$IMAGE" "$DIGEST"
             if [[ $PUBLISH == true ]]; then
               printf '[GitHub provenance attestation](%s)\n\n' "$ATTESTATION_URL"
             else

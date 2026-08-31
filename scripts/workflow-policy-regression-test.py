@@ -428,6 +428,18 @@ def mutate_actionlint_version(text: str) -> str:
     return text.replace("ACTIONLINT_VERSION: v1.7.12", "ACTIONLINT_VERSION: latest", 1)
 
 
+def mutate_ci_actionlint_version(text: str) -> str:
+    return text.replace("actionlint/cmd/actionlint@v1.7.12", "actionlint/cmd/actionlint@latest", 1)
+
+
+def mutate_bypass_ci_actionlint(text: str) -> str:
+    return text.replace(
+        "          actionlint .github/workflows/ci.yml .github/workflows/release.yml\n",
+        "          actionlint .github/workflows/ci.yml .github/workflows/release.yml || true\n",
+        1,
+    )
+
+
 def mutate_golangci_version(text: str) -> str:
     return text.replace("          version: v2.13.2", "          version: latest", 1)
 
@@ -916,6 +928,14 @@ def main() -> None:
             run_mutant("permissive release tag regex", "scripts/release-metadata.sh", mutate_permissive_tag_regex, ref),
             run_mutant("wall-clock release timestamp", "scripts/release-metadata.sh", mutate_wall_clock_created, ref),
             run_mutant("unpinned CI govulncheck", ".github/workflows/ci.yml", mutate_govulncheck_version, ref),
+            run_mutant("unpinned CI actionlint", ".github/workflows/ci.yml", mutate_ci_actionlint_version, ref),
+            run_mutant("disabled CI actionlint install", ".github/workflows/ci.yml", lambda text: mutate_step_attribute(text, "Install pinned actionlint", "if: false"), ref),
+            run_mutant("allowed CI actionlint install failure", ".github/workflows/ci.yml", lambda text: mutate_step_attribute(text, "Install pinned actionlint", "continue-on-error: true"), ref),
+            run_mutant("masked CI actionlint install shell", ".github/workflows/ci.yml", lambda text: mutate_step_attribute(text, "Install pinned actionlint", "shell: bash {0} || true"), ref),
+            run_mutant("bypassed CI actionlint", ".github/workflows/ci.yml", mutate_bypass_ci_actionlint, ref),
+            run_mutant("disabled CI policy validation", ".github/workflows/ci.yml", lambda text: mutate_step_attribute(text, "Validate workflow policy", "if: false"), ref),
+            run_mutant("allowed CI policy validation failure", ".github/workflows/ci.yml", lambda text: mutate_step_attribute(text, "Validate workflow policy", "continue-on-error: true"), ref),
+            run_mutant("masked CI policy validation shell", ".github/workflows/ci.yml", lambda text: mutate_step_attribute(text, "Validate workflow policy", "shell: bash {0} || true"), ref),
             run_mutant("missing CI acceptance job", ".github/workflows/ci.yml", mutate_remove_acceptance_job, ref),
             run_mutant("bypassed CI acceptance", ".github/workflows/ci.yml", mutate_bypass_acceptance, ref),
             run_mutant("unpinned markdownlint dependency", "package.json", mutate_markdownlint_version, ref),
