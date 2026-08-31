@@ -92,6 +92,22 @@ jobs:
       - name: Run race tests
         run: go test -race ./...
 
+  acceptance:
+    name: End-to-end acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install Poppler
+        run: sudo apt-get update && sudo apt-get install --yes poppler-utils
+      - name: Run acceptance tests
+        run: bash scripts/acceptance.sh
+
   vulnerability-scan:
     name: Vulnerability scan
     runs-on: ubuntu-latest

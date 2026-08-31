@@ -261,6 +261,9 @@ func TestProcessDownstreamFailureResumesWithoutRepeatingConfirmedEffects(t *test
 
 	err := fixture.finalizer.Process(context.Background(), fixture.job, fixture.result)
 	assertSafeError(t, err, saferr.CategoryProvider)
+	if got, want := fixture.store.retryAt, finalizerNow.Add(time.Minute); !got.Equal(want) {
+		t.Errorf("retry schedule = %s, want %s", got, want)
+	}
 	want := []string{"renew", "stage", "renew", "get-document", "dispatch:reserved", "renew", "dispatch", "dispatch:none", "retry"}
 	if !slices.Equal(fixture.trace.snapshot(), want) {
 		t.Errorf("first trace = %q, want %q", fixture.trace.snapshot(), want)
@@ -592,6 +595,7 @@ type fakeStore struct {
 	terminalMu          sync.Mutex
 	terminalActive      bool
 	renewDuringTerminal bool
+	retryAt             time.Time
 }
 
 func (store *fakeStore) RenewLeaseContext(context.Context, int64, int, string, time.Duration) error {
@@ -672,8 +676,9 @@ func (store *fakeStore) blockTerminal() {
 	store.terminalMu.Unlock()
 }
 
-func (store *fakeStore) ScheduleRetryContext(context.Context, int64, int, string, time.Time, queue.SafeDiagnostic) error {
+func (store *fakeStore) ScheduleRetryContext(_ context.Context, _ int64, _ int, _ string, retryAt time.Time, _ queue.SafeDiagnostic) error {
 	store.trace.add("retry")
+	store.retryAt = retryAt
 	return nil
 }
 

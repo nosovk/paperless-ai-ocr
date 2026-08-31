@@ -76,6 +76,7 @@ type Options struct {
 	Inspector        Inspector
 	Renderer         Renderer
 	Model            string
+	PromptVersion    string
 	BatchSize        int
 	RenderDPI        int
 	ModelAttempts    int
@@ -122,6 +123,9 @@ func New(options Options) (*Worker, error) {
 		strings.TrimSpace(options.Model) == "" || options.BatchSize < 1 || options.BatchSize > 5 || options.RenderDPI <= 0 ||
 		options.Capability != aigate.DirectPDF && options.Capability != aigate.PageImages {
 		return nil, saferr.New(saferr.CategoryConfiguration, "invalid worker configuration")
+	}
+	if strings.TrimSpace(options.PromptVersion) == "" {
+		options.PromptVersion = ocr.Version
 	}
 	if options.ModelAttempts == 0 {
 		options.ModelAttempts = defaultModelAttempts
@@ -244,7 +248,7 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 	if ctx == nil || job.ID <= 0 || job.DocumentID <= 0 || job.Attempts <= 0 || job.State != queue.StateProcessing || strings.TrimSpace(job.LeaseOwner) == "" {
 		return Result{}, saferr.New(saferr.CategoryValidation, "invalid claimed job")
 	}
-	if job.Model != worker.options.Model || job.PromptVersion != ocr.Version {
+	if job.Model != worker.options.Model || job.PromptVersion != worker.options.PromptVersion {
 		return Result{}, saferr.New(saferr.CategoryValidation, "job processing contract does not match worker")
 	}
 	if diagnostic, found, err := worker.options.Store.TerminalFailureContext(ctx, job.ID, job.Attempts, job.LeaseOwner); err != nil {

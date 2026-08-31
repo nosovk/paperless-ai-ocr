@@ -8,12 +8,15 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/nosovk/paperless-ai-ocr/internal/config"
 	"github.com/nosovk/paperless-ai-ocr/internal/observability"
 	"github.com/nosovk/paperless-ai-ocr/internal/queue"
 	"github.com/nosovk/paperless-ai-ocr/internal/reconcile"
@@ -22,6 +25,36 @@ import (
 	"github.com/nosovk/paperless-ai-ocr/internal/server"
 	"github.com/nosovk/paperless-ai-ocr/internal/worker"
 )
+
+func TestNewServiceWithOptionsUsesCompositionSeams(t *testing.T) {
+	endpoint, err := url.Parse("http://127.0.0.1:1/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		PaperlessURL: endpoint, PaperlessAPIToken: "paperless-token",
+		AIBaseURL: endpoint, AIAPIKey: "ai-key", AIModel: "model",
+		WebhookToken: "webhook-token", PaperlessAIWebhookURL: endpoint,
+		PaperlessAIWebhookKey: "paperless-ai-key", RenderDPI: 72, BatchSize: 5,
+		ModelAttempts: 1, RenderTimeout: time.Second, ModelTimeout: time.Second,
+		DocumentDeadline: time.Minute, TemporaryRenderBudget: 1 << 20,
+	}
+	databasePath := filepath.Join(t.TempDir(), "acceptance.db")
+	service, err := NewServiceWithOptions(cfg, server.NewReadiness(), observability.NewMetrics(), ServiceOptions{
+		DatabasePath:  databasePath,
+		RetryDelay:    10 * time.Millisecond,
+		PromptVersion: "acceptance-v2",
+	})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	if err := service.Runtime.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := NewServiceWithOptions(cfg, server.NewReadiness(), observability.NewMetrics(), ServiceOptions{RetryDelay: -time.Second}); err == nil {
+		t.Fatal("NewServiceWithOptions() error = nil for negative retry delay")
+	}
+}
 
 func TestRunStartupOrderAndReadiness(t *testing.T) {
 	readiness := server.NewReadiness()

@@ -96,6 +96,16 @@ example, an ambiguous Paperless AI dispatch can fail the queue job after content
 replacement while leaving `ai-ocr-complete` present and without adding
 `ai-ocr-failed`.
 
+A received Paperless AI HTTP `503` is the only downstream response classified
+as retry-safe. The service preserves completed OCR and finalization checkpoints,
+then schedules another durable queue attempt after the retry delay, one minute
+by default. Only dispatch repeats when that attempt becomes due. This is an
+operator-selected pre-admission assumption, not behavior guaranteed by Paperless
+AI 3.0.9. If Paperless AI returns `503` after applying metadata, the retry can
+duplicate metadata processing. HTTP `429`, `409`, `500`, `502`, `504`, other
+statuses, redirects, timeouts, malformed behavior, and transport errors remain
+ambiguous terminal outcomes.
+
 ## Manual Retry
 
 There is no public manual retry CLI or API. An internal queue method is not a

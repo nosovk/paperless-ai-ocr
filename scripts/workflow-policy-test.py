@@ -514,7 +514,7 @@ def assert_ci(workflow: Workflow) -> None:
         "CI tool versions must be exactly pinned",
     )
     jobs = workflow.jobs()
-    require(jobs.keys() == {"test", "lint", "race", "vulnerability-scan", "docker-build"}, "unexpected CI job set")
+    require(jobs.keys() == {"test", "lint", "race", "acceptance", "vulnerability-scan", "docker-build"}, "unexpected CI job set")
     for job in jobs.values():
         if "permissions:" in job.text:
             require(permissions(job) == {"contents": "read"}, f"CI job {job.header!r} may only read contents")
@@ -546,6 +546,13 @@ def assert_ci(workflow: Workflow) -> None:
     require("go test ./..." in test_steps["Unit tests"].text, "CI unit test step missing")
     require("TestInspectRealPDFs|TestRenderRealPDFOnePage|TestRenderRealPDFRangeAndSequentialReuse" in test_steps["Run real Poppler tests explicitly"].text, "CI explicit Poppler tests missing")
     require("go test -race ./..." in named_steps(jobs["race"])["Run race tests"].text, "CI race tests missing")
+    acceptance_steps = named_steps(jobs["acceptance"])
+    require("poppler-utils" in acceptance_steps["Install Poppler"].text, "CI acceptance job must install Poppler")
+    assert_required_step(
+        acceptance_steps["Run acceptance tests"],
+        "bash scripts/acceptance.sh",
+        "CI acceptance tests must use the controlled script",
+    )
     vulnerability_steps = named_steps(jobs["vulnerability-scan"])
     require("go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" in vulnerability_steps["Install pinned govulncheck"].text, "CI govulncheck install must be pinned")
     require("govulncheck ./..." in vulnerability_steps["Run govulncheck"].text, "CI vulnerability scan missing")

@@ -49,6 +49,9 @@ func (err *StatusError) Error() string {
 	return fmt.Sprintf("paperless AI dispatch returned HTTP status %d", err.StatusCode)
 }
 
+// RetrySafe reports the operator-selected pre-admission response.
+func (err *StatusError) RetrySafe() bool { return err.StatusCode == http.StatusServiceUnavailable }
+
 func (err *StatusError) Format(state fmt.State, verb rune) {
 	switch verb {
 	case 's', 'v':

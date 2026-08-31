@@ -24,6 +24,11 @@ apply an IP-address denylist.
 Use distinct, least-privilege credentials. Supply secrets through the deployment
 platform without printing resolved environment values.
 
+`PAPERLESS_AI_WEBHOOK_URL` must point to an endpoint where the operator accepts
+HTTP `503` as a pre-admission rejection. This is not guaranteed by Paperless AI
+3.0.9; a `503` emitted after a side effect can cause duplicate metadata
+processing when the service retries dispatch.
+
 ## Optional Variables
 
 | Variable | Default | Validation and effect |

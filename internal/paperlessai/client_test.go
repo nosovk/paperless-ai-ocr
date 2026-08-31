@@ -164,13 +164,27 @@ func TestDispatchStatusErrorRetainsOnlySafeStatus(t *testing.T) {
 	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("errors.As(*StatusError) = false: %v", err)
 	}
-	if classified, ok := any(statusErr).(interface{ RetrySafe() bool }); ok {
-		t.Errorf("StatusError unexpectedly classifies retry safety as %t", classified.RetrySafe())
+	if !statusErr.RetrySafe() {
+		t.Error("StatusError.RetrySafe() = false, want true for HTTP 503")
 	}
 	if unwrapped := errors.Unwrap(statusErr); unwrapped != nil {
 		t.Errorf("errors.Unwrap(StatusError) = %v, want nil", unwrapped)
 	}
 	assertRedacted(t, err, server.URL, "secret-endpoint", "paperless.example", "987654", "canary private response body")
+}
+
+func TestStatusErrorRetrySafeOnlyForServiceUnavailable(t *testing.T) {
+	for _, statusCode := range []int{
+		http.StatusConflict,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusGatewayTimeout,
+	} {
+		if (&StatusError{StatusCode: statusCode}).RetrySafe() {
+			t.Errorf("StatusError{StatusCode: %d}.RetrySafe() = true, want false", statusCode)
+		}
+	}
 }
 
 func TestNewRejectsMalformedConfiguration(t *testing.T) {

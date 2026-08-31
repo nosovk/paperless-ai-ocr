@@ -85,28 +85,54 @@ type Service struct {
 	Handler http.Handler
 }
 
+// ServiceOptions configures production composition. Zero values select the
+// same defaults used by NewService.
+type ServiceOptions struct {
+	DatabasePath  string
+	RetryDelay    time.Duration
+	PromptVersion string
+}
+
 type serviceRuntime struct {
-	db         *sql.DB
-	queue      *queue.Queue
-	paperless  *paperless.Client
-	ai         *aigate.Client
-	dispatcher *paperlessai.Client
-	reconciler *reconcile.Reconciler
-	config     config.Config
-	owner      string
-	capability aigate.Capability
-	worker     *worker.Worker
-	finalizer  *finalize.Finalizer
-	metrics    *observability.Metrics
-	cancel     context.CancelCauseFunc
+	db            *sql.DB
+	queue         *queue.Queue
+	paperless     *paperless.Client
+	ai            *aigate.Client
+	dispatcher    *paperlessai.Client
+	reconciler    *reconcile.Reconciler
+	config        config.Config
+	owner         string
+	capability    aigate.Capability
+	worker        *worker.Worker
+	finalizer     *finalize.Finalizer
+	metrics       *observability.Metrics
+	cancel        context.CancelCauseFunc
+	retryDelay    time.Duration
+	promptVersion string
 }
 
 // NewService opens durable state and constructs concrete runtime dependencies.
 func NewService(cfg config.Config, readiness *server.Readiness, metrics *observability.Metrics) (*Service, error) {
+	return NewServiceWithOptions(cfg, readiness, metrics, ServiceOptions{})
+}
+
+// NewServiceWithOptions opens durable state with explicit composition options.
+func NewServiceWithOptions(cfg config.Config, readiness *server.Readiness, metrics *observability.Metrics, options ServiceOptions) (*Service, error) {
 	if readiness == nil || metrics == nil {
 		return nil, saferr.New(saferr.CategoryConfiguration, "invalid application configuration")
 	}
-	db, err := database.Open(filepath.Clean(defaultDatabasePath))
+	if options.RetryDelay < 0 {
+		return nil, saferr.New(saferr.CategoryConfiguration, "invalid application configuration")
+	}
+	databasePath := options.DatabasePath
+	if strings.TrimSpace(databasePath) == "" {
+		databasePath = defaultDatabasePath
+	}
+	promptVersion := options.PromptVersion
+	if strings.TrimSpace(promptVersion) == "" {
+		promptVersion = ocr.Version
+	}
+	db, err := database.Open(filepath.Clean(databasePath))
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +153,7 @@ func NewService(cfg config.Config, readiness *server.Readiness, metrics *observa
 		cleanup()
 		return nil, err
 	}
-	reconciler, err := reconcile.New(db, paperlessClient, q, reconcile.Options{Model: cfg.AIModel, PromptVersion: ocr.Version})
+	reconciler, err := reconcile.New(db, paperlessClient, q, reconcile.Options{Model: cfg.AIModel, PromptVersion: promptVersion})
 	if err != nil {
 		cleanup()
 		return nil, err
@@ -139,7 +165,8 @@ func NewService(cfg config.Config, readiness *server.Readiness, metrics *observa
 	}
 	_, cancel := context.WithCancelCause(context.Background())
 	runtime := &serviceRuntime{db: db, queue: q, paperless: paperlessClient, ai: aiClient,
-		dispatcher: dispatcher, reconciler: reconciler, config: cfg, owner: owner, metrics: metrics, cancel: cancel}
+		dispatcher: dispatcher, reconciler: reconciler, config: cfg, owner: owner, metrics: metrics, cancel: cancel,
+		retryDelay: options.RetryDelay, promptVersion: promptVersion}
 	webhook, err := server.New(cfg.WebhookToken, q)
 	if err != nil {
 		cleanup()
@@ -184,6 +211,7 @@ func (runtime *serviceRuntime) Initialize(context.Context) error {
 		Inspector: inspector, Renderer: renderer, Model: runtime.config.AIModel, BatchSize: runtime.config.BatchSize,
 		RenderDPI: runtime.config.RenderDPI, ModelAttempts: runtime.config.ModelAttempts,
 		LeaseDuration: leaseDuration, DocumentDeadline: runtime.config.DocumentDeadline,
+		RetryDelay: runtime.retryDelay, PromptVersion: runtime.promptVersion,
 		ObserveProviderAttempt: observers.providerAttempt,
 		ObserveProcessedPages:  observers.processedPages,
 		ObserveRenderedBytes:   observers.renderedBytes,
@@ -193,6 +221,7 @@ func (runtime *serviceRuntime) Initialize(context.Context) error {
 	}
 	runtime.finalizer, err = finalize.New(finalize.Options{
 		Store: runtime.queue, Paperless: runtime.paperless, Dispatcher: runtime.dispatcher, LeaseDuration: leaseDuration,
+		RetryDelay: runtime.retryDelay,
 	})
 	return err
 }

@@ -35,8 +35,12 @@ operator decisions.
 ### Paperless AI
 
 After successful replacement, the service sends a Paperless document URL and an
-API key. Only HTTP `202` confirms success. Ambiguous outcomes are not retried
-automatically to reduce duplicate effects.
+API key. HTTP `202` confirms success. A received HTTP `503` is treated as a
+retry-safe pre-admission rejection; all other non-`202` and transport outcomes
+remain ambiguous and are not retried automatically. The `503` rule is an
+operator-selected assumption, not an upstream Paperless AI 3.0.9 guarantee. If
+upstream returns `503` after a side effect, retry can duplicate metadata
+processing.
 
 ### Poppler
 
@@ -85,7 +89,7 @@ and GHCR access remain trusted infrastructure.
 | Malicious provider output | Response size bounds, exact schema and page validation, atomic finalization. |
 | Stale overwrite | Paperless checksum checks before OCR and finalization. |
 | Partial transcription | Durable batch checkpoints; content replacement only after complete validation. |
-| Duplicate downstream effects | Durable finalization and dispatch reservation; ambiguous dispatch is not repeated. |
+| Duplicate downstream effects | Durable finalization and dispatch reservation; ambiguous dispatch is not repeated. The operator-selected HTTP `503` retry exception can duplicate effects if upstream returns `503` after admission. |
 | PDF resource exhaustion | 10,000-page limit, render timeout, post-render 8 MiB page validation and byte accounting, plus a separately bounded temporary filesystem. |
 | Data remanence | Temporary workspace cleanup; operator-enforced SQLite and backup retention. |
 | Supply-chain replacement | SHA-pinned actions, digest-pinned base images, policy mutation tests, release attestations. |

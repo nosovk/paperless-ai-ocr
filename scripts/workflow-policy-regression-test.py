@@ -154,6 +154,20 @@ def mutate_govulncheck_version(text: str) -> str:
     return text.replace("GOVULNCHECK_VERSION: v1.7.0", "GOVULNCHECK_VERSION: latest", 1)
 
 
+def mutate_remove_acceptance_job(text: str) -> str:
+    start = text.index("\n  acceptance:\n")
+    end = text.index("\n  vulnerability-scan:\n", start)
+    return text[:start] + text[end:]
+
+
+def mutate_bypass_acceptance(text: str) -> str:
+    return text.replace(
+        "      - name: Run acceptance tests\n        run: bash scripts/acceptance.sh\n",
+        "      - name: Run acceptance tests\n        if: false\n        run: bash scripts/acceptance.sh\n",
+        1,
+    )
+
+
 def mutate_markdownlint_version(text: str) -> str:
     return text.replace('"markdownlint-cli2": "0.23.2"', '"markdownlint-cli2": "latest"', 1)
 
@@ -902,6 +916,8 @@ def main() -> None:
             run_mutant("permissive release tag regex", "scripts/release-metadata.sh", mutate_permissive_tag_regex, ref),
             run_mutant("wall-clock release timestamp", "scripts/release-metadata.sh", mutate_wall_clock_created, ref),
             run_mutant("unpinned CI govulncheck", ".github/workflows/ci.yml", mutate_govulncheck_version, ref),
+            run_mutant("missing CI acceptance job", ".github/workflows/ci.yml", mutate_remove_acceptance_job, ref),
+            run_mutant("bypassed CI acceptance", ".github/workflows/ci.yml", mutate_bypass_acceptance, ref),
             run_mutant("unpinned markdownlint dependency", "package.json", mutate_markdownlint_version, ref),
             run_mutant("ranged markdown link checker dependency", "package.json", mutate_markdown_link_check_version, ref),
             run_mutant("missing node_modules markdownlint ignore", ".markdownlint-cli2.jsonc", mutate_remove_node_modules_markdownlint_ignore, ref),

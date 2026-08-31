@@ -34,9 +34,10 @@
    `document.content`.
 7. The finalizer adds `ai-ocr-complete`, removes `ai-ocr-failed`, and calls the
    configured Paperless AI webhook. The complete tag records committed validated
-   content, not downstream dispatch. Only HTTP `202` confirms dispatch, and an
-   ambiguous or non-`202` outcome can leave the complete tag present while the
-   queue job fails.
+   content, not downstream dispatch. HTTP `202` confirms dispatch. HTTP `503`
+   is treated as the one retry-safe pre-admission rejection; every other
+   non-`202` or transport outcome is ambiguous and can leave the complete tag
+   present while the queue job fails.
 
 Only complete validated output reaches Paperless. Temporary PDFs and images are
 created under `/tmp` and removed with the per-job workspace. Validated batch
@@ -86,12 +87,15 @@ There are three distinct layers:
    have separate handling and do not all enter this terminal path.
 
 Paperless AI dispatch has an additional duplicate-effect boundary. The runtime
-reserves dispatch before making the HTTP request. Its production
-`paperlessai.Client` does not return retry-safe errors, so every transport error
-or non-`202` response after reservation is an ambiguous terminal outcome and is
-not sent again. The internal finalizer protocol can reset a reservation if a
-future dispatcher explicitly supplies retry-safe classification, but that path
-is not reachable with the current production client.
+reserves dispatch before making the HTTP request. The production client treats
+only a received HTTP `503` as retry-safe and resets the reservation before the
+durable queue schedules another attempt after the retry delay, one minute by
+default. Completed OCR and finalization checkpoints are reused, so only dispatch
+repeats. Transport errors, timeouts, redirects, malformed responses,
+`4xx`, and every other `5xx` remain ambiguous terminal outcomes and are not sent
+again. This HTTP `503` classification is an operator-selected assumption, not a
+guarantee made by upstream Paperless AI 3.0.9. If upstream emits `503` after a
+side effect, retry can duplicate metadata processing.
 
 ## Startup And Readiness
 
