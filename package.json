@@ -1,0 +1,11 @@
+{
+  "name": "paperless-ai-ocr",
+  "private": true,
+  "engines": {
+    "node": "24.8.0"
+  },
+  "devDependencies": {
+    "markdown-link-check": "3.15.0",
+    "markdownlint-cli2": "0.23.2"
+  }
+}

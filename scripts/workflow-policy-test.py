@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ SHA = r"[0-9a-f]{40}"
 ALLOWED_ACTIONS = {
     "actions/checkout": ("3d3c42e5aac5ba805825da76410c181273ba90b1", "v7.0.1"),
     "actions/setup-go": ("b7ad1dad31e06c5925ef5d2fc7ad053ef454303e", "v7.0.0"),
+    "actions/setup-node": ("820762786026740c76f36085b0efc47a31fe5020", "v7.0.0"),
     "docker/setup-qemu-action": ("96fe6ef7f33517b61c61be40b68a1882f3264fb8", "v4.2.0"),
     "docker/setup-buildx-action": ("37fe631027851001ddb9b187196cc803df7f5f0e", "v4.3.0"),
     "docker/login-action": ("dbcb813823bdd20940b903addbd779551569679f", "v4.6.0"),
@@ -32,6 +34,26 @@ RELEASE_TAG_PATTERN = "readonly tag_pattern='^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)
 QEMU_IMAGE = "docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
 SAFE_GO_VERSION = "1.26.6"
 GO_BUILDER = "golang:1.26.6-alpine3.23@sha256:e57c41c1d5864341031181b0db34b9a537bb5773eb6428e4e5bdaea0f9135406"
+DOCUMENTATION_NODE_VERSION = "24.8.0"
+DOCUMENTATION_DEPENDENCIES = {
+    "markdown-link-check": "3.15.0",
+    "markdownlint-cli2": "0.23.2",
+}
+MARKDOWNLINT_CONFIG = {
+    "MD013": False,
+    "MD024": {"siblings_only": True},
+}
+MARKDOWN_LINK_CHECK_CONFIG = {
+    "timeout": "20s",
+    "retryOn429": True,
+    "retryCount": 2,
+    "fallbackRetryDelay": "10s",
+    "ignorePatterns": [
+        {
+            "pattern": "^https://github.com/nosovk/paperless-ai-ocr/security/advisories/new$",
+        }
+    ],
+}
 
 
 def require(condition: bool, message: str) -> None:
@@ -49,13 +71,31 @@ def uncommented(lines: list[str]) -> str:
 
 def normalize_mapping_key(line: str) -> str:
     match = re.fullmatch(
-        r"(\s*(?:-\s+)?)(?:\"([A-Za-z0-9_-]+)\"|'([A-Za-z0-9_-]+)'|([A-Za-z0-9_-]+))\s*:(.*)",
+        r'(\s*(?:-\s+)?)(?:"((?:\\.|[^"])*)"|\'([^\']*)\'|([A-Za-z0-9_-]+))\s*:(.*)',
         line,
     )
     if match is None:
         return line
     key = next(group for group in match.groups()[1:4] if group is not None)
+    require("\\" not in key, "escape sequences in quoted workflow mapping keys are forbidden")
     return f"{match.group(1)}{key}:{match.group(5)}"
+
+
+def normalize_workflow_lines(text: str) -> list[str]:
+    lines = []
+    block_scalar_indent: int | None = None
+    for line in text.splitlines():
+        current_indent = indentation(line)
+        if block_scalar_indent is not None:
+            if not line.strip() or current_indent > block_scalar_indent:
+                lines.append(line)
+                continue
+            block_scalar_indent = None
+        normalized = normalize_mapping_key(line)
+        lines.append(normalized)
+        if re.fullmatch(r"\s*(?:-\s+)?[A-Za-z0-9_-]+\s*:\s*[|>]\s*", normalized):
+            block_scalar_indent = current_indent
+    return lines
 
 
 @dataclass(frozen=True)
@@ -156,7 +196,7 @@ class Workflow:
     def __init__(self, name: str) -> None:
         self.path = ROOT / ".github" / "workflows" / name
         require(self.path.is_file(), f"missing workflow: {self.path.relative_to(ROOT)}")
-        self.lines = [normalize_mapping_key(line) for line in self.path.read_text(encoding="utf-8").splitlines()]
+        self.lines = normalize_workflow_lines(self.path.read_text(encoding="utf-8"))
 
     @property
     def text(self) -> str:
@@ -216,6 +256,24 @@ def assert_required_step(step: Block, command: str, message: str) -> None:
     require("continue-on-error" not in values, f"{step.header} must fail closed")
 
 
+def block_scalar_commands(step: Block, key: str) -> tuple[str, ...]:
+    attribute_indent = step.indent + 2
+    matches = [
+        index
+        for index, line in enumerate(step.lines)
+        if re.fullmatch(rf" {{{attribute_indent}}}{re.escape(key)}\s*:\s*\|\s*", line)
+    ]
+    require(len(matches) == 1, f"{step.header} must contain exactly one block {key!r}")
+    commands = []
+    for line in step.lines[matches[0] + 1 :]:
+        if line.strip() and indentation(line) <= attribute_indent:
+            break
+        if line.strip():
+            commands.append(line.strip())
+    require(commands, f"{step.header} block {key!r} must not be empty")
+    return tuple(commands)
+
+
 def assert_pinned_actions(workflow: Workflow) -> None:
     uses = re.findall(r"(?m)^\s+uses\s*:\s*([^\s#]+)\s+#\s+(v[^\s]+)\s*$", workflow.text)
     require(uses, f"{workflow.path.name} has no actions")
@@ -238,6 +296,110 @@ def assert_no_unsafe_inputs(workflow: Workflow) -> None:
     require("permissions: write-all" not in text, "write-all permissions are forbidden")
     for name in ("PAPERLESS_API_TOKEN", "AI_API_KEY", "WEBHOOK_TOKEN", "PAPERLESS_AI_WEBHOOK_KEY"):
         require(name not in text, f"credential-looking workflow input is forbidden: {name}")
+    for name in ("MARKDOWNLINT_VERSION", "MARKDOWN_LINK_CHECK_VERSION"):
+        require(name not in text, f"documentation version override is forbidden: {name}")
+
+    block_scalar_indent: int | None = None
+    for line in workflow.lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        current_indent = indentation(line)
+        if block_scalar_indent is not None:
+            if current_indent > block_scalar_indent:
+                continue
+            block_scalar_indent = None
+        if re.fullmatch(r"\s*(?:-\s+)?[A-Za-z0-9_-]+\s*:\s*[|>]\s*", line):
+            block_scalar_indent = current_indent
+            continue
+        flow_env = re.fullmatch(r"\s*(?:-\s+)?env\s*:\s*\{(.*)\}\s*", line)
+        if flow_env is not None:
+            for key in re.findall(r"(?:^|,)\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_-]+))\s*:", flow_env.group(1)):
+                key_source = next(part for part in key if part)
+                require("\\" not in key_source, "escape sequences in quoted workflow mapping keys are forbidden")
+                normalized_key = key_source.upper()
+                require(
+                    not normalized_key.startswith("NPM_CONFIG_")
+                    and normalized_key != "NODE_OPTIONS",
+                    f"protected workflow environment key is forbidden: {normalized_key}",
+                )
+            continue
+        match = re.fullmatch(r"\s*(?:-\s+)?([A-Za-z0-9_-]+)\s*:.*", line)
+        if match is None:
+            continue
+        key = match.group(1).upper()
+        require(
+            not key.startswith("NPM_CONFIG_") and key != "NODE_OPTIONS",
+            f"protected workflow environment key is forbidden: {key}",
+        )
+
+
+def load_json(relative_path: str) -> dict[str, object]:
+    path = ROOT / relative_path
+    require(path.is_file(), f"missing {relative_path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        raise AssertionError(f"invalid {relative_path}") from err
+    require(isinstance(value, dict), f"{relative_path} must contain a JSON object")
+    return value
+
+
+def assert_documentation_packages() -> None:
+    require(
+        load_json(".markdownlint.json") == MARKDOWNLINT_CONFIG,
+        ".markdownlint.json rules must be exact",
+    )
+    require(
+        load_json(".markdown-link-check.json") == MARKDOWN_LINK_CHECK_CONFIG,
+        ".markdown-link-check.json policy must be exact",
+    )
+    require(
+        load_json(".markdownlint-cli2.jsonc")
+        == {"ignores": ["docs/plans/**", "node_modules/**"]},
+        ".markdownlint-cli2.jsonc ignores must be exact",
+    )
+
+    package = load_json("package.json")
+    require(
+        package
+        == {
+            "name": "paperless-ai-ocr",
+            "private": True,
+            "engines": {"node": DOCUMENTATION_NODE_VERSION},
+            "devDependencies": DOCUMENTATION_DEPENDENCIES,
+        },
+        "package.json documentation tool policy is invalid",
+    )
+
+    lock = load_json("package-lock.json")
+    require(lock.get("name") == "paperless-ai-ocr", "package-lock.json name must match package.json")
+    require(lock.get("lockfileVersion") == 3, "package-lock.json must use lockfileVersion 3")
+    require(lock.get("requires") is True, "package-lock.json must require dependency resolution")
+    packages = lock.get("packages")
+    require(isinstance(packages, dict), "package-lock.json packages must be an object")
+    root = packages.get("")
+    require(
+        root
+        == {
+            "name": "paperless-ai-ocr",
+            "devDependencies": DOCUMENTATION_DEPENDENCIES,
+            "engines": {"node": DOCUMENTATION_NODE_VERSION},
+        },
+        "package-lock.json root metadata must match package.json",
+    )
+    require(len(packages) > 1, "package-lock.json must contain resolved dependencies")
+    for package_path, metadata in packages.items():
+        if package_path == "":
+            continue
+        require(package_path.startswith("node_modules/"), f"unexpected lockfile package path: {package_path}")
+        require(isinstance(metadata, dict), f"lockfile package metadata must be an object: {package_path}")
+        require(metadata.get("link") is not True, f"linked lockfile packages are not allowed: {package_path}")
+        version = metadata.get("version")
+        resolved = metadata.get("resolved")
+        integrity = metadata.get("integrity")
+        require(isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version) is not None, f"lockfile package version must be exact: {package_path}")
+        require(isinstance(resolved, str) and re.fullmatch(r"https://registry\.npmjs\.org/.+\.tgz", resolved) is not None, f"lockfile package must use the npm registry: {package_path}")
+        require(isinstance(integrity, str) and re.fullmatch(r"sha512-[A-Za-z0-9+/]+={0,2}", integrity) is not None, f"lockfile package integrity must be sha512: {package_path}")
 
 
 def assert_go_toolchain(workflows: tuple[Workflow, ...]) -> None:
@@ -347,7 +509,10 @@ def assert_ci(workflow: Workflow) -> None:
     require(trigger.children().keys() == {"push", "pull_request"}, "CI triggers must be exactly push and pull_request")
     require("branches: ['**']" in trigger.child("push").text, "CI push trigger must cover branches without tags")
     require(workflow.top("permissions").values() == {"contents": "read"}, "CI workflow permissions must be contents: read")
-    require(workflow.top("env").values() == {"GOVULNCHECK_VERSION": "v1.7.0"}, "CI govulncheck version must be v1.7.0")
+    require(
+        workflow.top("env").values() == {"GOVULNCHECK_VERSION": "v1.7.0"},
+        "CI tool versions must be exactly pinned",
+    )
     jobs = workflow.jobs()
     require(jobs.keys() == {"test", "lint", "race", "vulnerability-scan", "docker-build"}, "unexpected CI job set")
     for job in jobs.values():
@@ -361,6 +526,21 @@ def assert_ci(workflow: Workflow) -> None:
     require("python3 scripts/workflow-policy-regression-test.py" in policy, "CI must run policy mutation tests")
     require("bash scripts/release-metadata-test.sh" in policy, "CI must test release metadata validation")
     require("bash scripts/release-state-test.sh" in policy, "CI must test recoverable release state")
+    documentation = test_steps["Check documentation"]
+    setup_node = test_steps["Set up Node.js for documentation checks"]
+    require("actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0" in setup_node.text, "CI documentation checks must use the approved setup-node action")
+    require(setup_node.child("with").values() == {"node-version": DOCUMENTATION_NODE_VERSION, "package-manager-cache": "false"}, "CI documentation Node.js version and cache policy must be exact")
+    require(
+        block_scalar_commands(documentation, "run")
+        == (
+            "npm ci --ignore-scripts --no-audit --no-fund",
+            'npm exec --no -- markdownlint-cli2 "**/*.md"',
+            "npm exec --no -- markdown-link-check --config .markdown-link-check.json --quiet README.md SECURITY.md CONTRIBUTING.md docs/configuration.md docs/architecture.md docs/operations.md docs/threat-model.md",
+        ),
+        "CI documentation commands and targets must be exact",
+    )
+    require("if" not in documentation.values(), "documentation checks must not be conditional")
+    require("continue-on-error" not in documentation.values(), "documentation checks must fail closed")
     require("gofmt -l" in test_steps["Check formatting"].text, "CI formatting step must run gofmt")
     require("go vet ./..." in test_steps["Vet"].text, "CI vet step missing")
     require("go test ./..." in test_steps["Unit tests"].text, "CI unit test step missing")
@@ -533,6 +713,7 @@ def main() -> None:
         assert_pinned_actions(workflow)
         assert_no_unsafe_inputs(workflow)
     assert_go_toolchain((ci, release))
+    assert_documentation_packages()
     assert_release_metadata_script()
     assert_ci(ci)
     assert_release(release)

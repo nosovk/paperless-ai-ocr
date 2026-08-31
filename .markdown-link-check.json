@@ -1,0 +1,11 @@
+{
+  "timeout": "20s",
+  "retryOn429": true,
+  "retryCount": 2,
+  "fallbackRetryDelay": "10s",
+  "ignorePatterns": [
+    {
+      "pattern": "^https://github.com/nosovk/paperless-ai-ocr/security/advisories/new$"
+    }
+  ]
+}

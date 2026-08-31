@@ -1,0 +1,6 @@
+{
+  "ignores": [
+    "docs/plans/**",
+    "node_modules/**"
+  ]
+}
