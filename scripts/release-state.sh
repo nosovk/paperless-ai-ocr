@@ -26,9 +26,20 @@ import sys
 
 
 path, version, revision, reference = sys.argv[1:]
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 try:
-    document = json.loads(open(path, encoding="utf-8").read())
-except (OSError, json.JSONDecodeError) as err:
+    document = json.loads(open(path, encoding="utf-8").read(), object_pairs_hook=unique_object)
+except (OSError, json.JSONDecodeError, ValueError) as err:
     raise SystemExit(f"could not determine release state for {reference}: invalid inspection JSON: {err}")
 
 manifest = document.get("manifest")
@@ -126,10 +137,9 @@ for tag in "$VERSION" "$version"; do
     digests+=("$digest")
     continue
   fi
-  output_text=$(<"$output")
-  if [[ $output_text == "manifest unknown" \
-    || $output_text == "manifest unknown: not found" \
-    || $output_text == "ERROR: $reference: not found" ]]; then
+  if cmp -s "$output" <(printf 'manifest unknown\n') \
+    || cmp -s "$output" <(printf 'manifest unknown: not found\n') \
+    || cmp -s "$output" <(printf 'ERROR: %s: not found\n' "$reference"); then
     states+=(missing)
     digests+=("")
     continue

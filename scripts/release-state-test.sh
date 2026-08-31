@@ -136,6 +136,12 @@ if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
 fi
 grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "ambiguous manifest-unknown failure is not actionable"
 
+make_inspector "printf 'manifest unknown\\n\\n' >&2; exit 1"
+if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
+  fail "treated missing output with a blank line as an exact missing response"
+fi
+grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "blank-line inspection failure is not actionable"
+
 make_inspector "printf 'ERROR: ghcr.io/example/project:v1.2.3: not found\\nunauthorized: authentication required\\n' >&2; exit 1"
 if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
   fail "treated a multiline exact-reference error as a missing tag"
@@ -155,6 +161,10 @@ fi
 grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "ambiguous inspection error is not actionable"
 
 assert_rejected "${valid_image/\"schemaVersion\":2/\"schemaVersion\":1}" 'invalid image index' 'an invalid OCI schema version'
+readonly duplicate_root=$(python3 -c 'import sys; print(sys.argv[1].replace("{\"manifest\":", "{\"manifest\":{},\"manifest\":", 1))' "$valid_image")
+assert_rejected "$duplicate_root" 'duplicate JSON key' 'duplicate root manifest keys'
+assert_rejected "${valid_image/\"schemaVersion\":2/\"schemaVersion\":1,\"schemaVersion\":2}" 'duplicate JSON key' 'duplicate manifest schemaVersion keys'
+assert_rejected "${valid_image/\"architecture\":\"amd64\"/\"architecture\":\"arm\",\"architecture\":\"amd64\"}" 'duplicate JSON key' 'duplicate platform architecture keys'
 assert_rejected "${valid_image/application\/vnd.oci.image.index.v1+json/application\/vnd.oci.image.manifest.v1+json}" 'invalid image index' 'a non-index root media type'
 assert_rejected "${valid_image/application\/vnd.oci.image.manifest.v1+json/application\/vnd.oci.image.layer.v1.tar+gzip}" 'invalid release descriptor' 'a non-image runnable descriptor'
 assert_rejected "${valid_image/$digest_a/sha256:ABC}" 'invalid release descriptor' 'a malformed runnable descriptor digest'
