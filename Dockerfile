@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.20
 
-FROM golang:1.26.0-alpine3.23@sha256:d4c4845f5d60c6a974c6000ce58ae079328d03ab7f721a0734277e69905473e5 AS build
+FROM golang:1.26.6-alpine3.23@sha256:e57c41c1d5864341031181b0db34b9a537bb5773eb6428e4e5bdaea0f9135406 AS build
 
 ARG VERSION=development
 ARG REVISION=unknown
@@ -47,10 +47,11 @@ RUN apk add --no-cache \
         > /usr/local/bin/healthcheck \
     && chmod 0755 /usr/local/bin/healthcheck
 
+WORKDIR /app
+
 COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr
 
 USER 65532:65532
-WORKDIR /app
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \

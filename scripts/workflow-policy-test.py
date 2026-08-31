@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +30,8 @@ EXPECTED_RELEASE_PERMISSIONS = {
 }
 RELEASE_TAG_PATTERN = "readonly tag_pattern='^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$'"
 QEMU_IMAGE = "docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
+SAFE_GO_VERSION = "1.26.6"
+GO_BUILDER = "golang:1.26.6-alpine3.23@sha256:e57c41c1d5864341031181b0db34b9a537bb5773eb6428e4e5bdaea0f9135406"
 
 
 def require(condition: bool, message: str) -> None:
@@ -44,6 +47,61 @@ def uncommented(lines: list[str]) -> str:
     return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
 
 
+def normalize_mapping_key(line: str) -> str:
+    match = re.fullmatch(
+        r"(\s*(?:-\s+)?)(?:\"([A-Za-z0-9_-]+)\"|'([A-Za-z0-9_-]+)'|([A-Za-z0-9_-]+))\s*:(.*)",
+        line,
+    )
+    if match is None:
+        return line
+    key = next(group for group in match.groups()[1:4] if group is not None)
+    return f"{match.group(1)}{key}:{match.group(5)}"
+
+
+@dataclass(frozen=True)
+class DockerInstruction:
+    keyword: str
+    arguments: str
+    raw: str
+
+
+def docker_instructions(text: str) -> list[DockerInstruction]:
+    logical_lines: list[str] = []
+    continued: list[str] = []
+    for physical_line in text.splitlines():
+        stripped = physical_line.strip()
+        if not continued and (not stripped or stripped.startswith("#")):
+            continue
+        if stripped.endswith("\\"):
+            continued.append(stripped[:-1].rstrip())
+            continue
+        if continued:
+            continued.append(stripped)
+            logical_lines.append(" ".join(continued))
+            continued = []
+        else:
+            logical_lines.append(stripped)
+    require(not continued, "Dockerfile must not end with a continued instruction")
+
+    instructions = []
+    for raw in logical_lines:
+        match = re.fullmatch(r"([A-Za-z]+)\s+(.+)", raw)
+        require(match is not None, f"unsupported Dockerfile instruction format: {raw}")
+        instructions.append(DockerInstruction(match.group(1).upper(), match.group(2), raw))
+    return instructions
+
+
+def docker_from(arguments: str) -> tuple[str, str | None]:
+    tokens = shlex.split(arguments)
+    while tokens and tokens[0].startswith("--"):
+        tokens.pop(0)
+    require(len(tokens) in (1, 3), f"unsupported FROM format: {arguments}")
+    if len(tokens) == 1:
+        return tokens[0], None
+    require(tokens[1].lower() == "as", f"unsupported FROM format: {arguments}")
+    return tokens[0], tokens[2]
+
+
 @dataclass(frozen=True)
 class Block:
     header: str
@@ -55,8 +113,8 @@ class Block:
         return uncommented(self.lines)
 
     def child(self, key: str) -> Block:
-        wanted = f"{' ' * (self.indent + 2)}{key}:"
-        matches = [index for index, line in enumerate(self.lines) if line == wanted]
+        wanted = rf" {{{self.indent + 2}}}{re.escape(key)}\s*:"
+        matches = [index for index, line in enumerate(self.lines) if re.fullmatch(wanted, line)]
         require(len(matches) == 1, f"{self.header} must contain exactly one {key!r} block")
         return make_block(self.lines, matches[0], key)
 
@@ -64,7 +122,7 @@ class Block:
         child_indent = self.indent + 2
         result: dict[str, Block] = {}
         for index, line in enumerate(self.lines):
-            match = re.fullmatch(rf" {{{child_indent}}}([A-Za-z0-9_-]+):", line)
+            match = re.fullmatch(rf" {{{child_indent}}}([A-Za-z0-9_-]+)\s*:", line)
             if match:
                 key = match.group(1)
                 require(key not in result, f"duplicate {key!r} in {self.header}")
@@ -77,7 +135,7 @@ class Block:
         for line in self.lines[1:]:
             if indentation(line) != value_indent or line.lstrip().startswith(("-", "#")):
                 continue
-            match = re.fullmatch(r"\s*([A-Za-z0-9_-]+):\s*(.*?)\s*", line)
+            match = re.fullmatch(r"\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*", line)
             if match and match.group(2):
                 result[match.group(1)] = match.group(2).strip("'\"")
         return result
@@ -98,14 +156,14 @@ class Workflow:
     def __init__(self, name: str) -> None:
         self.path = ROOT / ".github" / "workflows" / name
         require(self.path.is_file(), f"missing workflow: {self.path.relative_to(ROOT)}")
-        self.lines = self.path.read_text(encoding="utf-8").splitlines()
+        self.lines = [normalize_mapping_key(line) for line in self.path.read_text(encoding="utf-8").splitlines()]
 
     @property
     def text(self) -> str:
         return uncommented(self.lines)
 
     def top(self, key: str) -> Block:
-        matches = [index for index, line in enumerate(self.lines) if line == f"{key}:"]
+        matches = [index for index, line in enumerate(self.lines) if re.fullmatch(rf"{re.escape(key)}\s*:", line)]
         require(len(matches) == 1, f"workflow must contain exactly one top-level {key!r} block")
         return make_block(self.lines, matches[0], key)
 
@@ -116,13 +174,22 @@ class Workflow:
 def step_blocks(job: Block) -> list[Block]:
     steps = job.child("steps")
     step_indent = steps.indent + 2
-    starts = [index for index, line in enumerate(steps.lines) if re.fullmatch(rf" {{{step_indent}}}- name: .+", line)]
-    require(starts, f"job {job.header!r} has no named steps")
+    starts = [index for index, line in enumerate(steps.lines) if re.match(rf"^ {{{step_indent}}}-(?:\s|$)", line)]
+    require(starts, f"job {job.header!r} has no steps")
     result = []
     for position, start in enumerate(starts):
         end = starts[position + 1] if position + 1 < len(starts) else len(steps.lines)
-        name = steps.lines[start].split(":", 1)[1].strip()
-        result.append(Block(name, step_indent, steps.lines[start:end]))
+        require(
+            not re.match(rf"^ {{{step_indent}}}-\s*\{{", steps.lines[start]),
+            f"job {job.header!r} must not contain flow-style steps",
+        )
+        match = re.fullmatch(rf" {{{step_indent}}}- name\s*: (.+)", steps.lines[start])
+        name = match.group(1).strip() if match else f"unnamed step {position + 1}"
+        lines = steps.lines[start:end]
+        shorthand = re.fullmatch(rf"( {{{step_indent}}})-\s+(.+)", lines[0])
+        if shorthand and not match:
+            lines = [f"{shorthand.group(1)}-", f"{shorthand.group(1)}  {shorthand.group(2)}", *lines[1:]]
+        result.append(Block(name, step_indent, lines))
     return result
 
 
@@ -150,9 +217,10 @@ def assert_required_step(step: Block, command: str, message: str) -> None:
 
 
 def assert_pinned_actions(workflow: Workflow) -> None:
-    uses = re.findall(r"(?m)^\s+uses:\s*([^\s#]+)\s+#\s+(v[^\s]+)\s*$", workflow.text)
+    uses = re.findall(r"(?m)^\s+uses\s*:\s*([^\s#]+)\s+#\s+(v[^\s]+)\s*$", workflow.text)
     require(uses, f"{workflow.path.name} has no actions")
-    require(workflow.text.count("uses:") == len(uses), f"every action in {workflow.path.name} must have a release comment")
+    use_keys = re.findall(r"(?m)^\s+uses\s*:", workflow.text)
+    require(len(use_keys) == len(uses), f"every action in {workflow.path.name} must have a release comment")
     for value, version in uses:
         match = re.fullmatch(rf"([^@]+)@({SHA})", value)
         require(match is not None, f"action is not pinned to a full SHA: {value}")
@@ -170,6 +238,90 @@ def assert_no_unsafe_inputs(workflow: Workflow) -> None:
     require("permissions: write-all" not in text, "write-all permissions are forbidden")
     for name in ("PAPERLESS_API_TOKEN", "AI_API_KEY", "WEBHOOK_TOKEN", "PAPERLESS_AI_WEBHOOK_KEY"):
         require(name not in text, f"credential-looking workflow input is forbidden: {name}")
+
+
+def assert_go_toolchain(workflows: tuple[Workflow, ...]) -> None:
+    go_mod = (ROOT / "go.mod").read_text(encoding="utf-8")
+    versions = re.findall(r"(?m)^go (\S+)$", go_mod)
+    require(versions == [SAFE_GO_VERSION], f"go.mod must require exact Go {SAFE_GO_VERSION}")
+
+    instructions = docker_instructions((ROOT / "Dockerfile").read_text(encoding="utf-8"))
+    stage_starts = [
+        (index, *docker_from(instruction.arguments))
+        for index, instruction in enumerate(instructions)
+        if instruction.keyword == "FROM"
+    ]
+    require(stage_starts, "Dockerfile must contain stages")
+    aliases = [alias.casefold() for _, _, alias in stage_starts if alias]
+    require(len(aliases) == len(set(aliases)), "Dockerfile stage aliases must be unique")
+    builders = [(image, alias) for _, image, alias in stage_starts if image.lower().startswith("golang:")]
+    require(len(builders) == 1, "Dockerfile must contain exactly one Go builder stage")
+    builder, builder_alias = builders[0]
+    require(builder == GO_BUILDER, f"Dockerfile builder must be exactly {GO_BUILDER}")
+    builder_version = re.fullmatch(r"golang:(\d+\.\d+\.\d+)-[^\s]+", builder)
+    require(builder_version is not None, "Dockerfile Go builder version must be exact")
+    require(builder_version.group(1) == versions[0], "Dockerfile builder Go version must match go.mod")
+    require(builder_alias, "Dockerfile Go builder stage must have an alias")
+
+    builder_start = next(index for index, image, alias in stage_starts if image == builder and alias == builder_alias)
+    builder_end = next((index for index, _, _ in stage_starts if index > builder_start), len(instructions))
+    builder_stage = instructions[builder_start + 1 : builder_end]
+    output_path = "/out/paperless-ai-ocr"
+    output_instructions = [instruction for instruction in builder_stage if output_path in instruction.raw]
+    require(len(output_instructions) == 1, "Go builder stage must contain exactly one instruction mentioning the build output")
+    approved_build = output_instructions[0]
+    expected_build = (
+        "RUN CGO_ENABLED=0 go build -trimpath "
+        '-ldflags="-s -w -X github.com/nosovk/paperless-ai-ocr/internal/buildinfo.version=${VERSION} '
+        "-X github.com/nosovk/paperless-ai-ocr/internal/buildinfo.revision=${REVISION} "
+        '-X github.com/nosovk/paperless-ai-ocr/internal/buildinfo.buildTime=${CREATED}" '
+        "-o /out/paperless-ai-ocr ./cmd/paperless-ai-ocr"
+    )
+    require(approved_build.raw == expected_build, "Go builder output must come from the approved static go build command")
+    require(
+        builder_stage[-1] == approved_build,
+        "approved go build must be the final instruction in the Go builder stage",
+    )
+
+    protected_path = "/usr/local/bin/paperless-ai-ocr"
+    final_stage = instructions[stage_starts[-1][0] + 1 :]
+    protected = [instruction for instruction in final_stage if instruction.keyword in {"RUN", "ADD", "COPY"} and protected_path in instruction.raw]
+    require(len(protected) == 1, "final image must contain exactly one mutating instruction mentioning the protected binary path")
+    approved_copy = protected[0]
+    require(approved_copy.keyword == "COPY", "protected binary path may only be written by the approved COPY")
+    require(not approved_copy.arguments.lstrip().startswith("["), "protected binary COPY must use controlled shell form")
+    copy_tokens = shlex.split(approved_copy.arguments)
+    copy_from = [token.removeprefix("--from=") for token in copy_tokens if token.startswith("--from=")]
+    copy_paths = [token for token in copy_tokens if not token.startswith("--")]
+    require(
+        copy_from == [builder_alias]
+        and copy_paths == ["/out/paperless-ai-ocr", protected_path],
+        "final image binary must be copied once from the approved Go builder stage",
+    )
+    copy_index = final_stage.index(approved_copy)
+    allowed_after_copy = {"USER", "EXPOSE", "HEALTHCHECK", "ENTRYPOINT"}
+    for instruction in final_stage[copy_index + 1 :]:
+        require(
+            instruction.keyword in allowed_after_copy,
+            f"unsupported instruction after approved binary COPY: {instruction.keyword}",
+        )
+    entrypoints = [instruction for instruction in final_stage if instruction.keyword == "ENTRYPOINT"]
+    require(
+        len(entrypoints) == 1 and entrypoints[0].arguments == '["/usr/local/bin/paperless-ai-ocr"]',
+        'final image must contain exactly ENTRYPOINT ["/usr/local/bin/paperless-ai-ocr"]',
+    )
+
+    setup_go_steps = []
+    for workflow in workflows:
+        for job in workflow.jobs().values():
+            for step in step_blocks(job):
+                if step.values().get("uses", "").startswith("actions/setup-go@"):
+                    setup_go_steps.append(step)
+    require(setup_go_steps, "controlled workflows must use actions/setup-go")
+    for step in setup_go_steps:
+        inputs = step.child("with").values()
+        require(inputs.get("go-version-file") == "go.mod", "setup-go must use go-version-file: go.mod")
+        require("go-version" not in inputs, "setup-go literal go-version is forbidden")
 
 
 def assert_release_metadata_script() -> None:
@@ -380,6 +532,7 @@ def main() -> None:
     for workflow in (ci, release):
         assert_pinned_actions(workflow)
         assert_no_unsafe_inputs(workflow)
+    assert_go_toolchain((ci, release))
     assert_release_metadata_script()
     assert_ci(ci)
     assert_release(release)

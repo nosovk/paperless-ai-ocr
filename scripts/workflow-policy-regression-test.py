@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent
 POLICY_INPUTS = (
     ".github/workflows/ci.yml",
     ".github/workflows/release.yml",
+    "Dockerfile",
+    "go.mod",
     "scripts/release-metadata.sh",
     "scripts/release-state.sh",
 )
@@ -158,6 +160,220 @@ def mutate_qemu_image(text: str) -> str:
     return text.replace(
         "QEMU_IMAGE: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0",
         "QEMU_IMAGE: docker.io/tonistiigi/binfmt:latest",
+        1,
+    )
+
+
+def mutate_go_mod_downgrade(text: str) -> str:
+    return text.replace("go 1.26.6", "go 1.26.0", 1)
+
+
+def mutate_builder_downgrade(text: str) -> str:
+    return text.replace(
+        "golang:1.26.6-alpine3.23@sha256:e57c41c1d5864341031181b0db34b9a537bb5773eb6428e4e5bdaea0f9135406",
+        "golang:1.26.0-alpine3.23@sha256:d4c4845f5d60c6a974c6000ce58ae079328d03ab7f721a0734277e69905473e5",
+        1,
+    )
+
+
+def mutate_builder_version_mismatch(text: str) -> str:
+    return text.replace("golang:1.26.6-alpine3.23@", "golang:1.26.0-alpine3.23@", 1)
+
+
+def mutate_remove_builder_digest(text: str) -> str:
+    return text.replace(
+        "@sha256:e57c41c1d5864341031181b0db34b9a537bb5773eb6428e4e5bdaea0f9135406",
+        "",
+        1,
+    )
+
+
+def mutate_wrong_builder_digest(text: str) -> str:
+    return text.replace(
+        "sha256:e57c41c1d5864341031181b0db34b9a537bb5773eb6428e4e5bdaea0f9135406",
+        "sha256:057c41c1d5864341031181b0db34b9a537bb5773eb6428e4e5bdaea0f9135406",
+        1,
+    )
+
+
+def mutate_select_additional_unsafe_builder(text: str) -> str:
+    unsafe_builder = (
+        "from golang:1.26.0-alpine3.23@sha256:d4c4845f5d60c6a974c6000ce58ae079328d03ab7f721a0734277e69905473e5 AS unsafe\n\n"
+    )
+    return text.replace("FROM alpine:", unsafe_builder + "FROM alpine:", 1).replace(
+        "COPY --from=build ",
+        "COPY --from=unsafe ",
+        1,
+    )
+
+
+def mutate_add_platform_unsafe_builder(text: str) -> str:
+    unsafe_builder = (
+        "FROM --platform=linux/amd64 golang:1.26.0-alpine3.23@sha256:d4c4845f5d60c6a974c6000ce58ae079328d03ab7f721a0734277e69905473e5 AS unsafe\n\n"
+    )
+    return text.replace("FROM alpine:", unsafe_builder + "FROM alpine:", 1)
+
+
+def mutate_overwrite_runtime_binary(text: str) -> str:
+    return text.replace(
+        "COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr\n",
+        "COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr\n"
+        "COPY go.mod /usr/local/bin/paperless-ai-ocr\n",
+        1,
+    )
+
+
+def mutate_add_final_runtime_stage(text: str) -> str:
+    return text + (
+        "\nFROM alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659 AS unsafe-runtime\n"
+        "COPY go.mod /usr/local/bin/paperless-ai-ocr\n"
+        "ENTRYPOINT [\"/usr/local/bin/paperless-ai-ocr\"]\n"
+    )
+
+
+def mutate_relative_copy_overwrite_runtime_binary(text: str) -> str:
+    return text.replace(
+        "COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr\n",
+        "COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr\n"
+        "WORKDIR /usr/local/bin\n"
+        "COPY go.mod paperless-ai-ocr\n",
+        1,
+    )
+
+
+def mutate_glob_remove_runtime_binary(text: str) -> str:
+    return text.replace(
+        "COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr\n",
+        "COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr\n"
+        "RUN rm -f /usr/local/bin/*\n",
+        1,
+    )
+
+
+def mutate_run_overwrite_runtime_binary(text: str) -> str:
+    return text.replace(
+        "COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr\n",
+        "COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr\n"
+        "RUN printf unsafe > /usr/local/bin/paperless-ai-ocr\n",
+        1,
+    )
+
+
+def mutate_json_copy_overwrite_runtime_binary(text: str) -> str:
+    return text.replace(
+        "COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr\n",
+        "COPY --from=build --chown=65532:65532 /out/paperless-ai-ocr /usr/local/bin/paperless-ai-ocr\n"
+        'COPY ["go.mod", "/usr/local/bin/paperless-ai-ocr"]\n',
+        1,
+    )
+
+
+def mutate_add_continued_unsafe_builder(text: str) -> str:
+    unsafe_builder = (
+        "FROM \\\n"
+        "    golang:1.26.0-alpine3.23@sha256:d4c4845f5d60c6a974c6000ce58ae079328d03ab7f721a0734277e69905473e5 AS unsafe\n\n"
+    )
+    return text.replace("FROM alpine:", unsafe_builder + "FROM alpine:", 1)
+
+
+def mutate_overwrite_build_output(text: str) -> str:
+    return text.replace(
+        "    ./cmd/paperless-ai-ocr\n\nFROM alpine:",
+        "    ./cmd/paperless-ai-ocr\n\n"
+        "RUN printf %s unsafe > /out/paperless-ai-ocr\n\n"
+        "FROM alpine:",
+        1,
+    )
+
+
+def mutate_replace_go_build(text: str) -> str:
+    start = text.index("RUN CGO_ENABLED=0 go build \\\n")
+    end = text.index("\n\nFROM alpine:", start)
+    return text[:start] + "RUN mkdir -p /out && printf %s unsafe > /out/paperless-ai-ocr" + text[end:]
+
+
+def mutate_copy_overwrite_build_output(text: str) -> str:
+    return text.replace(
+        "    ./cmd/paperless-ai-ocr\n\nFROM alpine:",
+        "    ./cmd/paperless-ai-ocr\n\n"
+        "COPY go.mod /out/paperless-ai-ocr\n\n"
+        "FROM alpine:",
+        1,
+    )
+
+
+def mutate_entrypoint_to_healthcheck(text: str) -> str:
+    return text.replace(
+        'ENTRYPOINT ["/usr/local/bin/paperless-ai-ocr"]',
+        'ENTRYPOINT ["/usr/local/bin/healthcheck"]',
+        1,
+    )
+
+
+def mutate_reuse_builder_alias(text: str) -> str:
+    fake_builder = (
+        "FROM alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659 AS build\n"
+        "RUN mkdir -p /out && printf %s unsafe > /out/paperless-ai-ocr\n\n"
+    )
+    return text.replace("FROM alpine:", fake_builder + "FROM alpine:", 1)
+
+
+def mutate_setup_go_away_from_go_mod(text: str) -> str:
+    return text.replace("          go-version-file: go.mod", "          go-version: '1.26.6'", 1)
+
+
+def mutate_add_unnamed_setup_go(text: str) -> str:
+    return text.replace(
+        "    steps:\n",
+        "    steps:\n"
+        "      -\n"
+        "        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0\n"
+        "        with:\n"
+        "          go-version: '1.26.0'\n",
+        1,
+    )
+
+
+def mutate_whitespace_hidden_setup_go(text: str) -> str:
+    return text.replace(
+        "        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0\n"
+        "        with:\n"
+        "          go-version-file: go.mod\n",
+        "        uses : actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0\n"
+        "        with:\n"
+        "          go-version: '1.26.0'\n",
+        1,
+    )
+
+
+def mutate_add_shorthand_whitespace_setup_go(text: str) -> str:
+    return text.replace(
+        "    steps:\n",
+        "    steps:\n"
+        "      - uses : actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0\n"
+        "        with:\n"
+        "          go-version: '1.26.0'\n",
+        1,
+    )
+
+
+def mutate_quoted_setup_go_key(text: str) -> str:
+    return text.replace(
+        "        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0\n"
+        "        with:\n"
+        "          go-version-file: go.mod\n",
+        '        "uses" : actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0\n'
+        "        with:\n"
+        "          go-version: '1.26.0'\n",
+        1,
+    )
+
+
+def mutate_add_flow_setup_go(text: str) -> str:
+    return text.replace(
+        "          go-version-file: go.mod\n",
+        "          go-version-file: go.mod\n"
+        "      - {uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e, with: {go-version: 1.26.0}}\n",
         1,
     )
 
@@ -382,6 +598,32 @@ def main() -> None:
             run_mutant("unpinned release actionlint", ".github/workflows/release.yml", mutate_actionlint_version, ref),
             run_mutant("unpinned release golangci", ".github/workflows/release.yml", mutate_golangci_version, ref),
             run_mutant("unpinned QEMU image", ".github/workflows/release.yml", mutate_qemu_image, ref),
+            run_mutant("go.mod downgrade", "go.mod", mutate_go_mod_downgrade, ref),
+            run_mutant("Docker builder downgrade", "Dockerfile", mutate_builder_downgrade, ref),
+            run_mutant("Docker builder version mismatch", "Dockerfile", mutate_builder_version_mismatch, ref),
+            run_mutant("Docker builder digest removed", "Dockerfile", mutate_remove_builder_digest, ref),
+            run_mutant("Docker builder wrong digest", "Dockerfile", mutate_wrong_builder_digest, ref),
+            run_mutant("additional unsafe Docker builder selected", "Dockerfile", mutate_select_additional_unsafe_builder, ref),
+            run_mutant("platform-qualified unsafe Docker builder", "Dockerfile", mutate_add_platform_unsafe_builder, ref),
+            run_mutant("later runtime binary overwrite", "Dockerfile", mutate_overwrite_runtime_binary, ref),
+            run_mutant("later final runtime stage", "Dockerfile", mutate_add_final_runtime_stage, ref),
+            run_mutant("relative runtime binary overwrite", "Dockerfile", mutate_relative_copy_overwrite_runtime_binary, ref),
+            run_mutant("glob removes runtime binary", "Dockerfile", mutate_glob_remove_runtime_binary, ref),
+            run_mutant("RUN overwrites runtime binary", "Dockerfile", mutate_run_overwrite_runtime_binary, ref),
+            run_mutant("JSON COPY overwrites runtime binary", "Dockerfile", mutate_json_copy_overwrite_runtime_binary, ref),
+            run_mutant("continued unsafe Docker builder", "Dockerfile", mutate_add_continued_unsafe_builder, ref),
+            run_mutant("RUN overwrites Go build output", "Dockerfile", mutate_overwrite_build_output, ref),
+            run_mutant("fake Go build output", "Dockerfile", mutate_replace_go_build, ref),
+            run_mutant("COPY overwrites Go build output", "Dockerfile", mutate_copy_overwrite_build_output, ref),
+            run_mutant("alternate runtime entrypoint", "Dockerfile", mutate_entrypoint_to_healthcheck, ref),
+            run_mutant("reused Docker builder alias", "Dockerfile", mutate_reuse_builder_alias, ref),
+            run_mutant("CI setup-go literal version", ".github/workflows/ci.yml", mutate_setup_go_away_from_go_mod, ref),
+            run_mutant("release setup-go literal version", ".github/workflows/release.yml", mutate_setup_go_away_from_go_mod, ref),
+            run_mutant("unnamed CI setup-go literal version", ".github/workflows/ci.yml", mutate_add_unnamed_setup_go, ref),
+            run_mutant("whitespace-hidden CI setup-go", ".github/workflows/ci.yml", mutate_whitespace_hidden_setup_go, ref),
+            run_mutant("shorthand whitespace-hidden CI setup-go", ".github/workflows/ci.yml", mutate_add_shorthand_whitespace_setup_go, ref),
+            run_mutant("quoted-key CI setup-go", ".github/workflows/ci.yml", mutate_quoted_setup_go_key, ref),
+            run_mutant("flow-style CI setup-go", ".github/workflows/ci.yml", mutate_add_flow_setup_go, ref),
             run_mutant("missing checkout binding", "scripts/release-metadata.sh", mutate_remove_head_check, ref),
             run_mutant("bypassed checkout binding", "scripts/release-metadata.sh", mutate_bypass_head_check, ref),
             run_mutant("per-tag release concurrency", ".github/workflows/release.yml", mutate_release_concurrency, ref),
