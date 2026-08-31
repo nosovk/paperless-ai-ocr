@@ -60,6 +60,10 @@ for descriptor in descriptors:
     if not isinstance(platform, dict):
         raise SystemExit(f"existing image {reference} has an invalid release descriptor")
     key = (platform.get("os"), platform.get("architecture"))
+    if set(platform) != {"os", "architecture"}:
+        if key == ("unknown", "unknown"):
+            raise SystemExit(f"existing image {reference} has an invalid attestation descriptor")
+        raise SystemExit(f"existing image {reference} has an invalid release descriptor")
     descriptor_digest = descriptor.get("digest")
     media_type = descriptor.get("mediaType")
     size = descriptor.get("size")
@@ -122,9 +126,10 @@ for tag in "$VERSION" "$version"; do
     digests+=("$digest")
     continue
   fi
-  if grep -Exi 'manifest unknown([: ].*)?' "$output" >/dev/null \
-    && [[ $(wc -l <"$output") -eq 1 ]] \
-    || grep -Fxi "ERROR: $reference: not found" "$output" >/dev/null; then
+  output_text=$(<"$output")
+  if [[ $output_text == "manifest unknown" \
+    || $output_text == "manifest unknown: not found" \
+    || $output_text == "ERROR: $reference: not found" ]]; then
     states+=(missing)
     digests+=("")
     continue

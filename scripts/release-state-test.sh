@@ -130,6 +130,18 @@ if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
 fi
 grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "multiline inspection failure is not actionable"
 
+make_inspector "printf 'manifest unknown: authentication required\\n' >&2; exit 1"
+if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
+  fail "treated an ambiguous manifest-unknown error as a missing tag"
+fi
+grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "ambiguous manifest-unknown failure is not actionable"
+
+make_inspector "printf 'ERROR: ghcr.io/example/project:v1.2.3: not found\\nunauthorized: authentication required\\n' >&2; exit 1"
+if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
+  fail "treated a multiline exact-reference error as a missing tag"
+fi
+grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "multiline exact-reference failure is not actionable"
+
 make_inspector "printf 'error: authorization helper not found\\n' >&2; exit 1"
 if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
   fail "treated an unrelated not-found error as a missing tag"
@@ -162,6 +174,8 @@ assert_rejected "${valid_image/\"vnd.docker.reference.digest\":\"$digest_a\"/\"v
 assert_rejected "${valid_image/\"vnd.docker.reference.digest\":\"$digest_b\"/\"vnd.docker.reference.digest\":\"$digest_a\"}" 'invalid attestation descriptor' 'duplicate attestation references'
 assert_rejected "${valid_image/$digest_e/$digest_d}" 'duplicate descriptor digest' 'duplicate attestation descriptor digests'
 assert_rejected "${valid_image/\"architecture\":\"arm64\"/\"architecture\":\"amd64\"}" 'does not contain the required release platforms' 'duplicate amd64 release descriptors'
+assert_rejected "${valid_image/\"architecture\":\"arm64\"/\"architecture\":\"arm64\",\"variant\":\"v8\"}" 'invalid release descriptor' 'an arm64 descriptor with a platform variant'
+assert_rejected "${valid_image/\"architecture\":\"amd64\"/\"architecture\":\"amd64\",\"os.version\":\"1\"}" 'invalid release descriptor' 'an amd64 descriptor with an OS version'
 readonly no_attestations=$(python3 -c 'import json,sys; value=json.loads(sys.argv[1]); value["manifest"]["manifests"]=[item for item in value["manifest"]["manifests"] if item["platform"]["os"] != "unknown"]; print(json.dumps(value, separators=(",", ":")))' "$valid_image")
 assert_rejected "$no_attestations" 'invalid attestation descriptor' 'an index without BuildKit attestation descriptors'
 readonly one_attestation=$(python3 -c 'import json,sys; value=json.loads(sys.argv[1]); value["manifest"]["manifests"]=[item for item in value["manifest"]["manifests"] if item["digest"] != sys.argv[2]]; print(json.dumps(value, separators=(",", ":")))' "$valid_image" "$digest_e")
