@@ -71,7 +71,7 @@ image_json() {
   if [[ $platforms == both ]]; then
     attestations=$(printf ',{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":1234,"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"%s"},"platform":{"os":"unknown","architecture":"unknown"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":1234,"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"%s"},"platform":{"os":"unknown","architecture":"unknown"}}' "$digest_d" "$digest_a" "$digest_e" "$digest_b")
   fi
-  printf '{"manifest":{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","digest":"%s","manifests":[%s%s%s%s]}}' \
+  printf '{"manifest":{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","digest":"%s","size":4321,"manifests":[%s%s%s%s]}}' \
     "$digest" "$amd64" "${amd64:+${arm64:+,}}" "$arm64" "$attestations"
 }
 
@@ -118,6 +118,18 @@ if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
 fi
 grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "inspection failure is not actionable"
 
+make_inspector "printf 'ERROR: unauthorized: manifest unknown: authentication required\\n' >&2; exit 1"
+if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
+  fail "treated a mixed authorization error as a missing tag"
+fi
+grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "mixed inspection failure is not actionable"
+
+make_inspector "printf 'manifest unknown: not found\\nunauthorized: authentication required\\n' >&2; exit 1"
+if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
+  fail "treated ambiguous multiline output as a missing tag"
+fi
+grep -F 'could not determine release state' "$work_dir/stderr" >/dev/null || fail "multiline inspection failure is not actionable"
+
 make_inspector "printf 'error: authorization helper not found\\n' >&2; exit 1"
 if run_check >"$work_dir/stdout" 2>"$work_dir/stderr"; then
   fail "treated an unrelated not-found error as a missing tag"
@@ -134,11 +146,18 @@ assert_rejected "${valid_image/\"schemaVersion\":2/\"schemaVersion\":1}" 'invali
 assert_rejected "${valid_image/application\/vnd.oci.image.index.v1+json/application\/vnd.oci.image.manifest.v1+json}" 'invalid image index' 'a non-index root media type'
 assert_rejected "${valid_image/application\/vnd.oci.image.manifest.v1+json/application\/vnd.oci.image.layer.v1.tar+gzip}" 'invalid release descriptor' 'a non-image runnable descriptor'
 assert_rejected "${valid_image/$digest_a/sha256:ABC}" 'invalid release descriptor' 'a malformed runnable descriptor digest'
+assert_rejected "${valid_image/\"size\":4321,/}" 'invalid image index' 'an image index without size'
+assert_rejected "${valid_image/\"size\":4321/\"size\":0}" 'invalid image index' 'an image index with zero size'
+assert_rejected "${valid_image/\"size\":4321/\"size\":9223372036854775808}" 'invalid image index' 'an image index with overflowing size'
 assert_rejected "${valid_image/\"size\":1234,/}" 'invalid release descriptor' 'a runnable descriptor without size'
+assert_rejected "${valid_image/\"size\":1234/\"size\":0}" 'invalid release descriptor' 'a runnable descriptor with zero size'
 assert_rejected "${valid_image/\"size\":1234/\"size\":\"1234\"}" 'invalid release descriptor' 'a runnable descriptor with string size'
 assert_rejected "${valid_image/\"size\":1234/\"size\":-1}" 'invalid release descriptor' 'a runnable descriptor with negative size'
 assert_rejected "${valid_image/\"size\":1234/\"size\":true}" 'invalid release descriptor' 'a runnable descriptor with boolean size'
+assert_rejected "${valid_image/\"size\":1234/\"size\":9223372036854775808}" 'invalid release descriptor' 'a runnable descriptor with overflowing size'
 assert_rejected "${valid_image/\"vnd.docker.reference.type\":\"attestation-manifest\"/\"vnd.docker.reference.type\":\"other\"}" 'invalid attestation descriptor' 'an unknown descriptor without the BuildKit attestation type'
+readonly docker_attestation=$(python3 -c 'import json,sys; value=json.loads(sys.argv[1]); next(item for item in value["manifest"]["manifests"] if item["digest"] == sys.argv[2])["mediaType"]="application/vnd.docker.distribution.manifest.v2+json"; print(json.dumps(value, separators=(",", ":")))' "$valid_image" "$digest_d")
+assert_rejected "$docker_attestation" 'invalid attestation descriptor' 'a Docker media type for an attestation descriptor'
 assert_rejected "${valid_image/\"vnd.docker.reference.digest\":\"$digest_a\"/\"vnd.docker.reference.digest\":\"$digest_d\"}" 'invalid attestation descriptor' 'an attestation descriptor not bound to a runnable manifest'
 assert_rejected "${valid_image/\"vnd.docker.reference.digest\":\"$digest_b\"/\"vnd.docker.reference.digest\":\"$digest_a\"}" 'invalid attestation descriptor' 'duplicate attestation references'
 assert_rejected "${valid_image/$digest_e/$digest_d}" 'duplicate descriptor digest' 'duplicate attestation descriptor digests'

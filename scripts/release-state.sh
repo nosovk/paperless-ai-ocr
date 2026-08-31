@@ -35,10 +35,11 @@ manifest = document.get("manifest")
 digest = manifest.get("digest") if isinstance(manifest, dict) else None
 if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
     raise SystemExit(f"could not determine release state for {reference}: expected exactly one manifest digest")
+root_size = manifest.get("size")
 if manifest.get("schemaVersion") != 2 or manifest.get("mediaType") not in {
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
-}:
+} or not isinstance(root_size, int) or isinstance(root_size, bool) or not 0 < root_size <= 2**63 - 1:
     raise SystemExit(f"existing image {reference} has an invalid image index")
 
 descriptors = manifest.get("manifests")
@@ -64,7 +65,7 @@ for descriptor in descriptors:
     size = descriptor.get("size")
     if media_type not in manifest_media_types or not isinstance(descriptor_digest, str) or re.fullmatch(
         r"sha256:[0-9a-f]{64}", descriptor_digest
-    ) is None or not isinstance(size, int) or isinstance(size, bool) or size < 0:
+    ) is None or not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= 2**63 - 1:
         if key == ("unknown", "unknown"):
             raise SystemExit(f"existing image {reference} has an invalid attestation descriptor")
         raise SystemExit(f"existing image {reference} has an invalid release descriptor")
@@ -79,6 +80,8 @@ for descriptor in descriptors:
     if key == ("unknown", "unknown"):
         attestation_reference = annotations.get("vnd.docker.reference.digest")
         if (
+            media_type != "application/vnd.oci.image.manifest.v1+json"
+            or
             annotations.get("vnd.docker.reference.type") != "attestation-manifest"
             or not isinstance(attestation_reference, str)
             or re.fullmatch(r"sha256:[0-9a-f]{64}", attestation_reference) is None
@@ -119,7 +122,8 @@ for tag in "$VERSION" "$version"; do
     digests+=("$digest")
     continue
   fi
-  if grep -Eqi '(^|: )manifest unknown([: ]|$)' "$output" \
+  if grep -Exi 'manifest unknown([: ].*)?' "$output" >/dev/null \
+    && [[ $(wc -l <"$output") -eq 1 ]] \
     || grep -Fxi "ERROR: $reference: not found" "$output" >/dev/null; then
     states+=(missing)
     digests+=("")
