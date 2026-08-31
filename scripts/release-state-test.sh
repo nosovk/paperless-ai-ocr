@@ -63,13 +63,13 @@ image_json() {
   local arm64=''
   local attestations=''
   if [[ $platforms == both || $platforms == amd64 ]]; then
-    amd64=$(printf '{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","annotations":{"org.opencontainers.image.version":"%s","org.opencontainers.image.revision":"%s"},"platform":{"os":"linux","architecture":"amd64"}}' "$digest_a" "$version" "$image_revision")
+    amd64=$(printf '{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":1234,"annotations":{"org.opencontainers.image.version":"%s","org.opencontainers.image.revision":"%s"},"platform":{"os":"linux","architecture":"amd64"}}' "$digest_a" "$version" "$image_revision")
   fi
   if [[ $platforms == both || $platforms == arm64 ]]; then
-    arm64=$(printf '{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","annotations":{"org.opencontainers.image.version":"%s","org.opencontainers.image.revision":"%s"},"platform":{"os":"linux","architecture":"arm64"}}' "$digest_b" "$version" "$image_revision")
+    arm64=$(printf '{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":1234,"annotations":{"org.opencontainers.image.version":"%s","org.opencontainers.image.revision":"%s"},"platform":{"os":"linux","architecture":"arm64"}}' "$digest_b" "$version" "$image_revision")
   fi
   if [[ $platforms == both ]]; then
-    attestations=$(printf ',{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"%s"},"platform":{"os":"unknown","architecture":"unknown"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"%s"},"platform":{"os":"unknown","architecture":"unknown"}}' "$digest_d" "$digest_a" "$digest_e" "$digest_b")
+    attestations=$(printf ',{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":1234,"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"%s"},"platform":{"os":"unknown","architecture":"unknown"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":1234,"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"%s"},"platform":{"os":"unknown","architecture":"unknown"}}' "$digest_d" "$digest_a" "$digest_e" "$digest_b")
   fi
   printf '{"manifest":{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","digest":"%s","manifests":[%s%s%s%s]}}' \
     "$digest" "$amd64" "${amd64:+${arm64:+,}}" "$arm64" "$attestations"
@@ -134,6 +134,10 @@ assert_rejected "${valid_image/\"schemaVersion\":2/\"schemaVersion\":1}" 'invali
 assert_rejected "${valid_image/application\/vnd.oci.image.index.v1+json/application\/vnd.oci.image.manifest.v1+json}" 'invalid image index' 'a non-index root media type'
 assert_rejected "${valid_image/application\/vnd.oci.image.manifest.v1+json/application\/vnd.oci.image.layer.v1.tar+gzip}" 'invalid release descriptor' 'a non-image runnable descriptor'
 assert_rejected "${valid_image/$digest_a/sha256:ABC}" 'invalid release descriptor' 'a malformed runnable descriptor digest'
+assert_rejected "${valid_image/\"size\":1234,/}" 'invalid release descriptor' 'a runnable descriptor without size'
+assert_rejected "${valid_image/\"size\":1234/\"size\":\"1234\"}" 'invalid release descriptor' 'a runnable descriptor with string size'
+assert_rejected "${valid_image/\"size\":1234/\"size\":-1}" 'invalid release descriptor' 'a runnable descriptor with negative size'
+assert_rejected "${valid_image/\"size\":1234/\"size\":true}" 'invalid release descriptor' 'a runnable descriptor with boolean size'
 assert_rejected "${valid_image/\"vnd.docker.reference.type\":\"attestation-manifest\"/\"vnd.docker.reference.type\":\"other\"}" 'invalid attestation descriptor' 'an unknown descriptor without the BuildKit attestation type'
 assert_rejected "${valid_image/\"vnd.docker.reference.digest\":\"$digest_a\"/\"vnd.docker.reference.digest\":\"$digest_d\"}" 'invalid attestation descriptor' 'an attestation descriptor not bound to a runnable manifest'
 assert_rejected "${valid_image/\"vnd.docker.reference.digest\":\"$digest_b\"/\"vnd.docker.reference.digest\":\"$digest_a\"}" 'invalid attestation descriptor' 'duplicate attestation references'

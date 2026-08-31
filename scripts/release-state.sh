@@ -61,9 +61,10 @@ for descriptor in descriptors:
     key = (platform.get("os"), platform.get("architecture"))
     descriptor_digest = descriptor.get("digest")
     media_type = descriptor.get("mediaType")
+    size = descriptor.get("size")
     if media_type not in manifest_media_types or not isinstance(descriptor_digest, str) or re.fullmatch(
         r"sha256:[0-9a-f]{64}", descriptor_digest
-    ) is None:
+    ) is None or not isinstance(size, int) or isinstance(size, bool) or size < 0:
         if key == ("unknown", "unknown"):
             raise SystemExit(f"existing image {reference} has an invalid attestation descriptor")
         raise SystemExit(f"existing image {reference} has an invalid release descriptor")
