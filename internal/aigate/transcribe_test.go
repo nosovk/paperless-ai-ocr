@@ -278,6 +278,7 @@ func TestTranscribeRetryClassification(t *testing.T) {
 		{name: "rate limit invalid delay", status: http.StatusTooManyRequests, retryAfter: "secret-invalid", wantClass: RetryRateLimit, wantRetry: true},
 		{name: "server", status: http.StatusBadGateway, retryAfter: "3", wantClass: RetryUnavailable, wantDelay: 3 * time.Second, wantRetry: true},
 		{name: "request timeout", status: http.StatusRequestTimeout, retryAfter: "4", wantClass: RetryUnavailable, wantDelay: 4 * time.Second, wantRetry: true},
+		{name: "gateway timeout", status: 524, wantClass: RetryUnavailable, wantRetry: true},
 		{name: "conflict", status: http.StatusConflict, retryAfter: "5", wantClass: RetryUnavailable, wantDelay: 5 * time.Second, wantRetry: true},
 		{name: "auth", status: http.StatusUnauthorized, retryAfter: "9"},
 		{name: "permanent", status: http.StatusBadRequest, retryAfter: "9"},
@@ -307,6 +308,9 @@ func TestTranscribeRetryClassification(t *testing.T) {
 			}
 			if providerCategory(err) != saferr.CategoryProvider {
 				t.Errorf("category = %q, want provider", providerCategory(err))
+			}
+			if got := ProviderTimeout(err); got != (test.status == http.StatusRequestTimeout || test.status == 524) {
+				t.Errorf("ProviderTimeout() = %t", got)
 			}
 		})
 	}

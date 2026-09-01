@@ -88,6 +88,7 @@ type Options struct {
 	Jitter           func(time.Duration) time.Duration
 	Retry            func(error) (aigate.RetryClass, time.Duration, bool)
 	Unsupported      func(error) bool
+	ProviderTimeout  func(error) bool
 	// Observers are trusted nonblocking internal callbacks and must not panic.
 	ObserveProviderAttempt func(time.Duration)
 	ObserveProcessedPages  func(int)
@@ -162,6 +163,9 @@ func New(options Options) (*Worker, error) {
 	}
 	if options.Unsupported == nil {
 		options.Unsupported = aigate.UnsupportedAttachment
+	}
+	if options.ProviderTimeout == nil {
+		options.ProviderTimeout = aigate.ProviderTimeout
 	}
 	if options.ObserveProviderAttempt == nil {
 		options.ObserveProviderAttempt = func(time.Duration) {}
@@ -330,6 +334,29 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 	} else if capability == aigate.DirectPDF {
 		capability = aigate.PageImages
 	}
+	if capability == aigate.DirectPDF {
+		pageRange := queue.BatchRange{FirstPage: 1, LastPage: info.Pages}
+		batch, canonical, directErr := worker.transcribe(ctx, job, pageRange, draft, pdfBytes, nil, true)
+		if directErr == nil {
+			if _, err := worker.options.Store.EnsureBatchesContext(ctx, job.ID, job.Attempts, job.LeaseOwner, []queue.BatchRange{pageRange}, worker.options.RenderDPI, renderFormat); err != nil {
+				return Result{}, err
+			}
+			if err := worker.checkpoint(ctx, job, pageRange, canonical); err != nil {
+				return Result{}, err
+			}
+			content, err := ocr.Join([]ocr.Batch{batch})
+			if err != nil {
+				return Result{}, err
+			}
+			return Result{JobID: job.ID, DocumentID: job.DocumentID, SourceChecksum: job.SourceChecksum,
+				DownloadSHA256: hex.EncodeToString(hash.Sum(nil)), Content: content}, nil
+		}
+		if !worker.options.Unsupported(directErr) && !worker.options.ProviderTimeout(directErr) {
+			return Result{}, directErr
+		}
+		capability = aigate.PageImages
+		pdfBytes = nil
+	}
 	ranges, err := planRanges(info.Pages, worker.options.BatchSize, capability)
 	if err != nil {
 		return Result{}, err
@@ -353,17 +380,7 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 			return Result{}, err
 		}
 		pageRange := ranges[index]
-		var batch ocr.Batch
-		if capability == aigate.DirectPDF {
-			batch, err = worker.transcribeAndCheckpoint(ctx, job, pageRange, draft, pdfBytes, nil)
-			if err != nil && worker.options.Unsupported(err) {
-				capability = aigate.PageImages
-				pdfBytes = nil
-				batch, err = worker.renderTranscribeAndCheckpoint(ctx, job, workspace, pageRange, draft)
-			}
-		} else {
-			batch, err = worker.renderTranscribeAndCheckpoint(ctx, job, workspace, pageRange, draft)
-		}
+		batch, err := worker.renderTranscribeAndCheckpoint(ctx, job, workspace, pageRange, draft)
 		if err != nil {
 			return Result{}, err
 		}
@@ -443,6 +460,17 @@ func (worker *Worker) renderTranscribeAndCheckpoint(ctx context.Context, job que
 }
 
 func (worker *Worker) transcribeAndCheckpoint(ctx context.Context, job queue.Job, pageRange queue.BatchRange, draft string, pdfBytes []byte, images [][]byte) (ocr.Batch, error) {
+	batch, canonical, err := worker.transcribe(ctx, job, pageRange, draft, pdfBytes, images, false)
+	if err != nil {
+		return ocr.Batch{}, err
+	}
+	if err := worker.checkpoint(ctx, job, pageRange, canonical); err != nil {
+		return ocr.Batch{}, err
+	}
+	return batch, nil
+}
+
+func (worker *Worker) transcribe(ctx context.Context, job queue.Job, pageRange queue.BatchRange, draft string, pdfBytes []byte, images [][]byte, stopOnTimeout bool) (ocr.Batch, []byte, error) {
 	capability := aigate.PageImages
 	if len(pdfBytes) != 0 {
 		capability = aigate.DirectPDF
@@ -452,7 +480,7 @@ func (worker *Worker) transcribeAndCheckpoint(ctx context.Context, job queue.Job
 	var err error
 	for attempt := 1; attempt <= worker.options.ModelAttempts; attempt++ {
 		if err = worker.renew(ctx, job); err != nil {
-			return ocr.Batch{}, err
+			return ocr.Batch{}, nil, err
 		}
 		started := time.Now()
 		raw, err = worker.options.Transcriber.Transcribe(ctx, input)
@@ -461,10 +489,13 @@ func (worker *Worker) transcribeAndCheckpoint(ctx context.Context, job queue.Job
 			break
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ocr.Batch{}, ctxErr
+			return ocr.Batch{}, nil, ctxErr
 		}
 		if worker.options.Unsupported(err) {
-			return ocr.Batch{}, err
+			return ocr.Batch{}, nil, err
+		}
+		if stopOnTimeout && worker.options.ProviderTimeout(err) {
+			return ocr.Batch{}, nil, err
 		}
 		var retryAfter time.Duration
 		var retryable bool
@@ -475,33 +506,37 @@ func (worker *Worker) transcribeAndCheckpoint(ctx context.Context, job queue.Job
 		}
 		if !retryable || attempt == worker.options.ModelAttempts {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return ocr.Batch{}, saferr.New(saferr.CategoryProvider, "transcription service unavailable")
+				return ocr.Batch{}, nil, saferr.New(saferr.CategoryProvider, "transcription service unavailable")
 			}
-			return ocr.Batch{}, err
+			return ocr.Batch{}, nil, err
 		}
 		delay := retryAfter
 		if delay <= 0 {
 			delay = backoffDelay(attempt, worker.options.Jitter)
 		}
 		if err := worker.options.Sleep(ctx, delay); err != nil {
-			return ocr.Batch{}, err
+			return ocr.Batch{}, nil, err
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return ocr.Batch{}, err
+		return ocr.Batch{}, nil, err
 	}
 	batch, canonical, err := ocr.ValidateCanonical(raw, pageRange.FirstPage, pageRange.LastPage)
 	if err != nil {
-		return ocr.Batch{}, err
+		return ocr.Batch{}, nil, err
 	}
+	return batch, canonical, nil
+}
+
+func (worker *Worker) checkpoint(ctx context.Context, job queue.Job, pageRange queue.BatchRange, canonical []byte) error {
 	if err := worker.renew(ctx, job); err != nil {
-		return ocr.Batch{}, err
+		return err
 	}
 	if err := worker.options.Store.CheckpointBatchContext(ctx, job.ID, job.Attempts, job.LeaseOwner, pageRange, worker.options.RenderDPI, renderFormat, string(canonical)); err != nil {
-		return ocr.Batch{}, err
+		return err
 	}
 	worker.options.ObserveProcessedPages(pageRange.LastPage - pageRange.FirstPage + 1)
-	return batch, nil
+	return nil
 }
 
 func backoffDelay(attempt int, jitter func(time.Duration) time.Duration) time.Duration {

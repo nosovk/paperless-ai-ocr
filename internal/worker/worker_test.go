@@ -152,6 +152,29 @@ func TestProcessFallsBackOnlyForUnsupportedDirectAttachment(t *testing.T) {
 	}
 }
 
+func TestProcessFallsBackToPageImagesAfterDirectTimeout(t *testing.T) {
+	fixture := newFixture(t, 3, aigate.DirectPDF)
+	fixture.worker.options.BatchSize = 1
+	fixture.worker.options.ProviderTimeout = func(err error) bool {
+		return errors.Is(err, context.DeadlineExceeded)
+	}
+	fixture.transcriber.errors = []error{context.DeadlineExceeded}
+	if _, err := fixture.worker.Process(context.Background(), fixture.job); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if len(fixture.transcriber.inputs) != 4 || fixture.transcriber.inputs[0].Capability != aigate.DirectPDF {
+		t.Fatalf("transcription inputs = %+v, want one direct attempt then three images", fixture.transcriber.inputs)
+	}
+	for _, input := range fixture.transcriber.inputs[1:] {
+		if input.Capability != aigate.PageImages || len(input.Images) != 1 || len(input.PDF) != 0 {
+			t.Errorf("fallback input = %+v, want one page image", input)
+		}
+	}
+	if len(fixture.store.batches) != 3 {
+		t.Fatalf("batch checkpoints = %+v, want three image checkpoints", fixture.store.batches)
+	}
+}
+
 func TestProcessSkipsOCRWhenTerminalFailureIntentAlreadyExists(t *testing.T) {
 	fixture := newFixture(t, 1, aigate.PageImages)
 	fixture.store.terminal = true

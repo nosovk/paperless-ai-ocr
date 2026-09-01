@@ -63,11 +63,21 @@ type unsupportedAttachmentError struct {
 	err error
 }
 
+type providerTimeoutError struct {
+	err error
+}
+
 func (err *unsupportedAttachmentError) Error() string { return err.err.Error() }
 func (err *unsupportedAttachmentError) Format(state fmt.State, verb rune) {
 	fmt.Fprintf(state, "%"+string(verb), err.err)
 }
 func (err *unsupportedAttachmentError) Unwrap() error { return err.err }
+
+func (err *providerTimeoutError) Error() string { return err.err.Error() }
+func (err *providerTimeoutError) Format(state fmt.State, verb rune) {
+	fmt.Fprintf(state, "%"+string(verb), err.err)
+}
+func (err *providerTimeoutError) Unwrap() error { return err.err }
 
 func (err *retryError) Error() string { return err.err.Error() }
 
@@ -90,6 +100,15 @@ func Retry(err error) (RetryClass, time.Duration, bool) {
 // an attachment transport without exposing provider response data.
 func UnsupportedAttachment(err error) bool {
 	_, ok := errors.AsType[*unsupportedAttachmentError](err)
+	return ok
+}
+
+// ProviderTimeout reports a provider request timeout without exposing response data.
+func ProviderTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	_, ok := errors.AsType[*providerTimeoutError](err)
 	return ok
 }
 
@@ -212,7 +231,7 @@ func (client *Client) transcribe(ctx context.Context, input Transcription, encod
 			return nil, providerContextError("transcription request failed", err)
 		}
 		if transientTransportError(err) {
-			return nil, newRetryError(RetryUnavailable, 0)
+			return nil, &providerTimeoutError{err: newRetryError(RetryUnavailable, 0)}
 		}
 		return nil, providerError("transcription request failed")
 	}
@@ -404,7 +423,9 @@ func (client *Client) transcriptionStatusError(capability Capability, statusCode
 	switch {
 	case statusCode == http.StatusTooManyRequests:
 		class = RetryRateLimit
-	case statusCode == http.StatusRequestTimeout || statusCode == http.StatusConflict || statusCode >= http.StatusInternalServerError && statusCode < 600:
+	case statusCode == http.StatusRequestTimeout || statusCode == 524:
+		return &providerTimeoutError{err: newRetryError(RetryUnavailable, parseRetryAfter(retryAfter, time.Now()))}
+	case statusCode == http.StatusConflict || statusCode >= http.StatusInternalServerError && statusCode < 600:
 		class = RetryUnavailable
 	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
 		return providerError("transcription authentication failed")

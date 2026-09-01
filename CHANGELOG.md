@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.5] - 2026-09-01
+
+### Fixed
+
+- Fall back from direct PDF input to page-image checkpoints after provider
+  request timeouts, while preserving the direct fast path for successful PDFs.
+
 ## [0.1.4] - 2026-09-01
 
 ### Fixed
