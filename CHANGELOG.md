@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.4] - 2026-09-01
+
+### Fixed
+
+- Read the source checksum from the unique root entry in Paperless 3.1 document
+  versions when the legacy top-level checksum field is absent.
+
 ## [0.1.3] - 2026-09-01
 
 ### Fixed

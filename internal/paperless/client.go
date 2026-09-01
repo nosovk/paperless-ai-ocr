@@ -147,8 +147,8 @@ func (client *Client) WalkDocuments(ctx context.Context, visit func([]Document) 
 		if err := client.doJSON(ctx, "walk documents", http.MethodGet, next, nil, &page); err != nil {
 			return nil, err
 		}
-		for _, document := range page.Results {
-			if err := validateDocument(document); err != nil {
+		for index := range page.Results {
+			if err := validateDocument(page.Results[index]); err != nil {
 				return nil, paperlessError("walk documents", err)
 			}
 		}
@@ -182,8 +182,8 @@ func (client *Client) ListDocumentsPage(ctx context.Context, cursor string) (Doc
 	if err := client.doJSON(ctx, "list documents page", http.MethodGet, current, nil, &page); err != nil {
 		return DocumentPage{}, err
 	}
-	for _, document := range page.Results {
-		if err := validateDocument(document); err != nil {
+	for index := range page.Results {
+		if err := validateDocument(page.Results[index]); err != nil {
 			return DocumentPage{}, paperlessError("list documents page", err)
 		}
 	}
@@ -211,6 +211,24 @@ func (client *Client) GetDocument(ctx context.Context, documentID int) (Document
 		return Document{}, paperlessError("get document", err)
 	}
 	return document, nil
+}
+
+func (document *Document) normalizeChecksum() {
+	if document.Checksum != "" {
+		return
+	}
+	rootChecksum := ""
+	roots := 0
+	for _, version := range document.versions {
+		if !version.IsRoot {
+			continue
+		}
+		roots++
+		rootChecksum = version.Checksum
+	}
+	if roots == 1 {
+		document.Checksum = rootChecksum
+	}
 }
 
 // GetChecksum retrieves the source checksum exposed on document detail.

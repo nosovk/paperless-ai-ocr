@@ -377,6 +377,80 @@ func TestGetDocumentAndChecksum(t *testing.T) {
 	}
 }
 
+func TestGetDocumentUsesPaperless31RootVersionChecksum(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		io.WriteString(writer, `{"id":42,"content":"native text","tags":[7,8],"versions":[{"id":9,"is_root":true,"checksum":"source-checksum"}]}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	document, err := client.GetDocument(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("GetDocument() error = %v", err)
+	}
+	if got, want := document.Checksum, "source-checksum"; got != want {
+		t.Errorf("GetDocument().Checksum = %q, want %q", got, want)
+	}
+}
+
+func TestListDocumentsPageUsesPaperless31RootVersionChecksum(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":42,"tags":[],"versions":[{"is_root":true,"checksum":"source-checksum"}]}]}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	page, err := client.ListDocumentsPage(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListDocumentsPage() error = %v", err)
+	}
+	if got, want := page.Documents[0].Checksum, "source-checksum"; got != want {
+		t.Errorf("ListDocumentsPage().Checksum = %q, want %q", got, want)
+	}
+}
+
+func TestWalkDocumentsUsesPaperless31RootVersionChecksum(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		io.WriteString(writer, `{"count":1,"next":null,"results":[{"id":42,"tags":[],"versions":[{"is_root":true,"checksum":"source-checksum"}]}]}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	err := client.WalkDocuments(context.Background(), func(documents []Document) error {
+		if got, want := documents[0].Checksum, "source-checksum"; got != want {
+			t.Errorf("WalkDocuments().Checksum = %q, want %q", got, want)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkDocuments() error = %v", err)
+	}
+}
+
+func TestGetDocumentRejectsAmbiguousPaperless31RootVersions(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		io.WriteString(writer, `{"id":42,"tags":[],"versions":[{"is_root":true,"checksum":"first"},{"is_root":true,"checksum":"second"}]}`)
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server.URL, Options{})
+
+	document, err := client.GetDocument(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("GetDocument() error = %v", err)
+	}
+	if document.Checksum != "" {
+		t.Errorf("GetDocument().Checksum = %q, want blank ambiguous checksum", document.Checksum)
+	}
+}
+
 func TestGetDocumentRejectsInvalidDecodedRecord(t *testing.T) {
 	t.Parallel()
 
