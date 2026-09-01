@@ -355,7 +355,6 @@ func (worker *Worker) process(ctx context.Context, job queue.Job) (_ Result, err
 			return Result{}, directErr
 		}
 		capability = aigate.PageImages
-		pdfBytes = nil
 	}
 	ranges, err := planRanges(info.Pages, worker.options.BatchSize, capability)
 	if err != nil {

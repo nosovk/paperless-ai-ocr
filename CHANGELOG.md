@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.6] - 2026-09-01
+
+### Fixed
+
+- Publish the adaptive provider-timeout fallback after correcting release lint.
+
 ## [0.1.5] - 2026-09-01
 
 ### Fixed
