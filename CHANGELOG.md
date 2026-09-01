@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.2] - 2026-09-01
+
+### Fixed
+
+- Use the bounded authenticated documents endpoint for the Paperless startup
+  probe, avoiding the Paperless 3.1 API root redirect.
+
 ## [0.1.1] - 2026-09-01
 
 ### Added

@@ -54,13 +54,13 @@ func TestNewValidatesConfiguration(t *testing.T) {
 	}
 }
 
-func TestPingUsesBoundedAPIRootRequest(t *testing.T) {
+func TestPingUsesBoundedDocumentsRequest(t *testing.T) {
 	t.Parallel()
 
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		calls.Add(1)
-		if request.Method != http.MethodGet || request.URL.Path != "/paperless/api/" || request.URL.RawQuery != "" {
+		if request.Method != http.MethodGet || request.URL.Path != "/paperless/api/documents/" || request.URL.Query().Get("page_size") != "1" {
 			t.Errorf("request = %s %s", request.Method, request.URL.RequestURI())
 		}
 		if got, want := request.Header.Get("Authorization"), "Token "+testToken; got != want {

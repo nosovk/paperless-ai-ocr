@@ -115,7 +115,11 @@ func New(baseURL *url.URL, token string, options Options) (*Client, error) {
 func (client *Client) Ping(ctx context.Context) error {
 	requestCtx, cancel := context.WithTimeout(ctx, client.requestTimeout)
 	defer cancel()
-	request, err := client.request(requestCtx, http.MethodGet, client.endpoint("api/"), nil)
+	endpoint := client.endpoint("api/documents/")
+	query := endpoint.Query()
+	query.Set("page_size", "1")
+	endpoint.RawQuery = query.Encode()
+	request, err := client.request(requestCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return paperlessError("ping", err)
 	}
