@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -34,6 +35,34 @@ func TestProbeFixtures(t *testing.T) {
 	}
 	if bytes.Contains(probePDF, []byte(probeNonce)) || bytes.Contains(probePNG, []byte(probeNonce)) {
 		t.Error("visual nonce is stored as extractable fixture text")
+	}
+	image, err := png.Decode(bytes.NewReader(probePNG))
+	if err != nil {
+		t.Fatalf("decode probe PNG: %v", err)
+	}
+	bounds := image.Bounds()
+	background := image.At(bounds.Min.X, bounds.Min.Y)
+	content := bounds
+	content.Min.X, content.Min.Y = bounds.Max.X, bounds.Max.Y
+	content.Max.X, content.Max.Y = bounds.Min.X, bounds.Min.Y
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if image.At(x, y) == background {
+				continue
+			}
+			content.Min.X = min(content.Min.X, x)
+			content.Min.Y = min(content.Min.Y, y)
+			content.Max.X = max(content.Max.X, x+1)
+			content.Max.Y = max(content.Max.Y, y+1)
+		}
+	}
+	const minimumPadding = 16
+	if content.Empty() {
+		t.Fatal("probe PNG has no visual content")
+	}
+	if content.Min.X-bounds.Min.X < minimumPadding || content.Min.Y-bounds.Min.Y < minimumPadding ||
+		bounds.Max.X-content.Max.X < minimumPadding || bounds.Max.Y-content.Max.Y < minimumPadding {
+		t.Errorf("probe PNG content bounds = %v within %v, want at least %d pixels of padding", content, bounds, minimumPadding)
 	}
 }
 

@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.3] - 2026-09-01
+
+### Fixed
+
+- Add horizontal padding to the synthetic capability-probe fixtures so the
+  complete visual nonce is available to multimodal models.
+
 ## [0.1.2] - 2026-09-01
 
 ### Fixed
