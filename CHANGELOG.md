@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.7] - 2026-09-02
+
+### Fixed
+
+- Honor the configured model request timeout while waiting for provider response
+  headers instead of terminating long-running image transcriptions after 15 seconds.
+
 ## [0.1.6] - 2026-09-01
 
 ### Fixed

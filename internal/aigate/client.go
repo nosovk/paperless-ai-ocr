@@ -69,17 +69,18 @@ func New(baseURL *url.URL, apiKey, model string, options ClientOptions) (*Client
 	clonedURL.RawPath = ""
 	clonedURL.Path = normalizedBasePath(clonedURL.Path)
 	responsesURL := clonedURL.ResolveReference(&url.URL{Path: "responses"})
+	requestTimeout := defaultValue(options.RequestTimeout, defaultRequestTimeout)
 
 	var httpClient *http.Client
 	var callerPolicy func(*http.Request, []*http.Request) error
 	if options.HTTPClient == nil {
-		httpClient = &http.Client{Transport: boundedTransport()}
+		httpClient = &http.Client{Transport: boundedTransport(requestTimeout)}
 	} else {
 		clone := *options.HTTPClient
 		httpClient = &clone
 		callerPolicy = options.HTTPClient.CheckRedirect
 		if httpClient.Transport == nil {
-			httpClient.Transport = boundedTransport()
+			httpClient.Transport = boundedTransport(requestTimeout)
 		}
 	}
 	httpClient.CheckRedirect = redirectPolicy(&clonedURL, callerPolicy)
@@ -89,12 +90,12 @@ func New(baseURL *url.URL, apiKey, model string, options ClientOptions) (*Client
 		apiKey:           apiKey,
 		model:            model,
 		httpClient:       httpClient,
-		requestTimeout:   defaultValue(options.RequestTimeout, defaultRequestTimeout),
+		requestTimeout:   requestTimeout,
 		maxResponseBytes: defaultValue(options.MaxResponseBytes, defaultMaxResponseBytes),
 	}, nil
 }
 
-func boundedTransport() *http.Transport {
+func boundedTransport(responseHeaderTimeout time.Duration) *http.Transport {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	return &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -104,7 +105,7 @@ func boundedTransport() *http.Transport {
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 		ExpectContinueTimeout: time.Second,
 	}
 }

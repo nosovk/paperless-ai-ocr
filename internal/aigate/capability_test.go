@@ -135,6 +135,14 @@ func TestNewValidatesAndNormalizesConfiguration(t *testing.T) {
 	if client.requestTimeout <= 0 || client.maxResponseBytes <= 0 || client.httpClient.Transport == nil {
 		t.Error("New() did not apply bounded defaults")
 	}
+	client, err = New(baseURL, "key", "model", ClientOptions{RequestTimeout: 3 * time.Minute})
+	if err != nil {
+		t.Fatalf("New() with custom timeout error = %v", err)
+	}
+	transport, ok := client.httpClient.Transport.(*http.Transport)
+	if !ok || transport.ResponseHeaderTimeout < 3*time.Minute {
+		t.Errorf("ResponseHeaderTimeout = %v, want at least 3m", transport.ResponseHeaderTimeout)
+	}
 }
 
 func TestProbeDirectPDFRequestAndResponse(t *testing.T) {
